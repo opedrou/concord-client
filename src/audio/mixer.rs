@@ -11,6 +11,8 @@ const MAX_QUEUED: usize = RATE as usize / 5;
 const MAX_GAIN: f32 = 2.0;
 /// Quem não tem volume salvo fica em 100%.
 const DEFAULT_SLIDER: u8 = 71;
+/// Volume padrão dos sons de interface no site (`DEFAULT_SOUND_VOLUME`).
+const EFFECT_GAIN: f32 = 0.6;
 
 /// A fila fica fora do `rtrb` porque só a sala e a thread de áudio tocam nela, nunca
 /// o callback, e descartar o mais antigo exige o lado do produtor mexer na ponta do
@@ -37,6 +39,9 @@ pub struct Mixer {
     volumes: HashMap<String, u8>,
     pub master: u8,
     pub deafened: bool,
+    /// Sons de interface tocando: PCM `i16` LE e a posição em amostras. Ficam fora do
+    /// volume geral e dos de pessoa.
+    effects: Vec<(&'static [u8], usize)>,
 }
 
 impl Mixer {
@@ -46,7 +51,19 @@ impl Mixer {
             volumes,
             master,
             deafened: false,
+            effects: Vec::new(),
         }
+    }
+
+    /// Surdo não começa som nenhum, como o site.
+    pub fn play(&mut self, pcm: &'static [u8]) {
+        if !self.deafened {
+            self.effects.push((pcm, 0));
+        }
+    }
+
+    pub fn playing(&self) -> bool {
+        !self.effects.is_empty()
     }
 
     pub fn add(&mut self, key: String, name: String, queue: Arc<VoiceQueue>) {
@@ -75,6 +92,16 @@ impl Mixer {
                 *o += s as f32 / 32768.0 * track_gain;
             }
         }
+        for (pcm, pos) in &mut self.effects {
+            for o in out.iter_mut() {
+                let Some(b) = pcm.get(*pos * 2..*pos * 2 + 2) else {
+                    break;
+                };
+                *o += i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0 * EFFECT_GAIN;
+                *pos += 1;
+            }
+        }
+        self.effects.retain(|(pcm, pos)| *pos * 2 < pcm.len());
         for o in out {
             *o = if self.deafened {
                 0.0
@@ -184,6 +211,28 @@ mod tests {
         assert_eq!(q.0.lock().unwrap().len(), FRAME);
         m.deafened = false;
         assert!(mix(&mut m)[0] > 0.0);
+    }
+
+    #[test]
+    fn efeito_toca_ate_o_fim_sem_ganho_de_pessoa_nem_geral() {
+        static PCM: [u8; 4] = [0x00, 0x40, 0x00, 0x40]; // 2 amostras de 16384
+        let mut m = mixer(0);
+        m.play(&PCM);
+        let out = mix(&mut m);
+        assert!(close(out[0], 0.5 * EFFECT_GAIN) && close(out[1], 0.5 * EFFECT_GAIN));
+        assert_eq!(out[2], 0.0);
+        assert!(!m.playing());
+    }
+
+    #[test]
+    fn surdo_nao_toca_efeito() {
+        static PCM: [u8; 2] = [0x00, 0x40];
+        let mut m = mixer(71);
+        m.deafened = true;
+        m.play(&PCM);
+        assert!(!m.playing());
+        m.deafened = false;
+        assert_eq!(mix(&mut m)[0], 0.0);
     }
 
     #[test]

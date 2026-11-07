@@ -125,6 +125,29 @@ pub fn devices() -> Devices {
     device::list()
 }
 
+/// Sons de interface, só pra quem ouve: não entram na sala. Os mesmos arquivos do site.
+///
+/// O PCM é mono, 48 kHz, `i16` little-endian, convertido uma vez dos mp3 do site:
+/// `ffmpeg -i X.mp3 -f s16le -ar 48000 -ac 1 assets/sounds/X.pcm`
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Effect {
+    Join,
+    Leave,
+    StreamStart,
+    StreamStop,
+}
+
+impl Effect {
+    fn pcm(self) -> &'static [u8] {
+        match self {
+            Effect::Join => include_bytes!("../../assets/sounds/join.pcm"),
+            Effect::Leave => include_bytes!("../../assets/sounds/leave.pcm"),
+            Effect::StreamStart => include_bytes!("../../assets/sounds/stream-start.pcm"),
+            Effect::StreamStop => include_bytes!("../../assets/sounds/stream-stop.pcm"),
+        }
+    }
+}
+
 /// Dono da thread de áudio. Clone barato; o motor para quando o último clone cai.
 #[derive(Clone)]
 pub struct Engine {
@@ -205,6 +228,12 @@ impl Engine {
         self.send(Command::Output(name));
     }
 
+    /// Toca um som de interface. Surdo não ouve: some, como no site. Se o motor cair
+    /// logo depois (sair da call), a thread espera o som acabar.
+    pub fn play(&self, effect: Effect) {
+        self.send(Command::Effect(effect.pcm()));
+    }
+
     /// Fila própria por faixa, identificada por `key`. Soltar o [`VoiceSink`] tira a
     /// faixa do mixer.
     pub fn add_voice(&self, key: String, name: String) -> VoiceSink {
@@ -242,6 +271,29 @@ mod tests {
         assert!(close(gain(71), 1.0082));
         assert!(close(gain(100), 2.0));
         assert_eq!(gain(255), 2.0);
+    }
+
+    #[test]
+    fn efeitos_embutidos_tem_duracao_e_nivel_plausiveis() {
+        for effect in [
+            Effect::Join,
+            Effect::Leave,
+            Effect::StreamStart,
+            Effect::StreamStop,
+        ] {
+            let pcm = effect.pcm();
+            assert_eq!(pcm.len() % 2, 0, "{effect:?}: i16 inteiro");
+            let samples: Vec<f32> = pcm
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .collect();
+            let secs = samples.len() as f32 / RATE as f32;
+            assert!((0.3..3.0).contains(&secs), "{effect:?}: {secs} s");
+            let peak = samples.iter().fold(0f32, |m, s| m.max(s.abs()));
+            let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+            assert!((0.1..=1.0).contains(&peak), "{effect:?}: pico {peak}");
+            assert!((0.01..0.5).contains(&rms), "{effect:?}: rms {rms}");
+        }
     }
 
     #[test]

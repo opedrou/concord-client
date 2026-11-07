@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use iced::widget::image;
 use iced::{Point, Size};
 
+use super::sounds::Cues;
 use crate::api::{self, Participant};
 use crate::audio::{Engine, Meter, MicFrames};
 use crate::call::{Call, End, Live};
@@ -65,6 +66,8 @@ pub struct ActiveCall {
     pub meter: Option<Meter>,
     /// Sem duplicados e em ordem de nome. `None` até a primeira lista da sala.
     pub live: Option<Vec<Live>>,
+    /// Quando tocar entrada, saída e transmissão.
+    cues: Cues,
     /// Nome -> quando parou de falar. Quem passou de [`SPEAKING_HOLD`] sai.
     fading: HashMap<String, Instant>,
     /// Pessoa com o painel de volume aberto.
@@ -123,6 +126,7 @@ impl ActiveCall {
             engine: None,
             meter: None,
             live: None,
+            cues: Cues::default(),
             fading: HashMap::new(),
             volume_panel: None,
             share: share::State::Off,
@@ -258,7 +262,18 @@ impl ActiveCall {
         }
     }
 
+    /// Entrada da própria pessoa, uma vez por call.
+    pub fn cue_own_join(&mut self, now: Instant) {
+        if let (Some(effect), Some(engine)) = (self.cues.connected(now), &self.engine) {
+            engine.play(effect);
+        }
+    }
+
     pub fn participants(&mut self, list: Vec<Live>, now: Instant) {
+        let effects = self.cues.roster(&list, now);
+        if let Some(engine) = &self.engine {
+            effects.into_iter().for_each(|e| engine.play(e));
+        }
         // Mesma regra de nome repetido da sidebar: `api::occupants`.
         let flat: Vec<Participant> = list
             .iter()

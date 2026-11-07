@@ -2,6 +2,7 @@
 mod avatar;
 mod screens;
 mod sidebar;
+mod sounds;
 mod stage;
 pub mod theme;
 mod voice;
@@ -17,7 +18,7 @@ use voice::{ActiveCall, Boot, Probe};
 use crate::api::{
     self, AddressError, Channel, ChannelKind, Client, Error, Member, Presence, Secret, User,
 };
-use crate::audio::{self, Devices, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
+use crate::audio::{self, Devices, Effect, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
 use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::session;
@@ -907,7 +908,10 @@ impl App {
             return Task::none();
         };
         match event {
-            call::Event::Connected => active.status = voice::Status::Connected,
+            call::Event::Connected => {
+                active.status = voice::Status::Connected;
+                active.cue_own_join(Instant::now());
+            }
             call::Event::Reconnecting { attempt } => {
                 active.status = voice::Status::Reconnecting(attempt);
             }
@@ -924,6 +928,13 @@ impl App {
         let Screen::Main(m) = &mut self.screen else {
             return Task::none();
         };
+        // Saída da própria pessoa (a do botão já tirou a call antes; ver `leave_call`).
+        // Fechando a janela o processo acaba logo, e o som sairia cortado.
+        if m.closing.is_none()
+            && let Some(engine) = m.call.as_ref().and_then(|c| c.engine.as_ref())
+        {
+            engine.play(Effect::Leave);
+        }
         m.call = None;
         let closing = m.closing.take();
         m.notice = voice::end_notice(end).map(str::to_owned);
@@ -945,6 +956,9 @@ impl App {
         if let Screen::Main(m) = &mut self.screen
             && let Some(active) = m.call.take()
         {
+            if let Some(engine) = &active.engine {
+                engine.play(Effect::Leave);
+            }
             active.leave();
         }
     }

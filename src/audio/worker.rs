@@ -1,6 +1,7 @@
 //! Thread de áudio: dona do APM, das filas e dos streams do cpal, que não são `Send`.
 use std::{
     sync::{Arc, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -25,6 +26,7 @@ pub enum Command {
     Sensitivity(Sensitivity),
     Input(Option<String>),
     Output(Option<String>),
+    Effect(&'static [u8]),
     Voice {
         key: String,
         name: String,
@@ -86,6 +88,8 @@ pub fn run(
     let mut output = Side::new(prefs.output);
     let mut mix = [0f32; FRAME];
     let mut pcm = [0i16; FRAME];
+    // Motor solto com som de saída tocando: só a saída segue, até o som acabar.
+    let mut closing = false;
 
     let keep_open = |output: &mut Side<_>, input: &mut Side<_>| {
         let now = Instant::now();
@@ -104,7 +108,15 @@ pub fn run(
         let mut next = match commands.recv_timeout(TICK) {
             Ok(command) => Some(command),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if !mixer.playing() || output.stream.is_none() {
+                    return;
+                }
+                closing = true;
+                input.stream = None;
+                thread::sleep(TICK);
+                None
+            }
         };
         while let Some(command) = next {
             match command {
@@ -116,11 +128,14 @@ pub fn run(
                 Command::Sensitivity(sensitivity) => chain.gate.set_sensitivity(sensitivity),
                 Command::Input(name) => input.switch(name),
                 Command::Output(name) => output.switch(name),
+                Command::Effect(pcm) => mixer.play(pcm),
                 Command::Voice { key, name, queue } => mixer.add(key, name, queue),
             }
             next = commands.try_recv().ok();
         }
-        keep_open(&mut output, &mut input);
+        if !closing {
+            keep_open(&mut output, &mut input);
+        }
 
         // Reverse antes do forward: o APM precisa ver o som antes do eco dele.
         if let Some(stream) = &mut output.stream {
