@@ -101,6 +101,14 @@ impl Quality {
     }
 }
 
+/// Pro menu do seletor do Windows: "Alta · 1080p · 30 fps".
+impl std::fmt::Display for Quality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let resumo = self.detail().rsplit_once(" · ").map_or("", |(r, _)| r);
+        write!(f, "{} · {resumo}", self.label())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum State {
     #[default]
@@ -133,9 +141,70 @@ impl std::fmt::Display for Source {
     }
 }
 
-/// Telas primeiro, depois as janelas com título. Bloqueia: chamar fora da interface.
+/// Miniatura RGBA do seletor.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct Thumb {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Caixa da miniatura: a interface mostra em 16:9.
+#[cfg_attr(not(windows), allow(dead_code))]
+const THUMB: (u32, u32) = (320, 180);
+
+/// Quadro BGRA do WebRTC reduzido pra caber em [`THUMB`], já em RGBA.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn thumb_of(bgra: &[u8], stride: u32, width: u32, height: u32) -> Thumb {
+    let mut full = image::RgbaImage::new(width, height);
+    for (y, row) in full.rows_mut().enumerate() {
+        let line = &bgra[y * stride as usize..];
+        for (x, px) in row.enumerate() {
+            let p = &line[x * 4..x * 4 + 4];
+            *px = image::Rgba([p[2], p[1], p[0], 255]);
+        }
+    }
+    let (w, h) = fit(width, height, Some(THUMB));
+    Thumb {
+        width: w,
+        height: h,
+        rgba: image::imageops::thumbnail(&full, w, h).into_raw(),
+    }
+}
+
+/// Um quadro da fonte, num capturador só dela. A captura de janela pode demorar uns
+/// quadros pra entregar o primeiro.
 #[cfg(windows)]
-pub fn sources() -> Vec<Source> {
+fn snapshot(kind: DesktopCaptureSourceType, id: u64) -> Option<Thumb> {
+    use std::sync::Mutex;
+    let mut capturer = DesktopCapturer::new(DesktopCapturerOptions::new(kind))?;
+    let source = capturer
+        .get_source_list()
+        .into_iter()
+        .find(|s| s.id() == id)?;
+    let slot = Arc::new(Mutex::new(None));
+    let out = slot.clone();
+    capturer.start_capture(Some(source), move |result| {
+        if let Ok(f) = result {
+            let thumb = thumb_of(f.data(), f.stride(), f.width() as u32, f.height() as u32);
+            *out.lock().unwrap() = Some(thumb);
+        }
+    });
+    for _ in 0..10 {
+        capturer.capture_frame();
+        if let Some(thumb) = slot.lock().unwrap().take() {
+            return Some(thumb);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// Telas primeiro, depois as janelas com título, cada uma com a miniatura. Bloqueia:
+/// chamar fora da interface.
+#[cfg(windows)]
+pub fn sources() -> Vec<(Source, Option<Thumb>)> {
     let list = |window: bool| {
         let kind = if window {
             DesktopCaptureSourceType::Window
@@ -148,15 +217,19 @@ pub fn sources() -> Vec<Source> {
         found
             .into_iter()
             .enumerate()
-            .filter(move |(_, s)| !window || !s.title().trim().is_empty())
-            .map(move |(i, s)| Source {
-                window,
-                id: s.id(),
-                title: if window {
-                    s.title()
-                } else {
-                    format!("Tela {}", i + 1)
-                },
+            .filter(|(_, s)| !window || !s.title().trim().is_empty())
+            .map(|(i, s)| {
+                let source = Source {
+                    window,
+                    id: s.id(),
+                    title: if window {
+                        s.title()
+                    } else {
+                        format!("Tela {}", i + 1)
+                    },
+                };
+                let thumb = snapshot(kind, source.id);
+                (source, thumb)
             })
             .collect::<Vec<_>>()
     };
@@ -166,7 +239,7 @@ pub fn sources() -> Vec<Source> {
 }
 
 #[cfg(not(windows))]
-pub fn sources() -> Vec<Source> {
+pub fn sources() -> Vec<(Source, Option<Thumb>)> {
     Vec::new()
 }
 
@@ -567,20 +640,45 @@ mod tests {
         assert!(curto.ends_with('…'));
     }
 
-    /// Lista as fontes de verdade, sem capturar: `cargo test -- --ignored fontes_do_windows`.
+    /// Lista as fontes de verdade com o tempo das miniaturas, um quadro de cada:
+    /// `cargo test --release -- --ignored fontes_do_windows --nocapture`.
     #[cfg(windows)]
     #[test]
     #[ignore]
     fn fontes_do_windows() {
+        let inicio = Instant::now();
         let fontes = sources();
-        for f in &fontes {
-            println!(
-                "{} {:>10} {f}",
-                if f.window { "JANELA" } else { "TELA  " },
-                f.id
-            );
+        for (f, thumb) in &fontes {
+            let tamanho = thumb.as_ref().map(|t| (t.width, t.height));
+            let tipo = if f.window { "JANELA" } else { "TELA  " };
+            println!("{tipo} {:>10} {tamanho:?} {f}", f.id);
         }
-        assert!(fontes.first().is_some_and(|f| !f.window), "falta a tela");
+        println!(
+            "{} fontes em {} ms",
+            fontes.len(),
+            inicio.elapsed().as_millis()
+        );
+        assert!(
+            fontes.first().is_some_and(|(f, _)| !f.window),
+            "falta a tela"
+        );
+    }
+
+    #[test]
+    fn miniatura_vira_rgba_e_cabe_na_caixa() {
+        // 640x360 todo azul em BGRA, com 16 bytes de sobra por linha.
+        let (w, h, stride) = (640u32, 360u32, 640 * 4 + 16);
+        let mut bgra = vec![0u8; (stride * h) as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let i = y * stride as usize + x * 4;
+                bgra[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+            }
+        }
+        let t = thumb_of(&bgra, stride, w, h);
+        assert_eq!((t.width, t.height), (320, 180));
+        assert_eq!(t.rgba.len(), 320 * 180 * 4);
+        assert_eq!(&t.rgba[..4], &[0, 0, 255, 255], "azul em RGBA");
     }
 
     const HD: Option<(u32, u32)> = Some((1280, 720));

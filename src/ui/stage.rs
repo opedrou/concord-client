@@ -1,26 +1,31 @@
 //! Palco da call: grade de tiles, barra de controles e painel de volume.
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, center, column, container, mouse_area, opaque, pick_list, pin, responsive,
-    row, slider, space, stack, text, toggler,
+    Column, Row, button, center, checkbox, column, container, image, mouse_area, opaque, pick_list,
+    pin, responsive, row, scrollable, slider, space, stack, text, toggler,
 };
-use iced::{Alignment, Color, Element, Length, Padding, Size, Theme, border};
+use iced::{Alignment, Color, ContentFit, Element, Length, Padding, Size, Theme, border};
 
 use super::sidebar::{
     CLOSE, HEADPHONES, HEADPHONES_OFF, MIC, MIC_OFF, SCREEN, VOLUME, VOLUME_X, icon, live_badge,
     tipped,
 };
-use super::theme::{self, ACCENT, ACCENT2, BG2, BORDER, BORDER2, DANGER, FG, FG2, GREEN, IDLE};
+use super::theme::{self, ACCENT, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, FG, FG2, GREEN, IDLE};
 use super::voice::{self, ActiveCall, GAP, Status};
 use super::{Main, Msg, avatar};
 use crate::call::{Live, MAX_ATTEMPTS};
 use crate::config::Config;
-use crate::share::{Choice, Quality, State, View};
+use crate::share::{Choice, Quality, Source, State, View};
 
 /// Largura fixa e altura aproximada do painel de volume, pra centrar no tile.
 const PANEL: Size = Size::new(280.0, 104.0);
 /// Largura do painel de qualidade.
 const SHARE_PANEL: f32 = 340.0;
+/// Seletor do Windows: três miniaturas por linha, com rolagem a partir da terceira.
+const PICKER: f32 = 620.0;
+const PICKER_COLUMNS: usize = 3;
+const PICKER_GRID: f32 = 300.0;
+const THUMB_HEIGHT: f32 = 104.0;
 /// Barra de controles com a margem dela, pra os avisos abrirem logo acima.
 const ABOVE_BAR: f32 = 94.0;
 
@@ -228,7 +233,8 @@ fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element
             Some(view) => audio_line(view),
             None => return None,
         },
-        _ if call.share_panel => share_card(call, config),
+        _ if call.share_panel && cfg!(windows) => picker(call, config),
+        _ if call.share_panel => share_card(config),
         _ => return None,
     };
     Some(
@@ -261,7 +267,7 @@ fn choosing<'a>() -> Element<'a, Msg> {
 }
 
 /// Qualidade da próxima transmissão. Sem fundo clicável, como o painel de volume.
-fn share_card<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
+fn share_card(config: &Config) -> Element<'_, Msg> {
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(28))
         .padding(0)
         .style(theme::ghost)
@@ -312,22 +318,7 @@ fn share_card<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> 
             .into()
     });
 
-    // Seletor do Windows: no Linux a lista fica vazia e quem escolhe é o portal.
-    let source: Option<Element<'_, Msg>> = (!call.share_sources.is_empty()).then(|| {
-        pick_list(
-            call.share_sources.as_slice(),
-            call.share_source.as_ref(),
-            Msg::ShareSource,
-        )
-        .width(Length::Fill)
-        .padding([9, 12])
-        .style(theme::pick)
-        .into()
-    });
-
-    let body = column![head]
-        .push(source)
-        .push(Column::with_children(options).spacing(2))
+    let body = column![head, Column::with_children(options).spacing(2)]
         .push(audio)
         .push(start)
         .spacing(10);
@@ -335,6 +326,124 @@ fn share_card<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> 
         .width(SHARE_PANEL)
         .padding(12)
         .style(floating(BORDER))
+        .into()
+}
+
+/// Seletor do Windows: abas de aplicativos e telas, miniatura com o nome embaixo, áudio e
+/// qualidade. No Linux quem escolhe é o portal, e vale o [`share_card`].
+fn picker<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
+    let close = button(container(icon(CLOSE, 16.0, FG2)).center(28))
+        .padding(0)
+        .style(theme::ghost)
+        .on_press(Msg::ShareButton);
+    let head = row![
+        text("Transmitir a tela")
+            .size(14.4)
+            .font(theme::SEMIBOLD)
+            .width(Length::Fill),
+        close
+    ]
+    .align_y(Alignment::Center);
+
+    let tab = |label, windows: bool| {
+        button(text(label).size(14).font(theme::SEMIBOLD).center())
+            .padding([7, 16])
+            .style(theme::nav_item(call.share_windows == windows))
+            .on_press(Msg::ShareTab(windows))
+    };
+    let tabs = row![tab("Aplicativos", true), tab("Telas", false)].spacing(6);
+
+    let grid: Element<'_, Msg> = match &call.share_sources {
+        None => center(text("Lendo telas e janelas…").size(13.5).color(FG2))
+            .height(PICKER_GRID)
+            .into(),
+        Some(list) => {
+            let tiles: Vec<Element<'_, Msg>> = list
+                .iter()
+                .filter(|(s, _)| s.window == call.share_windows)
+                .map(|(s, thumb)| {
+                    source_tile(s, thumb.as_ref(), call.share_source.as_ref() == Some(s))
+                })
+                .collect();
+            if tiles.is_empty() {
+                center(text("Nenhuma janela aberta.").size(13.5).color(FG2))
+                    .height(PICKER_GRID)
+                    .into()
+            } else {
+                let mut rows = Column::new().spacing(8);
+                let mut tiles = tiles.into_iter().peekable();
+                while tiles.peek().is_some() {
+                    let mut line = Row::new().spacing(8);
+                    for _ in 0..PICKER_COLUMNS {
+                        line = line.push(match tiles.next() {
+                            Some(t) => t,
+                            None => space().width(Length::FillPortion(1)).into(),
+                        });
+                    }
+                    rows = rows.push(line);
+                }
+                scrollable(rows)
+                    .height(PICKER_GRID)
+                    .style(theme::thin_scroll)
+                    .into()
+            }
+        }
+    };
+
+    let quality = pick_list(Quality::ALL, Some(config.share_quality), Msg::ShareQuality)
+        .padding([8, 12])
+        .style(theme::pick);
+    let audio = checkbox(config.share_audio)
+        .label(if call.share_windows {
+            "Áudio do aplicativo"
+        } else {
+            "Áudio do computador"
+        })
+        .on_toggle(Msg::ShareAudio)
+        .size(18)
+        .text_size(14);
+    let start = button(text("Transmitir").size(14.5).font(theme::BOLD).center())
+        .padding([10, 22])
+        .style(theme::primary)
+        .on_press_maybe(call.share_source.is_some().then_some(Msg::ShareStart));
+    let foot = row![quality, space().width(Length::Fill), audio, start]
+        .spacing(14)
+        .align_y(Alignment::Center);
+
+    container(column![head, tabs, grid, foot].spacing(12))
+        .width(PICKER)
+        .padding(14)
+        .style(floating(BORDER))
+        .into()
+}
+
+/// Miniatura em 16:9 com o nome pequeno embaixo.
+fn source_tile<'a>(
+    source: &'a Source,
+    thumb: Option<&'a image::Handle>,
+    chosen: bool,
+) -> Element<'a, Msg> {
+    let preview: Element<'_, Msg> = match thumb {
+        Some(h) => image(h.clone())
+            .width(Length::Fill)
+            .height(THUMB_HEIGHT)
+            .content_fit(ContentFit::Contain)
+            .into(),
+        None => container(space())
+            .width(Length::Fill)
+            .height(THUMB_HEIGHT)
+            .style(theme::fill(BG))
+            .into(),
+    };
+    let name = text(source.to_string())
+        .size(12)
+        .color(if chosen { FG } else { FG2 })
+        .wrapping(Wrapping::None);
+    button(column![preview, name].spacing(6))
+        .padding(6)
+        .width(Length::FillPortion(1))
+        .style(theme::nav_item(chosen))
+        .on_press(Msg::ShareSource(source.clone()))
         .into()
 }
 

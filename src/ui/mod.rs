@@ -21,7 +21,7 @@ use crate::audio::{self, Devices, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
 use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::session;
-use crate::share::{Choice, Quality, Source};
+use crate::share::{Choice, Quality, Source, Thumb};
 
 const POLL: Duration = Duration::from_secs(4);
 /// Falhas seguidas de presença até o rodapé trocar "Online" por "Sem conexão".
@@ -154,9 +154,11 @@ pub enum Msg {
     ShareAudio(bool),
     ShareStart,
     ShareStop,
-    /// Telas e janelas lidas pro seletor do Windows.
-    ShareSources(Vec<Source>),
+    /// Telas e janelas lidas pro seletor do Windows, com a miniatura.
+    ShareSources(Vec<(Source, Option<Thumb>)>),
     ShareSource(Source),
+    /// Aba do seletor: `true` em Aplicativos.
+    ShareTab(bool),
     /// Abre e fecha a lista de áudio da transmissão no ar.
     AudioList,
     AudioChoice(Choice),
@@ -449,7 +451,8 @@ impl App {
                 if !(cfg!(windows) && call.share_panel) {
                     return Task::none();
                 }
-                // Listar janelas bloqueia: lê fora da thread da interface.
+                call.share_sources = None;
+                // Listar e tirar as miniaturas bloqueia: lê fora da thread da interface.
                 Task::future(async {
                     let sources = tokio::task::spawn_blocking(crate::share::sources).await;
                     Msg::ShareSources(sources.unwrap_or_default())
@@ -464,6 +467,12 @@ impl App {
             Msg::ShareSource(source) => {
                 if let Some(call) = self.call_mut() {
                     call.share_source = Some(source);
+                }
+                Task::none()
+            }
+            Msg::ShareTab(windows) => {
+                if let Some(call) = self.call_mut() {
+                    call.set_share_tab(windows);
                 }
                 Task::none()
             }

@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use iced::widget::image;
 use iced::{Point, Size};
 
 use crate::api::{self, Participant};
@@ -72,10 +73,13 @@ pub struct ActiveCall {
     pub share: share::State,
     /// Painel de qualidade aberto.
     pub share_panel: bool,
-    /// Telas e janelas do seletor do Windows, lidas ao abrir o painel. Vazia no Linux.
-    pub share_sources: Vec<share::Source>,
-    /// Escolhida no seletor; `None` é a primeira tela.
+    /// Telas e janelas do seletor do Windows, com a miniatura, lidas ao abrir o painel.
+    /// Vazia no Linux. `None` enquanto lê.
+    pub share_sources: Option<Vec<(share::Source, Option<image::Handle>)>>,
+    /// Escolhida no seletor. Na aba de telas sempre tem uma; na de aplicativos começa vazia.
     pub share_source: Option<share::Source>,
+    /// Aba do seletor: `true` em Aplicativos.
+    pub share_windows: bool,
     /// Áudio da transmissão no ar, por `Event::ShareAudio`.
     pub share_audio: Option<share::View>,
     /// Lista de áudio aberta, sobre o palco.
@@ -96,8 +100,9 @@ impl ActiveCall {
             volume_panel: None,
             share: share::State::Off,
             share_panel: false,
-            share_sources: Vec::new(),
+            share_sources: None,
             share_source: None,
+            share_windows: false,
             share_audio: None,
             audio_list: false,
         }
@@ -134,16 +139,39 @@ impl ActiveCall {
         }
     }
 
-    /// Lista nova do seletor. A escolha anterior fica se ainda existir; senão, a primeira.
-    pub fn set_share_sources(&mut self, sources: Vec<share::Source>) {
-        if !self
+    /// Lista nova do seletor, com as miniaturas já prontas pra tela.
+    pub fn set_share_sources(&mut self, sources: Vec<(share::Source, Option<share::Thumb>)>) {
+        let sources = sources
+            .into_iter()
+            .map(|(s, t)| {
+                let handle = t.map(|t| image::Handle::from_rgba(t.width, t.height, t.rgba));
+                (s, handle)
+            })
+            .collect();
+        self.share_sources = Some(sources);
+        self.fix_share_source();
+    }
+
+    pub fn set_share_tab(&mut self, windows: bool) {
+        self.share_windows = windows;
+        self.fix_share_source();
+    }
+
+    /// A escolha fica se ainda existir e for da aba aberta. Senão, nas telas vai a
+    /// primeira, que não dá pra desmarcar; nos aplicativos, nenhum.
+    fn fix_share_source(&mut self) {
+        let list = self.share_sources.as_deref().unwrap_or_default();
+        let windows = self.share_windows;
+        let kept = self
             .share_source
             .as_ref()
-            .is_some_and(|s| sources.contains(s))
-        {
-            self.share_source = sources.first().cloned();
+            .is_some_and(|c| c.window == windows && list.iter().any(|(s, _)| s == c));
+        if !kept {
+            self.share_source = list
+                .iter()
+                .find(|(s, _)| !windows && !s.window)
+                .map(|(s, _)| s.clone());
         }
-        self.share_sources = sources;
     }
 
     /// O áudio só existe com a transmissão no ar.
@@ -324,24 +352,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seletor_mantem_a_escolha_se_ela_ainda_existe() {
+    fn seletor_tela_sempre_marcada_aplicativo_so_no_clique() {
         let fonte = |id, title: &str| share::Source {
             window: id > 1,
             id,
             title: title.into(),
         };
+        let lista = |ids: &[u64]| {
+            ids.iter()
+                .map(|&id| (fonte(id, &id.to_string()), None))
+                .collect::<Vec<_>>()
+        };
         let mut call = ActiveCall::new(1, "call-tete".into());
-        call.set_share_sources(vec![fonte(1, "Tela 1"), fonte(7, "YouTube")]);
-        assert_eq!(
-            call.share_source,
-            Some(fonte(1, "Tela 1")),
-            "começa na tela"
-        );
-        call.share_source = Some(fonte(7, "YouTube"));
-        call.set_share_sources(vec![fonte(1, "Tela 1"), fonte(7, "YouTube")]);
-        assert_eq!(call.share_source, Some(fonte(7, "YouTube")));
-        call.set_share_sources(vec![fonte(1, "Tela 1")]);
-        assert_eq!(call.share_source, Some(fonte(1, "Tela 1")), "janela fechou");
+        call.set_share_sources(lista(&[0, 1, 7]));
+        assert_eq!(call.share_source, Some(fonte(0, "0")), "começa na tela 1");
+
+        call.set_share_tab(true);
+        assert_eq!(call.share_source, None, "aplicativo só no clique");
+        call.share_source = Some(fonte(7, "7"));
+        call.set_share_sources(lista(&[0, 1, 7]));
+        assert_eq!(call.share_source, Some(fonte(7, "7")), "lista nova mantém");
+        call.set_share_sources(lista(&[0, 1]));
+        assert_eq!(call.share_source, None, "janela fechou");
+
+        call.share_source = Some(fonte(1, "1"));
+        call.set_share_tab(false);
+        assert_eq!(call.share_source, Some(fonte(1, "1")), "tela 2 fica");
+        call.set_share_sources(lista(&[0]));
+        assert_eq!(call.share_source, Some(fonte(0, "0")), "monitor saiu");
     }
 
     #[test]
