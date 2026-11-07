@@ -1,7 +1,7 @@
 //! Telas fora da sidebar: endereço, login, offline, home e configurações.
 use iced::widget::{
-    Column, button, center, column, container, mouse_area, opaque, row, space, stack, text,
-    text_input,
+    Column, button, center, column, container, mouse_area, opaque, pick_list, row, slider, space,
+    stack, text, text_input,
 };
 use iced::{Alignment, Element, Length, Theme};
 
@@ -9,6 +9,11 @@ use super::sidebar::{CLOSE, icon, mark};
 use super::theme::{self, BG, DANGER, FG, FG2, IDLE};
 use super::{ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avatar};
 use crate::api::Secret;
+use crate::audio::NoiseLevel;
+use crate::config::Config;
+
+/// Primeira opção das listas de dispositivo: `None` na config.
+const PADRAO: &str = "Padrão do sistema";
 
 const COLUNA: f32 = 400.0;
 
@@ -147,7 +152,7 @@ pub fn offline(server: &str) -> Element<'_, Msg> {
     )
 }
 
-pub fn home(username: &str) -> Element<'_, Msg> {
+pub fn home<'a>(username: &'a str, notice: Option<&'a str>) -> Element<'a, Msg> {
     page(
         column![
             mark(92.0),
@@ -158,13 +163,14 @@ pub fn home(username: &str) -> Element<'_, Msg> {
                 .center(),
             text("Escolha um canal pra começar.").size(16).color(FG2),
         ]
+        .push(notice.map(|n| text(n).size(14).color(IDLE)))
         .spacing(12)
         .padding(40)
         .align_x(Alignment::Center),
     )
 }
 
-pub fn settings(m: &Main, tab: Tab) -> Element<'_, Msg> {
+pub fn settings<'a>(m: &'a Main, config: &'a Config, tab: Tab) -> Element<'a, Msg> {
     let item = |label, target| {
         button(text(label).size(14.4).font(theme::MEDIUM))
             .padding([8, 12])
@@ -176,6 +182,7 @@ pub fn settings(m: &Main, tab: Tab) -> Element<'_, Msg> {
         column![
             item("Servidor", Tab::Server),
             item("Conta", Tab::Account),
+            item("Voz", Tab::Voice),
             item("Sobre", Tab::About)
         ]
         .spacing(4),
@@ -187,6 +194,7 @@ pub fn settings(m: &Main, tab: Tab) -> Element<'_, Msg> {
     let panel = match tab {
         Tab::Server => server_panel(m),
         Tab::Account => account_panel(m),
+        Tab::Voice => voice_panel(m, config),
         Tab::About => about_panel(),
     };
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(32))
@@ -208,7 +216,7 @@ pub fn settings(m: &Main, tab: Tab) -> Element<'_, Msg> {
         body
     ])
     .width(640)
-    .height(420)
+    .height(440)
     .style(theme::card);
 
     stack![
@@ -275,6 +283,73 @@ fn account_panel(m: &Main) -> Element<'_, Msg> {
         .push(action("Sair", Msg::Logout, theme::danger))
         .spacing(16)
         .into()
+}
+
+/// Opções de um dispositivo: "Padrão do sistema" e depois a lista do sistema.
+fn device_field<'a>(
+    label: &'a str,
+    names: &[String],
+    selected: &Option<String>,
+    msg: fn(Option<String>) -> Msg,
+) -> Element<'a, Msg> {
+    let options: Vec<String> = [PADRAO.to_owned()]
+        .into_iter()
+        .chain(names.iter().cloned())
+        .collect();
+    let current = selected.clone().unwrap_or_else(|| PADRAO.to_owned());
+    let list = pick_list(options, Some(current), move |name| {
+        msg((name != PADRAO).then_some(name))
+    })
+    .width(Length::Fill)
+    .padding([9, 12])
+    .text_size(14.4)
+    .style(theme::pick)
+    .menu_style(theme::pick_menu);
+    labeled(label, list)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Noise(NoiseLevel);
+
+impl std::fmt::Display for Noise {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            NoiseLevel::Off => "Desligada",
+            NoiseLevel::Apm => "Navegador",
+            NoiseLevel::Rnnoise => "RNNoise",
+        })
+    }
+}
+
+fn voice_panel<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
+    let devices = m.devices.clone().unwrap_or_default();
+    let noise = pick_list(
+        [NoiseLevel::Off, NoiseLevel::Apm, NoiseLevel::Rnnoise].map(Noise),
+        Some(Noise(config.noise)),
+        |n| Msg::Noise(n.0),
+    )
+    .width(Length::Fill)
+    .padding([9, 12])
+    .text_size(14.4)
+    .style(theme::pick)
+    .menu_style(theme::pick_menu);
+    let master = slider(0..=100u8, config.master_volume, Msg::Master)
+        .on_release(Msg::VolumeDone)
+        .width(Length::Fill);
+    column![
+        title("Voz"),
+        device_field("Microfone", &devices.inputs, &config.input, Msg::Input),
+        device_field(
+            "Saída de áudio",
+            &devices.outputs,
+            &config.output,
+            Msg::Output
+        ),
+        labeled("Redução de ruído", noise),
+        labeled("Volume geral", master),
+    ]
+    .spacing(14)
+    .into()
 }
 
 fn about_panel<'a>() -> Element<'a, Msg> {

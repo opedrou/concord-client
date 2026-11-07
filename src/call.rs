@@ -1,6 +1,4 @@
 //! Conexão com a sala do LiveKit: entrar, publicar o mic, ouvir os outros e reconectar.
-// Some quando a interface passar a chamar `Call::join`.
-#![allow(dead_code)]
 use std::{collections::HashMap, fmt, future::Future, time::Duration};
 
 use futures_util::StreamExt;

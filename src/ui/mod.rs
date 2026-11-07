@@ -2,22 +2,34 @@
 mod avatar;
 mod screens;
 mod sidebar;
+mod stage;
 pub mod theme;
+mod voice;
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{image, operation, row, stack};
 use iced::{Element, Event, Subscription, Task, Theme, event, mouse, time, window};
+use voice::{ActiveCall, Boot};
 
-use crate::api::{self, AddressError, Channel, Client, Error, Member, Presence, Secret, User};
+use crate::api::{
+    self, AddressError, Channel, ChannelKind, Client, Error, Member, Presence, Secret, User,
+};
+use crate::audio::{self, Devices, Engine, NoiseLevel};
+use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::session;
 
 const POLL: Duration = Duration::from_secs(4);
 /// Falhas seguidas de presença até o rodapé trocar "Online" por "Sem conexão".
 const FALHAS_ATE_AVISAR: u8 = 3;
+
+/// Tempo que a saída espera o `Ended` antes de fechar a janela mesmo assim.
+const ESPERA_AO_FECHAR: Duration = Duration::from_secs(2);
+/// Relógio do anel de fala: o hold é de 400 ms, então 100 ms apaga sem atraso visível.
+const QUADRO: Duration = Duration::from_millis(100);
 
 const ID_SERVIDOR: &str = "campo-servidor";
 const ID_USUARIO: &str = "campo-usuario";
@@ -66,12 +78,21 @@ struct Main {
     settings: Option<Tab>,
     resizing: bool,
     vault_ok: bool,
+    call: Option<ActiveCall>,
+    next_call: u64,
+    /// Aviso curto na home: motivo de a call ter acabado ou de não ter aberto.
+    notice: Option<String>,
+    /// Lista do sistema, lida ao abrir a aba Voz.
+    devices: Option<Devices>,
+    /// Janela que pediu pra fechar e espera a call terminar.
+    closing: Option<window::Id>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tab {
     Server,
     Account,
+    Voice,
     About,
 }
 
@@ -99,6 +120,24 @@ pub enum Msg {
     Avatar(String, Option<image::Handle>),
     ToggleMic,
     ToggleDeafen,
+    JoinChannel(String),
+    EngineStarted(u64, Result<Boot, String>),
+    CallEvent(u64, call::Event),
+    /// Relógio do anel de fala.
+    Frame(Instant),
+    Leave,
+    OpenVolume(String),
+    CloseVolume,
+    Volume(String, u8),
+    Master(u8),
+    /// Solta um slider: grava na config.
+    VolumeDone,
+    Input(Option<String>),
+    Output(Option<String>),
+    Noise(NoiseLevel),
+    Devices(Devices),
+    CloseRequested(window::Id),
+    CloseNow(window::Id),
     DragStart,
     DragMove(f32),
     DragEnd,
@@ -179,9 +218,15 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Msg> {
-        let mut subs = vec![keyboard::listen().filter_map(keys)];
+        let mut subs = vec![
+            keyboard::listen().filter_map(keys),
+            window::close_requests().map(Msg::CloseRequested),
+        ];
         if let Screen::Main(m) = &self.screen {
             subs.push(time::every(POLL).map(|_| Msg::Tick));
+            if m.call.as_ref().is_some_and(ActiveCall::holding) {
+                subs.push(time::every(QUADRO).map(Msg::Frame));
+            }
             if m.resizing {
                 subs.push(event::listen_with(drag));
             }
@@ -196,13 +241,17 @@ impl App {
             Screen::Login(f) => screens::login(f),
             Screen::Offline(server) => screens::offline(server),
             Screen::Main(m) => {
+                let content = match &m.call {
+                    Some(call) => stage::view(m, call, &self.config),
+                    None => screens::home(&m.user.username, m.notice.as_deref()),
+                };
                 let base = row![
                     sidebar::view(m, &self.config),
                     sidebar::resize_handle(),
-                    screens::home(&m.user.username),
+                    content,
                 ];
                 match m.settings {
-                    Some(tab) => stack![base, screens::settings(m, tab)].into(),
+                    Some(tab) => stack![base, screens::settings(m, &self.config, tab)].into(),
                     None => base.into(),
                 }
             }
@@ -298,13 +347,93 @@ impl App {
             Msg::ToggleMic => {
                 self.config.toggle_mic();
                 self.persist();
+                self.apply_mute();
                 Task::none()
             }
             Msg::ToggleDeafen => {
                 self.config.toggle_deafen();
                 self.persist();
+                self.apply_mute();
                 Task::none()
             }
+            Msg::JoinChannel(slug) => self.join_channel(slug),
+            Msg::EngineStarted(id, result) => self.engine_started(id, result),
+            Msg::CallEvent(id, event) => self.call_event(id, event),
+            Msg::Frame(now) => {
+                if let Some(call) = self.call_mut() {
+                    call.tick(now);
+                }
+                Task::none()
+            }
+            Msg::Leave => {
+                self.leave_call();
+                Task::none()
+            }
+            Msg::OpenVolume(name) => {
+                if let Some(call) = self.call_mut() {
+                    call.volume_panel = Some(name);
+                }
+                Task::none()
+            }
+            Msg::CloseVolume => {
+                self.close_volume();
+                Task::none()
+            }
+            Msg::Volume(name, slider) => {
+                let muted = self.config.set_volume(&name, slider);
+                if let Some(call) = self.call_mut() {
+                    if let (Some(muted), Some(c)) = (muted, &call.call) {
+                        c.set_muted_people(muted);
+                    }
+                    if let Some(engine) = &call.engine {
+                        engine.set_person_volume(&name, slider);
+                    }
+                }
+                Task::none()
+            }
+            Msg::Master(slider) => {
+                self.config.master_volume = slider;
+                if let Some(engine) = self.engine() {
+                    engine.set_master(slider);
+                }
+                Task::none()
+            }
+            Msg::VolumeDone => {
+                self.persist();
+                Task::none()
+            }
+            Msg::Input(name) => {
+                self.config.input = name.clone();
+                self.persist();
+                if let Some(engine) = self.engine() {
+                    engine.set_input(name);
+                }
+                Task::none()
+            }
+            Msg::Output(name) => {
+                self.config.output = name.clone();
+                self.persist();
+                if let Some(engine) = self.engine() {
+                    engine.set_output(name);
+                }
+                Task::none()
+            }
+            Msg::Noise(level) => {
+                self.config.noise = level;
+                self.persist();
+                if let Some(engine) = self.engine() {
+                    engine.set_noise(level);
+                }
+                Task::none()
+            }
+            Msg::Devices(devices) => {
+                if let Screen::Main(m) = &mut self.screen {
+                    m.devices = Some(devices);
+                }
+                Task::none()
+            }
+            Msg::CloseRequested(id) => self.close_requested(id),
+            Msg::CloseNow(id) => window::close(id),
             Msg::DragStart => {
                 if let Screen::Main(m) = &mut self.screen {
                     m.resizing = true;
@@ -326,11 +455,25 @@ impl App {
                 if let Screen::Main(m) = &mut self.screen {
                     m.settings = Some(tab);
                 }
+                if tab == Tab::Voice {
+                    // `devices()` bloqueia: lê fora da thread da interface.
+                    return Task::future(async {
+                        let devices = tokio::task::spawn_blocking(audio::devices).await;
+                        Msg::Devices(devices.unwrap_or_default())
+                    });
+                }
                 Task::none()
             }
-            Msg::CloseSettings | Msg::Escape => {
+            Msg::CloseSettings => {
                 if let Screen::Main(m) = &mut self.screen {
                     m.settings = None;
+                }
+                Task::none()
+            }
+            Msg::Escape => {
+                match &mut self.screen {
+                    Screen::Main(m) if m.settings.is_some() => m.settings = None,
+                    _ => self.close_volume(),
                 }
                 Task::none()
             }
@@ -338,6 +481,156 @@ impl App {
             Msg::FocusNext => operation::focus_next(),
             Msg::FocusPrevious => operation::focus_previous(),
         }
+    }
+
+    fn call_mut(&mut self) -> Option<&mut ActiveCall> {
+        match &mut self.screen {
+            Screen::Main(m) => m.call.as_mut(),
+            _ => None,
+        }
+    }
+
+    fn engine(&self) -> Option<&Engine> {
+        match &self.screen {
+            Screen::Main(m) => m.call.as_ref()?.engine.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn apply_mute(&self) {
+        if let Screen::Main(m) = &self.screen
+            && let Some(call) = &m.call
+        {
+            call.apply_mute(&self.config);
+        }
+    }
+
+    fn close_volume(&mut self) {
+        if let Some(call) = self.call_mut() {
+            call.volume_panel = None;
+        }
+    }
+
+    /// Clicar no canal da call volta pra ela; em outro, sai e entra no novo.
+    fn join_channel(&mut self, slug: String) -> Task<Msg> {
+        let Screen::Main(m) = &mut self.screen else {
+            return Task::none();
+        };
+        let is_voice = m
+            .channels
+            .iter()
+            .any(|c| c.slug == slug && c.kind == ChannelKind::Voice);
+        let same = m.call.as_ref().is_some_and(|c| c.slug == slug);
+        if !is_voice || same || m.closing.is_some() {
+            return Task::none();
+        }
+        if let Some(old) = m.call.take() {
+            old.leave();
+        }
+        m.notice = None;
+        m.next_call += 1;
+        let id = m.next_call;
+        m.call = Some(ActiveCall::new(id, slug));
+        let prefs = self.config.audio_prefs();
+        // `Engine::start` bloqueia: abre o áudio fora da thread da interface.
+        Task::future(async move {
+            let started = tokio::task::spawn_blocking(move || Engine::start(prefs))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            Msg::EngineStarted(id, started.map(Boot::new))
+        })
+    }
+
+    fn engine_started(&mut self, id: u64, result: Result<Boot, String>) -> Task<Msg> {
+        let Screen::Main(m) = &mut self.screen else {
+            return Task::none();
+        };
+        // Saiu ou trocou de canal enquanto o áudio abria: o motor cai aqui.
+        let Some(active) = m.call.as_mut().filter(|c| c.id == id) else {
+            return Task::none();
+        };
+        let started =
+            result.and_then(|boot| boot.take().ok_or_else(|| "motor indisponível".into()));
+        let (engine, mic) = match started {
+            Ok(started) => started,
+            Err(e) => {
+                m.call = None;
+                m.notice = Some(format!("Não foi possível abrir o áudio: {e}"));
+                return Task::none();
+            }
+        };
+        engine.set_deafened(self.config.deafened);
+        let (call, events) = Call::join(
+            m.client.clone(),
+            active.slug.clone(),
+            self.config.install_id.clone(),
+            engine.clone(),
+            mic,
+            self.config.mic_muted,
+        );
+        let muted = self.config.muted_people();
+        if !muted.is_empty() {
+            call.set_muted_people(muted);
+        }
+        active.attach(call, engine);
+        let events = futures_util::stream::unfold(events, |mut rx| async {
+            rx.recv().await.map(|event| (event, rx))
+        });
+        Task::run(events, move |event| Msg::CallEvent(id, event))
+    }
+
+    fn call_event(&mut self, id: u64, event: call::Event) -> Task<Msg> {
+        let Some(active) = self.call_mut().filter(|c| c.id == id) else {
+            return Task::none();
+        };
+        match event {
+            call::Event::Connected => active.status = voice::Status::Connected,
+            call::Event::Reconnecting { attempt } => {
+                active.status = voice::Status::Reconnecting(attempt);
+            }
+            call::Event::Participants(list) => active.participants(list, Instant::now()),
+            call::Event::Ended(end) => return self.call_ended(end),
+        }
+        Task::none()
+    }
+
+    fn call_ended(&mut self, end: End) -> Task<Msg> {
+        let Screen::Main(m) = &mut self.screen else {
+            return Task::none();
+        };
+        m.call = None;
+        let closing = m.closing.take();
+        m.notice = voice::end_notice(end).map(str::to_owned);
+        let expired = match end {
+            End::Unauthorized => self.session_expired(),
+            _ => Task::none(),
+        };
+        Task::batch([expired, closing.map_or_else(Task::none, window::close)])
+    }
+
+    /// Sair da call deixa a tela na home na hora; o `Ended(Left)` que vem depois é
+    /// ignorado porque a call já não existe.
+    fn leave_call(&mut self) {
+        if let Screen::Main(m) = &mut self.screen
+            && let Some(active) = m.call.take()
+        {
+            active.leave();
+        }
+    }
+
+    fn close_requested(&mut self, id: window::Id) -> Task<Msg> {
+        if let Screen::Main(m) = &mut self.screen
+            && m.closing.is_none()
+            && let Some(call) = m.call.as_ref().and_then(|c| c.call.as_ref())
+        {
+            call.leave();
+            m.closing = Some(id);
+            return Task::future(async move {
+                tokio::time::sleep(ESPERA_AO_FECHAR).await;
+                Msg::CloseNow(id)
+            });
+        }
+        window::close(id)
     }
 
     fn connected(
@@ -396,6 +689,7 @@ impl App {
     }
 
     fn change_server(&mut self) -> Task<Msg> {
+        self.leave_call();
         let input = match &self.screen {
             Screen::Login(f) => f.server.clone(),
             Screen::Offline(server) => server.clone(),
@@ -479,6 +773,11 @@ impl App {
             settings: None,
             resizing: false,
             vault_ok,
+            call: None,
+            next_call: 0,
+            notice: None,
+            devices: None,
+            closing: None,
         };
         let avatars = main.fetch_avatars();
         self.screen = Screen::Main(Box::new(main));
@@ -514,7 +813,9 @@ impl App {
         match (e, &self.screen) {
             (Error::Unauthorized, _) => self.session_expired(),
             (_, Screen::Main(m)) => {
-                self.screen = Screen::Offline(m.server.clone());
+                let server = m.server.clone();
+                self.leave_call();
+                self.screen = Screen::Offline(server);
                 Task::none()
             }
             _ => Task::none(),
@@ -526,6 +827,7 @@ impl App {
             return Task::none();
         };
         let server = m.server.clone();
+        self.leave_call();
         let error = Some("Sua sessão expirou. Entre de novo.".to_owned());
         self.screen = Screen::Login(LoginForm::new(server.clone(), error));
         Task::batch([
@@ -539,6 +841,7 @@ impl App {
             return Task::none();
         };
         let (server, client) = (m.server.clone(), m.client.clone());
+        self.leave_call();
         self.screen = Screen::Login(LoginForm::new(server.clone(), None));
         // Apaga do cofre antes: com o servidor fora, o logout demora até o tempo esgotar.
         let leave = Task::future(async move {
@@ -830,6 +1133,263 @@ mod tests {
         assert!(!format!("{msg:?}").contains("hunter2"));
     }
 
+    fn canal(id: i64, name: &str, kind: ChannelKind) -> Channel {
+        Channel {
+            id,
+            name: name.into(),
+            slug: name.to_lowercase(),
+            kind,
+        }
+    }
+
+    /// Principal com dois canais de voz e um de texto, sem call.
+    fn voice_app() -> App {
+        let mut a = main_app();
+        main_of(&mut a).channels = vec![
+            canal(1, "Geral", ChannelKind::Text),
+            canal(2, "Call", ChannelKind::Voice),
+            canal(3, "Jogando", ChannelKind::Voice),
+        ];
+        a
+    }
+
+    fn call_of(a: &mut App) -> &mut ActiveCall {
+        main_of(a).call.as_mut().expect("sem call")
+    }
+
+    fn call_id(a: &mut App) -> u64 {
+        call_of(a).id
+    }
+
+    /// Entra em "call" e simula o que o `Call::join` mandaria, sem tocar no contrato.
+    fn in_call(names: &[&str]) -> App {
+        let mut a = voice_app();
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Connected));
+        let list = names.iter().map(|n| voice::test_live(n, false)).collect();
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(list)));
+        a
+    }
+
+    #[test]
+    fn clicar_no_canal_de_voz_entra_sem_tela_previa() {
+        let mut a = voice_app();
+        a.config.mic_muted = true;
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        let c = call_of(&mut a);
+        assert_eq!(
+            (c.slug.as_str(), c.status),
+            ("call", voice::Status::Connecting)
+        );
+        assert!(a.config.mic_muted, "o mic segue o estado salvo");
+    }
+
+    #[test]
+    fn canal_de_texto_ou_desconhecido_nao_entra() {
+        let mut a = voice_app();
+        let _ = a.update(Msg::JoinChannel("geral".into()));
+        let _ = a.update(Msg::JoinChannel("nao-existe".into()));
+        assert!(main_of(&mut a).call.is_none());
+    }
+
+    #[test]
+    fn clicar_no_canal_atual_volta_pra_call_sem_reconectar() {
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        assert_eq!(call_id(&mut a), id);
+        assert!(call_of(&mut a).live.is_some(), "a sala não foi zerada");
+    }
+
+    #[test]
+    fn trocar_de_canal_sai_e_entra_no_novo_e_ignora_eventos_do_antigo() {
+        let mut a = in_call(&["Ana"]);
+        let antigo = call_id(&mut a);
+        let _ = a.update(Msg::JoinChannel("jogando".into()));
+        let novo = call_id(&mut a);
+        assert_ne!(antigo, novo);
+        assert_eq!(call_of(&mut a).slug, "jogando");
+        assert!(call_of(&mut a).live.is_none());
+        let _ = a.update(Msg::CallEvent(antigo, call::Event::Ended(End::Left)));
+        let _ = a.update(Msg::EngineStarted(antigo, Err("velho".into())));
+        assert_eq!(
+            call_id(&mut a),
+            novo,
+            "o fim da call antiga não derruba a nova"
+        );
+    }
+
+    #[test]
+    fn sair_volta_pra_home_e_o_ended_atrasado_nao_faz_nada() {
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::Leave);
+        assert!(main_of(&mut a).call.is_none());
+        let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::Left)));
+        assert!(main_of(&mut a).notice.is_none());
+    }
+
+    #[test]
+    fn mudo_e_surdo_valem_com_e_sem_call() {
+        for com_call in [false, true] {
+            let mut a = if com_call {
+                in_call(&["Ana"])
+            } else {
+                voice_app()
+            };
+            let _ = a.update(Msg::ToggleDeafen);
+            assert!(a.config.deafened && a.config.mic_muted);
+            let _ = a.update(Msg::ToggleMic);
+            assert!(
+                !a.config.deafened && !a.config.mic_muted,
+                "desmutar tira o surdo"
+            );
+            let _ = a.update(Msg::ToggleMic);
+            assert!(a.config.mic_muted);
+        }
+    }
+
+    #[test]
+    fn conectando_reconectando_e_conectado() {
+        let mut a = in_call(&[]);
+        let id = call_id(&mut a);
+        assert_eq!(call_of(&mut a).status, voice::Status::Connected);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Reconnecting { attempt: 3 }));
+        assert_eq!(call_of(&mut a).status, voice::Status::Reconnecting(3));
+        let _ = a.update(Msg::CallEvent(id, call::Event::Connected));
+        assert_eq!(call_of(&mut a).status, voice::Status::Connected);
+    }
+
+    #[test]
+    fn ended_volta_pra_home_com_aviso_conforme_o_motivo() {
+        for (end, aviso) in [
+            (End::Left, None),
+            (
+                End::Duplicate,
+                Some("Você entrou nessa call de outro lugar."),
+            ),
+            (End::Removed, Some("Você foi removido da call.")),
+            (End::RoomClosed, Some("A sala foi fechada.")),
+            (End::GaveUp, Some("Não foi possível reconectar à call.")),
+        ] {
+            let mut a = in_call(&["Ana"]);
+            let id = call_id(&mut a);
+            let _ = a.update(Msg::CallEvent(id, call::Event::Ended(end)));
+            let m = main_of(&mut a);
+            assert!(m.call.is_none(), "{end:?}");
+            assert_eq!(m.notice.as_deref(), aviso, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn sessao_vencida_na_call_usa_o_caminho_de_sessao_expirada() {
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::Unauthorized)));
+        let Screen::Login(f) = &a.screen else {
+            panic!("não voltou pro login")
+        };
+        assert_eq!(
+            f.error.as_deref(),
+            Some("Sua sessão expirou. Entre de novo.")
+        );
+    }
+
+    #[test]
+    fn ended_com_a_janela_fechando_limpa_o_pedido() {
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        main_of(&mut a).closing = Some(window::Id::unique());
+        let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::Left)));
+        assert!(main_of(&mut a).closing.is_none());
+    }
+
+    #[test]
+    fn falha_do_motor_mostra_o_erro_e_volta_pra_home() {
+        let mut a = voice_app();
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::EngineStarted(id, Err("sem placa de som".into())));
+        let m = main_of(&mut a);
+        assert!(m.call.is_none());
+        assert_eq!(
+            m.notice.as_deref(),
+            Some("Não foi possível abrir o áudio: sem placa de som")
+        );
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        assert!(main_of(&mut a).notice.is_none(), "entrar limpa o aviso");
+    }
+
+    #[test]
+    fn sidebar_da_call_usa_a_sala_sem_nome_repetido_e_o_anel_segura_400_ms() {
+        let mut a = voice_app();
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        let id = call_id(&mut a);
+        let antes = Instant::now();
+        let falando = voice::test_live("Zé", true);
+        let mut fantasma = voice::test_live("ana", false);
+        fantasma.identity = "ana__2".into();
+        let lista = vec![falando, voice::test_live("ana", false), fantasma];
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
+        let nomes: Vec<_> = call_of(&mut a)
+            .live
+            .iter()
+            .flatten()
+            .map(|l| l.name.clone())
+            .collect();
+        assert_eq!(nomes, ["ana", "Zé"]);
+        assert!(call_of(&mut a).speaking("Zé"));
+
+        let _ = a.update(Msg::Frame(antes + Duration::from_millis(300)));
+        assert!(call_of(&mut a).speaking("Zé"));
+        let _ = a.update(Msg::Frame(antes + Duration::from_secs(1)));
+        assert!(!call_of(&mut a).speaking("Zé"));
+    }
+
+    #[test]
+    fn arrastar_o_volume_grava_por_nome_e_so_lista_quem_esta_em_zero() {
+        let mut a = in_call(&["Ana", "Bia"]);
+        let _ = a.update(Msg::OpenVolume("Ana".into()));
+        assert_eq!(call_of(&mut a).volume_panel.as_deref(), Some("Ana"));
+        assert_eq!(a.config.volume_of("Ana"), 71);
+
+        for v in [60, 30, 0] {
+            let _ = a.update(Msg::Volume("Ana".into(), v));
+        }
+        assert_eq!(a.config.volume_of("Ana"), 0);
+        assert_eq!(a.config.muted_people(), ["Ana"]);
+        let _ = a.update(Msg::Volume("Bia".into(), 0));
+        assert_eq!(a.config.muted_people(), ["Ana", "Bia"]);
+        let _ = a.update(Msg::Volume("Ana".into(), 12));
+        assert_eq!(a.config.muted_people(), ["Bia"]);
+        let _ = a.update(Msg::VolumeDone);
+
+        let _ = a.update(Msg::Escape);
+        assert!(call_of(&mut a).volume_panel.is_none(), "a call segue");
+    }
+
+    #[test]
+    fn config_de_voz_vale_com_e_sem_call() {
+        let mut a = in_call(&["Ana"]);
+        let _ = a.update(Msg::Input(Some("USB".into())));
+        let _ = a.update(Msg::Output(None));
+        let _ = a.update(Msg::Noise(NoiseLevel::Off));
+        let _ = a.update(Msg::Master(40));
+        let p = a.config.audio_prefs();
+        assert_eq!(p.input.as_deref(), Some("USB"));
+        assert_eq!((p.output, p.noise, p.master), (None, NoiseLevel::Off, 40));
+    }
+
+    #[test]
+    fn trocar_de_servidor_e_encerrar_sessao_saem_da_call() {
+        for msg in [Msg::ChangeServer, Msg::Logout] {
+            let mut a = in_call(&["Ana"]);
+            let _ = a.update(msg);
+            assert!(!matches!(a.screen, Screen::Main(_)));
+        }
+    }
+
     /// Gera `snapshots/*.png` sem abrir janela: `cargo test -- --ignored prints`.
     #[test]
     #[ignore]
@@ -917,11 +1477,76 @@ mod tests {
         for (tab, nome) in [
             (Tab::Server, "config-servidor"),
             (Tab::Account, "config-conta"),
+            (Tab::Voice, "config-voz"),
             (Tab::About, "config-sobre"),
         ] {
             main_of(&mut a).settings = Some(tab);
             main_of(&mut a).vault_ok = false;
+            if tab == Tab::Voice {
+                a.config.input = Some("Microfone USB (hw:1,0)".into());
+                main_of(&mut a).devices = Some(Devices {
+                    inputs: vec!["Microfone USB (hw:1,0)".into()],
+                    outputs: vec!["Alto-falantes".into()],
+                });
+            }
             print(&a, nome);
         }
+
+        // Palco: 1, 4 e 9 pessoas, com quem fala e quem está mudo.
+        let nomes = [
+            "Opedro",
+            "Ana",
+            "Bruno com nome bem comprido demais",
+            "Carla",
+            "Duda",
+            "Edu",
+            "Fabi",
+            "Gabi",
+            "Hugo",
+            "Iara",
+            "Jota",
+        ];
+        let palco = |n: usize| {
+            let mut a = voice_app();
+            let _ = a.update(Msg::JoinChannel("call".into()));
+            let id = call_id(&mut a);
+            let _ = a.update(Msg::CallEvent(id, call::Event::Connected));
+            let lista = nomes[..n]
+                .iter()
+                .enumerate()
+                .map(|(i, nome)| {
+                    let mut l = voice::test_live(nome, i == 1 || i == 3);
+                    l.muted = i == 2 || i == 0;
+                    l.is_local = i == 0;
+                    l
+                })
+                .collect();
+            let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
+            (a, id)
+        };
+        for (n, nome) in [
+            (1, "palco-1"),
+            (4, "palco-4"),
+            (9, "palco-9"),
+            (11, "palco-11"),
+        ] {
+            print(&palco(n).0, nome);
+        }
+        let (mut a, id) = palco(4);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Reconnecting { attempt: 3 }));
+        let _ = a.update(Msg::OpenVolume("Ana".into()));
+        a.config.volumes.insert("Ana".into(), 0);
+        print(&a, "palco-reconectando-volume");
+        let _ = a.update(Msg::CallEvent(id, call::Event::Connected));
+        let _ = a.update(Msg::ToggleDeafen);
+        a.config.volumes.insert("Ana".into(), 40);
+        print(&a, "palco-surdo-volume");
+
+        let mut a = voice_app();
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        print(&a, "palco-conectando");
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::RoomClosed)));
+        print(&a, "home-aviso");
     }
 }
