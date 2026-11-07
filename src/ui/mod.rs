@@ -488,8 +488,7 @@ impl App {
             }
             Msg::ShareStart => {
                 let quality = self.config.share_quality;
-                // Etapa 4: no Windows o interruptor nem aparece.
-                let audio = cfg!(target_os = "linux") && self.config.share_audio;
+                let audio = self.config.share_audio;
                 if let Some(call) = self.call_mut() {
                     call.start_share(quality, audio);
                 }

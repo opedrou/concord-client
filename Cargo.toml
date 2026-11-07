@@ -21,6 +21,8 @@ rtrb = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.18"
+# Áudio da transmissão: WASAPI process loopback, como no spike.
+wasapi = "0.26"
 
 # O libwebrtc embute `pw_*` vazios: linkar libpipewire derruba o processo. Por isso
 # `cpal` só pelo backend PulseAudio.

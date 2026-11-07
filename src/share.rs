@@ -1,7 +1,11 @@
 //! Transmissão de tela: qualidades, captura numa thread própria e publicação na sala.
+// No Windows só os tipos `Choice` e `View` e os testes do grafo são usados daqui.
+#[cfg_attr(windows, allow(dead_code))]
 mod app_audio;
 #[cfg(test)]
 mod bancada;
+#[cfg(windows)]
+mod loopback;
 
 use std::{
     sync::{
@@ -40,8 +44,11 @@ use tokio::{
     },
 };
 
-use app_audio::AppAudio;
+#[cfg(not(windows))]
+use app_audio::AppAudio as Audio;
 pub use app_audio::{Choice, View};
+#[cfg(windows)]
+use loopback::Loopback as Audio;
 
 /// Tabela da seção 7 do plano, os mesmos presets do `lib/screenShareQuality.ts` da web.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,10 +407,14 @@ struct Running {
     /// Publicada na sala atual.
     published: bool,
     with_audio: bool,
-    /// Tamanho do primeiro quadro: tela ou janela.
+    /// Tamanho do primeiro quadro: no Linux decide entre tela e janela.
+    #[cfg_attr(windows, allow(dead_code))]
     frame: (u32, u32),
+    /// Alvo do seletor: no Windows decide o que o áudio leva.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    target: Option<Source>,
     /// Nasce depois do vídeo no ar e morre com o `Running`.
-    audio: Option<AppAudio>,
+    audio: Option<Audio>,
 }
 
 impl Running {
@@ -419,7 +430,7 @@ impl Running {
             limit: quality.limit(),
             source: None,
             notes: notes_tx,
-            target,
+            target: target.clone(),
         };
         let flag = stop.clone();
         let runtime = Handle::current();
@@ -439,6 +450,7 @@ impl Running {
             source: None,
             published: false,
             with_audio,
+            target,
             frame: (0, 0),
             audio: None,
         })
@@ -581,7 +593,16 @@ pub async fn run(
             if let Some(r) = &mut share {
                 r.published = true;
                 if r.with_audio && r.audio.is_none() {
-                    r.audio = AppAudio::start(r.frame, audio.clone());
+                    #[cfg(not(windows))]
+                    {
+                        r.audio = Audio::start(r.frame, audio.clone());
+                    }
+                    // No Windows a escolha já veio do seletor: não há lista pra mostrar.
+                    #[cfg(windows)]
+                    {
+                        let _ = &audio;
+                        r.audio = Audio::start(r.target.as_ref());
+                    }
                 }
                 if let Some(a) = &r.audio {
                     publish_audio(&me, a.source.clone()).await;
