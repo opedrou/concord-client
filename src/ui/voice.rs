@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use iced::Size;
+use iced::{Point, Size};
 
 use crate::api::{self, Participant};
 use crate::audio::{Engine, MicFrames};
@@ -162,6 +162,8 @@ pub const GAP: f32 = 14.0;
 const PAD_X: f32 = 20.0;
 const PAD_TOP: f32 = 6.0;
 const PAD_BOTTOM: f32 = 14.0;
+/// Margem entre o painel de volume e a borda do palco.
+const PANEL_MARGIN: f32 = 8.0;
 
 /// Colunas e fileiras da grade, nas contagens do site (2 colunas até 4, 3 até 9).
 pub fn grid(n: usize) -> (usize, usize) {
@@ -185,6 +187,23 @@ pub fn tile_size(area: Size, n: usize) -> Size {
     Size::new(h * 16.0 / 9.0, h)
 }
 
+/// Onde abrir o painel de volume: centrado no tile clicado, sem sair do palco. O `iced`
+/// não informa a posição do clique, então a âncora é o tile.
+pub fn panel_origin(area: Size, n: usize, index: usize, panel: Size) -> Point {
+    let tile = tile_size(area, n);
+    let (cols, rows) = grid(n);
+    let block = |count: usize, side: f32| count as f32 * side + GAP * (count - 1) as f32;
+    let left = (area.width - block(cols, tile.width)) / 2.0;
+    let top = (area.height - block(rows, tile.height)) / 2.0;
+    let x = left + (index % cols) as f32 * (tile.width + GAP) + (tile.width - panel.width) / 2.0;
+    let y = top + (index / cols) as f32 * (tile.height + GAP) + (tile.height - panel.height) / 2.0;
+    let fit = |value: f32, free: f32| value.min(free - PANEL_MARGIN).max(PANEL_MARGIN);
+    Point::new(
+        fit(x, area.width - panel.width),
+        fit(y, area.height - panel.height),
+    )
+}
+
 #[cfg(test)]
 pub fn test_live(name: &str, speaking: bool) -> Live {
     Live {
@@ -202,6 +221,30 @@ pub fn test_live(name: &str, speaking: bool) -> Live {
 mod tests {
     use super::test_live as live;
     use super::*;
+
+    #[test]
+    fn painel_abre_em_cima_do_tile_clicado() {
+        let area = Size::new(900.0, 600.0);
+        let panel = Size::new(280.0, 100.0);
+        let esquerda = panel_origin(area, 4, 0, panel);
+        let direita = panel_origin(area, 4, 1, panel);
+        let embaixo = panel_origin(area, 4, 2, panel);
+        assert!(esquerda.x < direita.x);
+        assert_eq!(esquerda.y, direita.y);
+        assert!(esquerda.y < embaixo.y);
+        assert_eq!(esquerda.x, embaixo.x);
+    }
+
+    #[test]
+    fn painel_nao_sai_do_palco_com_tile_pequeno() {
+        let area = Size::new(500.0, 300.0);
+        let panel = Size::new(280.0, 100.0);
+        for index in 0..16 {
+            let p = panel_origin(area, 16, index, panel);
+            assert!(p.x >= PANEL_MARGIN && p.x + panel.width <= area.width - PANEL_MARGIN + 0.01);
+            assert!(p.y >= PANEL_MARGIN && p.y + panel.height <= area.height - PANEL_MARGIN + 0.01);
+        }
+    }
 
     #[test]
     fn nome_repetido_vira_um_e_a_lista_fica_em_ordem() {

@@ -65,7 +65,8 @@ pub enum End {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     Connected,
-    /// Caiu e está tentando voltar: tentativa `attempt` de [`MAX_ATTEMPTS`].
+    /// Caiu e está tentando voltar: tentativa `attempt` de [`MAX_ATTEMPTS`]. Zero é a
+    /// retomada do próprio SDK, que vem antes das nossas tentativas.
     Reconnecting {
         attempt: u32,
     },
@@ -267,6 +268,7 @@ struct Session {
     last: Vec<Live>,
     /// Último `concord.muted` enviado nesta sala.
     sent_muted: String,
+    reconnecting: bool,
 }
 
 impl Ctl {
@@ -401,7 +403,8 @@ impl Task {
             .ok_or(Fail::Leave)?
             .map_err(|_| Fail::Retry)?;
 
-        let src = NativeAudioSource::new(AudioSourceOptions::default(), RATE, 1, 200);
+        // Fila zero: entrega direto. Com fila, o mudo demoraria o tamanho dela pra valer.
+        let src = NativeAudioSource::new(AudioSourceOptions::default(), RATE, 1, 0);
         let track =
             LocalAudioTrack::create_audio_track("microphone", RtcAudioSource::Native(src.clone()));
         let options = TrackPublishOptions {
@@ -430,6 +433,7 @@ impl Task {
             voices: HashMap::new(),
             last: Vec::new(),
             sent_muted: String::new(),
+            reconnecting: false,
         })
     }
 
@@ -520,7 +524,13 @@ impl Task {
                 let identity = p.identity().to_string();
                 s.voices.retain(|_, v| v.identity != identity);
             }
+            RoomEvent::Reconnecting => {
+                s.reconnecting = true;
+                self.emit(Event::Reconnecting { attempt: 0 });
+            }
             RoomEvent::Reconnected => {
+                s.reconnecting = false;
+                self.emit(Event::Connected);
                 // A retomada pode ter perdido assinaturas e atributos.
                 s.subscribe_all();
                 s.sent_muted.clear();
@@ -547,6 +557,7 @@ impl Task {
                 | RoomEvent::TrackMuted { .. }
                 | RoomEvent::TrackUnmuted { .. }
                 | RoomEvent::ActiveSpeakersChanged { .. }
+                | RoomEvent::Reconnecting
                 | RoomEvent::Reconnected
         ) {
             self.refresh(s);
@@ -556,11 +567,29 @@ impl Task {
 
     fn refresh(&self, s: &mut Session) {
         let list = s.participants();
+        let list = if s.reconnecting {
+            hold_remotes(list, &s.last)
+        } else {
+            list
+        };
         if list != s.last {
             s.last.clone_from(&list);
             self.emit(Event::Participants(list));
         }
     }
+}
+
+/// O SDK solta todo mundo ao recomeçar a conexão. Sem isto, a pessoa se veria sozinha
+/// na sala enquanto a rede não volta.
+fn hold_remotes(list: Vec<Live>, last: &[Live]) -> Vec<Live> {
+    let remotes = last.iter().filter(|p| !p.is_local).map(|p| Live {
+        speaking: false,
+        ..p.clone()
+    });
+    list.into_iter()
+        .filter(|p| p.is_local)
+        .chain(remotes)
+        .collect()
 }
 
 impl Session {
@@ -630,6 +659,36 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vivo(name: &str, is_local: bool, speaking: bool) -> Live {
+        Live {
+            identity: format!("{name}__1"),
+            name: name.into(),
+            is_local,
+            muted: false,
+            camera: false,
+            screen_share: false,
+            speaking,
+        }
+    }
+
+    #[test]
+    fn reconectando_mantem_quem_estava_na_sala() {
+        let antes = [vivo("eu", true, false), vivo("ana", false, true)];
+        let agora = vec![vivo("eu", true, false)];
+        let lista = hold_remotes(agora, &antes);
+        assert_eq!(lista.len(), 2);
+        assert!(lista[0].is_local);
+        assert_eq!(lista[1].name, "ana");
+        assert!(!lista[1].speaking, "ninguém fala sem conexão");
+    }
+
+    #[test]
+    fn retomada_sem_soltar_ninguem_nao_duplica() {
+        let antes = [vivo("eu", true, false), vivo("ana", false, false)];
+        let lista = hold_remotes(antes.to_vec(), &antes);
+        assert_eq!(lista.len(), 2);
+    }
 
     #[test]
     fn motivos_definitivos() {

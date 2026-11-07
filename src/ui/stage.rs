@@ -1,8 +1,8 @@
 //! Palco da call: grade de tiles, barra de controles e painel de volume.
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, center, column, container, mouse_area, responsive, row, slider, space,
-    stack, text,
+    Column, Row, button, center, column, container, mouse_area, pin, responsive, row, slider,
+    space, stack, text,
 };
 use iced::{Alignment, Element, Length, Size, border};
 
@@ -15,9 +15,14 @@ use super::{Main, Msg, avatar};
 use crate::call::{Live, MAX_ATTEMPTS};
 use crate::config::Config;
 
+/// Largura fixa e altura aproximada do painel de volume, pra centrar no tile.
+const PANEL: Size = Size::new(280.0, 104.0);
+
 pub fn view<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     let body: Element<_> = match &call.live {
-        Some(live) if !live.is_empty() => responsive(move |area| grid(m, call, live, area)).into(),
+        Some(live) if !live.is_empty() => {
+            responsive(move |area| grid(m, call, config, live, area)).into()
+        }
         _ => center(text("Conectando…").size(15).color(FG2)).into(),
     };
     let base = column![
@@ -31,17 +36,16 @@ pub fn view<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Elemen
     if let Status::Reconnecting(n) = call.status {
         layers.push(banner(n));
     }
-    if let Some(card) = call
-        .volume_panel
-        .as_deref()
-        .map(|n| volume_card(call, config, n))
-    {
-        layers.push(card);
-    }
     stack(layers).into()
 }
 
-fn grid<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) -> Element<'a, Msg> {
+fn grid<'a>(
+    m: &'a Main,
+    call: &'a ActiveCall,
+    config: &'a Config,
+    live: &'a [Live],
+    area: Size,
+) -> Element<'a, Msg> {
     let size = voice::tile_size(area, live.len());
     let (cols, _) = voice::grid(live.len());
     let rows = live.chunks(cols).map(|chunk| {
@@ -49,7 +53,16 @@ fn grid<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) -> 
             .spacing(GAP)
             .into()
     });
-    center(Column::with_children(rows).spacing(GAP)).into()
+    let tiles = center(Column::with_children(rows).spacing(GAP));
+    let panel = call.volume_panel.as_deref().and_then(|name| {
+        let index = live.iter().position(|p| voice::name_of(p) == name)?;
+        let at = voice::panel_origin(area, live.len(), index, PANEL);
+        Some(pin(volume_card(call, config, name)).x(at.x).y(at.y))
+    });
+    match panel {
+        Some(panel) => stack![tiles, panel].into(),
+        None => tiles.into(),
+    }
 }
 
 fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
@@ -159,10 +172,11 @@ fn bar(config: &Config) -> Element<'_, Msg> {
 }
 
 fn banner<'a>(attempt: u32) -> Element<'a, Msg> {
-    let label = text(format!("Reconectando ({attempt} de {MAX_ATTEMPTS})"))
-        .size(13.5)
-        .font(theme::SEMIBOLD)
-        .color(IDLE);
+    let label = match attempt {
+        0 => "Reconectando…".to_owned(),
+        n => format!("Reconectando ({n} de {MAX_ATTEMPTS})"),
+    };
+    let label = text(label).size(13.5).font(theme::SEMIBOLD).color(IDLE);
     container(container(label).padding([7, 14]).style(theme::tooltip))
         .center_x(Length::Fill)
         .padding(14)
@@ -206,8 +220,8 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
     .align_y(Alignment::Center);
 
     let ring = if call.speaking(name) { ACCENT } else { BORDER };
-    let card = container(column![head, line].spacing(10))
-        .width(280)
+    container(column![head, line].spacing(10))
+        .width(PANEL.width)
         .padding(12)
         .style(move |_| container::Style {
             background: Some(BG2.into()),
@@ -219,13 +233,6 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
                 blur_radius: 32.0,
             },
             ..Default::default()
-        });
-    container(card)
-        .center_x(Length::Fill)
-        .align_bottom(Length::Fill)
-        .padding(iced::Padding {
-            bottom: 92.0,
-            ..iced::Padding::ZERO
         })
         .into()
 }
