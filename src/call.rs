@@ -1,5 +1,10 @@
 //! Conexão com a sala do LiveKit: entrar, publicar o mic, ouvir os outros e reconectar.
-use std::{collections::HashMap, fmt, future::Future, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    future::Future,
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use livekit::{
@@ -117,11 +122,14 @@ impl Call {
             install_id,
             tx,
         };
+        let (speech_tx, speech_rx) = mpsc::unbounded_channel();
         let ctl = Ctl {
             rx,
             engine: engine.clone(),
             muted: mic_muted,
             people: Vec::new(),
+            speech_tx,
+            speech_rx,
         };
         tokio::spawn(task.run(ctl, mic));
         (Call { cmd, engine }, events)
@@ -204,7 +212,7 @@ fn live(
         muted: !mic_open,
         camera,
         screen_share,
-        speaking,
+        speaking: speaking && mic_open,
     }
 }
 
@@ -232,6 +240,9 @@ struct Ctl {
     /// Último estado pedido do mic.
     muted: bool,
     people: Vec<String>,
+    /// Quem começou ou parou de falar, medido no PCM.
+    speech_tx: UnboundedSender<(String, bool)>,
+    speech_rx: UnboundedReceiver<(String, bool)>,
 }
 
 enum Fail {
@@ -260,6 +271,44 @@ struct Voice {
 }
 
 /// Uma conexão com a sala. Soltar a sessão solta as faixas e as vozes.
+/// Limiares de fala em RMS de 0 a 1: o gate de quem fala já zerou o silêncio, então
+/// aqui basta saber se tem sinal. A queda segura 150 ms, pra não piscar entre palavras.
+const SPEECH_RISE: f32 = 0.01;
+const SPEECH_FALL: f32 = 0.005;
+const SPEECH_HOLD: usize = RATE as usize * 150 / 1000;
+
+/// Chave da pessoa local em [`Session::speaking`].
+const LOCAL: &str = "";
+
+/// Anel de fala medido no PCM que chega, como o site faz. O `ActiveSpeakersChanged`
+/// dá uma volta pelo servidor, com o intervalo de agregação dele, e chega atrasado.
+#[derive(Default)]
+struct Speech {
+    on: bool,
+    quiet: usize,
+}
+
+impl Speech {
+    /// Devolve o estado novo quando ele muda.
+    fn update(&mut self, block: &[i16]) -> Option<bool> {
+        let energy: f32 = block.iter().map(|s| (*s as f32 / 32768.0).powi(2)).sum();
+        let rms = (energy / block.len().max(1) as f32).sqrt();
+        if rms >= SPEECH_RISE {
+            self.quiet = 0;
+            return (!std::mem::replace(&mut self.on, true)).then_some(true);
+        }
+        if !self.on || rms >= SPEECH_FALL {
+            return None;
+        }
+        self.quiet += block.len();
+        if self.quiet < SPEECH_HOLD {
+            return None;
+        }
+        *self = Self::default();
+        Some(false)
+    }
+}
+
 struct Session {
     room: Room,
     events: UnboundedReceiver<RoomEvent>,
@@ -269,6 +318,7 @@ struct Session {
     /// Último `concord.muted` enviado nesta sala.
     sent_muted: String,
     reconnecting: bool,
+    speaking: HashSet<String>,
 }
 
 impl Ctl {
@@ -309,8 +359,16 @@ fn apply_mute(engine: &Engine, mic: Option<&LocalTrackPublication>, muted: bool)
 
 /// Dono do `MicFrames`: manda cada bloco pra faixa da sala atual, ou descarta se
 /// não há sala.
-async fn forward_mic(mut mic: MicFrames, source: watch::Receiver<Option<NativeAudioSource>>) {
+async fn forward_mic(
+    mut mic: MicFrames,
+    source: watch::Receiver<Option<NativeAudioSource>>,
+    speech: UnboundedSender<(String, bool)>,
+) {
+    let mut detector = Speech::default();
     while let Some(block) = mic.recv().await {
+        if let Some(on) = detector.update(&block) {
+            let _ = speech.send((LOCAL.to_owned(), on));
+        }
         let Some(src) = source.borrow().clone() else {
             continue;
         };
@@ -338,7 +396,8 @@ impl Task {
 
     async fn run(self, mut ctl: Ctl, mic: MicFrames) {
         let (source, source_rx) = watch::channel(None);
-        let _forward = AbortOnDrop(tokio::spawn(forward_mic(mic, source_rx)));
+        let speech = ctl.speech_tx.clone();
+        let _forward = AbortOnDrop(tokio::spawn(forward_mic(mic, source_rx, speech)));
         let end = self.lifecycle(&mut ctl, &source).await;
         // Faixa e vozes já caíram aqui: `Ended` é sempre o último evento.
         self.emit(Event::Ended(end));
@@ -434,6 +493,7 @@ impl Task {
             last: Vec::new(),
             sent_muted: String::new(),
             reconnecting: false,
+            speaking: HashSet::new(),
         })
     }
 
@@ -450,6 +510,14 @@ impl Task {
                     if let Some(outcome) = self.on_event(s, ctl, event) {
                         return outcome;
                     }
+                }
+                Some((who, on)) = ctl.speech_rx.recv() => {
+                    if on {
+                        s.speaking.insert(who);
+                    } else {
+                        s.speaking.remove(&who);
+                    }
+                    self.refresh(s);
                 }
                 cmd = ctl.rx.recv() => match cmd {
                     Some(Cmd::Mute(m)) => {
@@ -502,10 +570,17 @@ impl Task {
                 } else {
                     name
                 };
+                s.speaking.remove(&identity);
                 let mut sink = ctl.engine.add_voice(sid.clone(), name);
                 let mut stream = NativeAudioStream::new(audio.rtc_track(), RATE as i32, 1);
+                let speech = ctl.speech_tx.clone();
+                let who = identity.clone();
                 let task = tokio::spawn(async move {
+                    let mut detector = Speech::default();
                     while let Some(frame) = stream.next().await {
+                        if let Some(on) = detector.update(&frame.data) {
+                            let _ = speech.send((who.clone(), on));
+                        }
                         sink.push(&frame.data);
                     }
                 });
@@ -518,11 +593,14 @@ impl Task {
                 );
             }
             RoomEvent::TrackUnsubscribed { publication, .. } => {
-                s.voices.remove(&publication.sid().to_string());
+                if let Some(voice) = s.voices.remove(&publication.sid().to_string()) {
+                    s.speaking.remove(&voice.identity);
+                }
             }
             RoomEvent::ParticipantDisconnected(p) => {
                 let identity = p.identity().to_string();
                 s.voices.retain(|_, v| v.identity != identity);
+                s.speaking.remove(&identity);
             }
             RoomEvent::Reconnecting => {
                 s.reconnecting = true;
@@ -556,7 +634,6 @@ impl Task {
                 | RoomEvent::LocalTrackRepublished { .. }
                 | RoomEvent::TrackMuted { .. }
                 | RoomEvent::TrackUnmuted { .. }
-                | RoomEvent::ActiveSpeakersChanged { .. }
                 | RoomEvent::Reconnecting
                 | RoomEvent::Reconnected
         ) {
@@ -613,7 +690,7 @@ impl Session {
             me.track_publications()
                 .values()
                 .map(|p| (p.source(), p.is_muted())),
-            me.is_speaking(),
+            self.speaking.contains(LOCAL),
         );
         let remotes = self
             .room
@@ -627,7 +704,7 @@ impl Session {
                     p.track_publications()
                         .values()
                         .map(|t| (t.source(), t.is_muted())),
-                    p.is_speaking(),
+                    self.speaking.contains(p.identity().as_str()),
                 )
             })
             .collect();
@@ -659,6 +736,47 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fala_acende_no_primeiro_bloco_e_segura_a_queda() {
+        let voz = [800i16; 480];
+        let silencio = [0i16; 480];
+        let mut s = Speech::default();
+        assert_eq!(s.update(&silencio), None);
+        assert_eq!(s.update(&voz), Some(true), "10 ms depois de chegar som");
+        assert_eq!(s.update(&voz), None);
+        for _ in 0..14 {
+            assert_eq!(s.update(&silencio), None);
+        }
+        assert_eq!(s.update(&silencio), Some(false), "150 ms de silêncio");
+        assert_eq!(s.update(&voz), Some(true));
+    }
+
+    #[test]
+    fn pausa_curta_entre_palavras_nao_apaga() {
+        let voz = [800i16; 480];
+        let silencio = [0i16; 480];
+        let mut s = Speech::default();
+        s.update(&voz);
+        for _ in 0..3 {
+            for _ in 0..10 {
+                assert_eq!(s.update(&silencio), None);
+            }
+            assert_eq!(s.update(&voz), None);
+        }
+    }
+
+    #[test]
+    fn nivel_entre_os_limiares_mantem_o_estado() {
+        let meio = [245i16; 480];
+        let voz = [800i16; 480];
+        let mut s = Speech::default();
+        assert_eq!(s.update(&meio), None, "não acende");
+        s.update(&voz);
+        for _ in 0..40 {
+            assert_eq!(s.update(&meio), None, "não apaga");
+        }
+    }
 
     fn vivo(name: &str, is_local: bool, speaking: bool) -> Live {
         Live {
