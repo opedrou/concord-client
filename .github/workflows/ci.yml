@@ -16,6 +16,25 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Os mesmos passos do `release.yml`.
+      - name: Dependências do Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libglib2.0-dev libx11-dev \
+            libxext-dev libxfixes-dev libxdamage-dev libxrandr-dev libxcomposite-dev libxtst-dev \
+            libxkbcommon-dev libwayland-dev libudev-dev libdrm-dev libgbm-dev libva-dev \
+            libpipewire-0.3-dev libdbus-1-dev
+          # O libc++ que vem com o libwebrtc pede clang 21+; o Ubuntu do Actions traz o 18.
+          wget -q https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 21
+          echo "CC=clang-21" >> "$GITHUB_ENV"
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
+      - name: LLVM no Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
       - run: rustup update stable && rustup default stable && rustup component add clippy
       - uses: actions/cache@v4
         with:
