@@ -25,6 +25,8 @@ use crate::session;
 use crate::share::{Choice, Quality, Source, Thumb};
 
 const POLL: Duration = Duration::from_secs(4);
+/// De quanto em quanto tempo confere se saiu versão nova, com o app aberto.
+const CONFERE_UPDATE: Duration = Duration::from_secs(15 * 60);
 /// Falhas seguidas de presença até o rodapé trocar "Online" por "Sem conexão".
 const FALHAS_ATE_AVISAR: u8 = 3;
 
@@ -193,6 +195,8 @@ pub enum Msg {
     Updated(Option<String>),
     /// Clique no ícone de atualização: abre a versão nova agora.
     RestartForUpdate,
+    /// Hora de conferir de novo se saiu versão nova.
+    CheckUpdate,
     /// Abre e fecha a lista de áudio da transmissão no ar.
     AudioList,
     AudioChoice(Choice),
@@ -306,6 +310,7 @@ impl App {
         ];
         if let Screen::Main(m) = &self.screen {
             subs.push(time::every(POLL).map(|_| Msg::Tick));
+            subs.push(time::every(CONFERE_UPDATE).map(|_| Msg::CheckUpdate));
             if m.call.as_ref().is_some_and(ActiveCall::holding) {
                 subs.push(time::every(QUADRO).map(Msg::Frame));
             }
@@ -782,14 +787,14 @@ impl App {
                 }
                 Task::none()
             }
-            // Só fora de call: reiniciar derrubaria a sala sem o `close` limpo.
+            // Com call, sai pelo mesmo caminho de fechar a janela, que deixa a sala limpo.
             Msg::RestartForUpdate => match &self.screen {
-                Screen::Main(m) if m.call.is_none() && m.update.is_some() => {
-                    crate::update::restart();
-                    iced::exit()
+                Screen::Main(m) if m.update.is_some() && crate::update::restart() => {
+                    window::latest().and_then(|id| Task::done(Msg::CloseRequested(id)))
                 }
                 _ => Task::none(),
             },
+            Msg::CheckUpdate => Task::future(async { Msg::Updated(crate::update::run().await) }),
             Msg::StageMouse(at, near) => {
                 if let Some(call) = self.call_mut() {
                     call.cursor = at;

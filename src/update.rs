@@ -5,7 +5,10 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use serde::Deserialize;
@@ -170,13 +173,20 @@ pub fn cleanup() {
 
 /// Executável que se atualiza, ou `None` em desenvolvimento: build de teste e binário
 /// rodando de dentro de `target/` não são trocados pela release.
+///
+/// Lido uma vez, ao abrir: depois da troca, no Linux o `current_exe` passa a apontar pro
+/// `.old` (o arquivo renomeado), e reiniciar por ele abria a versão velha.
 fn installed() -> Option<PathBuf> {
-    if cfg!(debug_assertions) || std::env::var_os("CONCORD_NO_UPDATE").is_some() {
-        return None;
-    }
-    let exe = std::env::current_exe().ok()?;
-    let dev = exe.components().any(|c| c.as_os_str() == "target");
-    (!dev).then_some(exe)
+    static EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    EXE.get_or_init(|| {
+        if cfg!(debug_assertions) || std::env::var_os("CONCORD_NO_UPDATE").is_some() {
+            return None;
+        }
+        let exe = std::env::current_exe().ok()?;
+        let dev = exe.components().any(|c| c.as_os_str() == "target");
+        (!dev).then_some(exe)
+    })
+    .clone()
 }
 
 fn old_of(exe: &Path) -> PathBuf {
@@ -186,11 +196,18 @@ fn old_of(exe: &Path) -> PathBuf {
 /// Confere e, se tiver versão nova, deixa ela instalada pra próxima abertura. Devolve a
 /// versão instalada. Qualquer falha é silenciosa: tenta de novo na próxima vez.
 pub async fn run() -> Option<String> {
-    // Uma vez por processo: logar de novo não baixa outra vez por cima da troca feita.
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if STARTED.swap(true, Ordering::Relaxed) {
+    // Roda ao abrir e de tempos em tempos; uma conferência por vez.
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::Relaxed) {
         return None;
     }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            RUNNING.store(false, Ordering::Relaxed);
+        }
+    }
+    let _done = Done;
     let exe = installed()?;
     let client = reqwest::Client::builder()
         .user_agent("concord-client")
@@ -207,7 +224,12 @@ pub async fn run() -> Option<String> {
         .json()
         .await
         .ok()?;
-    if !is_newer(&release.tag_name, env!("CARGO_PKG_VERSION")) {
+    // Compara com a última já instalada nesta sessão, pra não baixar a mesma de novo.
+    let current = INSTALLED.lock().ok()?.clone();
+    if !is_newer(
+        &release.tag_name,
+        current.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")),
+    ) {
         return None;
     }
     let asset = release.assets.into_iter().find(|a| a.name == ASSET)?;
@@ -230,8 +252,12 @@ pub async fn run() -> Option<String> {
         .await
         .ok()?
         .ok()?;
+    *INSTALLED.lock().ok()? = Some(version.clone());
     Some(version)
 }
+
+/// Versão trocada nesta sessão, que já está no disco esperando reiniciar.
+static INSTALLED: Mutex<Option<String>> = Mutex::new(None);
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -258,10 +284,9 @@ fn install(exe: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Abre a versão nova e fecha esta. Só fora de call.
-pub fn restart() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).spawn();
-    }
+/// Abre a versão nova pelo caminho instalado. `false` se não abriu: aí esta segue aberta.
+pub fn restart() -> bool {
+    installed().is_some_and(|exe| std::process::Command::new(exe).spawn().is_ok())
 }
 
 #[cfg(test)]
