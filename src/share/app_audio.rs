@@ -55,10 +55,17 @@ pub struct View {
     pub ask: bool,
 }
 
+/// Pedido pra thread dos links.
+enum Order {
+    Choose(Choice),
+    /// Tela nova na troca, pelo tamanho do primeiro quadro: decide tudo de novo.
+    Frame((u32, u32)),
+}
+
 /// Captura em andamento. Soltar mata o `pw-record`, e as threads saem sozinhas.
 pub struct AppAudio {
     child: Child,
-    choose: Sender<Choice>,
+    orders: Sender<Order>,
     pub source: NativeAudioSource,
 }
 
@@ -83,12 +90,12 @@ impl AppAudio {
             .spawn()
             .ok()?;
         let stdout = child.stdout.take();
-        let (choose, choices) = mpsc::channel();
+        let (orders, received) = mpsc::channel();
         // Sem AEC, NS nem AGC: são feitos pra voz e mutilam música e jogo.
         let source = NativeAudioSource::new(AudioSourceOptions::default(), RATE, CHANNELS, 0);
         let audio = Self {
             child,
-            choose,
+            orders,
             source,
         };
         let (stdout, feed) = (stdout?, audio.source.clone());
@@ -99,13 +106,18 @@ impl AppAudio {
             .ok()?;
         thread::Builder::new()
             .name("concord-tela-links".into())
-            .spawn(move || watch(recorder, frame, choices, notify))
+            .spawn(move || watch(recorder, frame, received, notify))
             .ok()?;
         Some(audio)
     }
 
     pub fn choose(&self, choice: Choice) {
-        let _ = self.choose.send(choice);
+        let _ = self.orders.send(Order::Choose(choice));
+    }
+
+    /// A transmissão trocou de tela: tela ou janela e o app saem do quadro novo.
+    pub fn reframe(&self, frame: (u32, u32)) {
+        let _ = self.orders.send(Order::Frame(frame));
     }
 }
 
@@ -136,8 +148,8 @@ fn pump(mut out: ChildStdout, source: NativeAudioSource) {
 }
 
 /// Mantém os links de acordo com a escolha, a cada [`POLL`] ou na hora em que ela muda.
-fn watch(recorder: u32, frame: (u32, u32), choices: Receiver<Choice>, notify: impl Fn(View)) {
-    let screen = is_screen(frame, monitors());
+fn watch(recorder: u32, frame: (u32, u32), orders: Receiver<Order>, notify: impl Fn(View)) {
+    let mut screen = is_screen(frame, monitors());
     let me = u64::from(std::process::id());
     let born = Instant::now();
     let mut choice = None;
@@ -173,8 +185,12 @@ fn watch(recorder: u32, frame: (u32, u32), choices: Receiver<Choice>, notify: im
                 shown = Some(view);
             }
         }
-        match choices.recv_timeout(wait) {
-            Ok(c) => choice = Some(c),
+        match orders.recv_timeout(wait) {
+            Ok(Order::Choose(c)) => choice = Some(c),
+            Ok(Order::Frame(f)) => {
+                screen = is_screen(f, monitors());
+                choice = None;
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -945,6 +961,19 @@ mod tests {
                 assert_eq!(ligados, ["Jogo"]);
                 bancada::so_o_jogo(&x);
             }
+        }
+
+        // Troca de tela no ar: quadro do tamanho do monitor vira tela inteira, sem a pessoa
+        // escolher de novo.
+        if let Some(&monitor) = monitors().as_ref().and_then(|m| m.first()) {
+            while views.try_recv().is_ok() {}
+            audio.reframe(monitor);
+            let view = views.recv().await.unwrap();
+            println!("TROCA {monitor:?} -> {view:?}");
+            assert_eq!(view.choice, Choice::All);
+            sleep(Duration::from_millis(500)).await;
+            assert_eq!(bancada::ligados(recorder), ["Jogo"]);
+            bancada::so_o_jogo(&ouvido.segundo().await);
         }
 
         drop(audio);

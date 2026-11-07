@@ -35,6 +35,8 @@ const QUADRO: Duration = Duration::from_millis(100);
 const MEDIDOR: Duration = Duration::from_millis(33);
 /// Relógio da transmissão assistida: 60 por segundo, pra não atrasar a de 30 fps.
 const TELA: Duration = Duration::from_millis(16);
+/// Relógio da prévia da própria transmissão, no ritmo em que ela é gerada.
+const PREVIA: Duration = Duration::from_millis(200);
 
 // Quantas vezes `persist` rodou nesta thread de teste.
 #[cfg(test)]
@@ -160,6 +162,8 @@ pub enum Msg {
     ShareAudio(bool),
     ShareStart,
     ShareStop,
+    /// "Trocar" no tile da própria transmissão: outra tela sem parar.
+    ShareSwap,
     /// Telas e janelas lidas pro seletor do Windows, com a miniatura.
     ShareSources(Vec<(Source, Option<Thumb>)>),
     ShareSource(Source),
@@ -171,6 +175,11 @@ pub enum Msg {
     ScreenTick,
     /// Quadro da transmissão já na GPU.
     ScreenReady(Option<image::Allocation>),
+    /// Relógio da prévia própria e a prévia já na GPU.
+    PreviewTick,
+    PreviewReady(Option<image::Allocation>),
+    /// A janela ganhou ou perdeu o foco.
+    Focus(bool),
     /// Põe a transmissão assistida em tela cheia, pelo menu do botão direito.
     Fullscreen,
     /// Clique na transmissão assistida: alterna entre o tile e grande com as pessoas do lado.
@@ -208,6 +217,16 @@ pub enum Msg {
     FocusNext,
     FocusPrevious,
     Escape,
+}
+
+/// Telas e janelas pro seletor do Windows. Listar e tirar as miniaturas bloqueia: lê fora
+/// da thread da interface.
+fn read_sources(call: &mut ActiveCall) -> Task<Msg> {
+    call.share_sources = None;
+    Task::future(async {
+        let sources = tokio::task::spawn_blocking(crate::share::sources).await;
+        Msg::ShareSources(sources.unwrap_or_default())
+    })
 }
 
 fn connect(server: String) -> Task<Msg> {
@@ -282,6 +301,7 @@ impl App {
         let mut subs = vec![
             keyboard::listen().filter_map(keys),
             window::close_requests().map(Msg::CloseRequested),
+            event::listen_with(focus),
         ];
         if let Screen::Main(m) = &self.screen {
             subs.push(time::every(POLL).map(|_| Msg::Tick));
@@ -290,6 +310,9 @@ impl App {
             }
             if m.call.as_ref().is_some_and(|c| c.watching.is_some()) {
                 subs.push(time::every(TELA).map(|_| Msg::ScreenTick));
+            }
+            if m.call.as_ref().is_some_and(ActiveCall::preview_clock) {
+                subs.push(time::every(PREVIA).map(|_| Msg::PreviewTick));
             }
             if m.meter_clock() {
                 subs.push(time::every(MEDIDOR).map(|_| Msg::MeterTick));
@@ -506,12 +529,20 @@ impl App {
                 if !(cfg!(windows) && call.share_panel) {
                     return Task::none();
                 }
-                call.share_sources = None;
-                // Listar e tirar as miniaturas bloqueia: lê fora da thread da interface.
-                Task::future(async {
-                    let sources = tokio::task::spawn_blocking(crate::share::sources).await;
-                    Msg::ShareSources(sources.unwrap_or_default())
-                })
+                read_sources(call)
+            }
+            // No Linux a própria captura abre o portal; no Windows abre o nosso seletor.
+            Msg::ShareSwap => {
+                let Some(call) = self.call_mut() else {
+                    return Task::none();
+                };
+                if !cfg!(windows) {
+                    call.swap_share();
+                    return Task::none();
+                }
+                call.share_panel = true;
+                call.volume_panel = None;
+                read_sources(call)
             }
             Msg::ShareSources(sources) => {
                 if let Some(call) = self.call_mut() {
@@ -700,6 +731,23 @@ impl App {
             Msg::ScreenReady(allocation) => {
                 if let Some(call) = self.call_mut() {
                     call.screen_ready(allocation);
+                }
+                Task::none()
+            }
+            // Mesmo cuidado da transmissão assistida: só troca depois do `allocate`.
+            Msg::PreviewTick => match self.call_mut().and_then(ActiveCall::pull_own) {
+                Some(handle) => image::allocate(handle).map(|r| Msg::PreviewReady(r.ok())),
+                None => Task::none(),
+            },
+            Msg::PreviewReady(allocation) => {
+                if let Some(call) = self.call_mut() {
+                    call.own_ready(allocation);
+                }
+                Task::none()
+            }
+            Msg::Focus(focused) => {
+                if let Some(call) = self.call_mut() {
+                    call.set_focus(focused);
                 }
                 Task::none()
             }
@@ -1290,6 +1338,14 @@ fn drag(event: Event, _: event::Status, _: window::Id) -> Option<Msg> {
     match event {
         Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Msg::DragMove(position.x)),
         Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Msg::DragEnd),
+        _ => None,
+    }
+}
+
+fn focus(event: Event, _: event::Status, _: window::Id) -> Option<Msg> {
+    match event {
+        Event::Window(window::Event::Focused) => Some(Msg::Focus(true)),
+        Event::Window(window::Event::Unfocused) => Some(Msg::Focus(false)),
         _ => None,
     }
 }
@@ -1911,6 +1967,65 @@ mod tests {
         }
     }
 
+    /// Prévia já "na GPU", pros testes e prints: tela azul com uma janela clara.
+    fn alocada(w: u32, h: u32) -> image::Allocation {
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let janela = (w / 6..w * 5 / 6).contains(&x) && (h / 6..h * 5 / 6).contains(&y);
+                let px = match (janela, y < h / 6 + h / 12) {
+                    (true, true) => [70, 76, 92, 255],
+                    (true, false) => [236, 238, 242, 255],
+                    _ => [(40 + x * 60 / w) as u8, (60 + y * 80 / h) as u8, 150, 255],
+                };
+                rgba.extend_from_slice(&px);
+            }
+        }
+        let handle = image::Handle::from_rgba(w, h, rgba);
+        // SAFETY: renderer nenhum guarda memória por esta `Allocation`; ela só leva o handle,
+        // que o tiny-skia carrega na hora de desenhar.
+        unsafe { iced_test::core::image::allocate(&handle, iced::Size::new(w, h)) }
+    }
+
+    #[test]
+    fn previa_propria_para_sem_foco_e_some_com_a_transmissao() {
+        let mut a = in_call(&["Ana"]);
+        assert!(
+            !call_of(&mut a).preview_clock(),
+            "sem transmissão, sem relógio"
+        );
+        share(&mut a, ShareState::Live);
+        assert!(call_of(&mut a).preview_clock());
+        let _ = a.update(Msg::Focus(false));
+        assert!(call_of(&mut a).preview_paused);
+        assert!(!call_of(&mut a).preview_clock(), "sem foco nada sobe");
+        let _ = a.update(Msg::Focus(true));
+        assert!(call_of(&mut a).preview_clock());
+
+        let _ = a.update(Msg::PreviewReady(Some(alocada(48, 27))));
+        assert!(call_of(&mut a).own.is_some());
+        share(&mut a, ShareState::Off);
+        assert!(call_of(&mut a).own.is_none());
+        let _ = a.update(Msg::PreviewReady(Some(alocada(48, 27))));
+        assert!(call_of(&mut a).own.is_none(), "atrasada, depois de parar");
+    }
+
+    #[test]
+    fn trocar_no_ar_nao_para_a_transmissao() {
+        let mut a = in_call(&["Ana"]);
+        share(&mut a, ShareState::Live);
+        let _ = a.update(Msg::ShareSwap);
+        // No Linux o portal abre direto; no Windows abre o nosso seletor.
+        assert_eq!(call_of(&mut a).share_panel, cfg!(windows));
+        call_of(&mut a).share_panel = true;
+        let _ = a.update(Msg::ShareButton);
+        assert!(
+            !call_of(&mut a).share_panel,
+            "o X do seletor fecha ele, sem parar"
+        );
+        assert_eq!(call_of(&mut a).share, ShareState::Live);
+    }
+
     #[test]
     fn falha_fica_ate_a_pessoa_tentar_de_novo() {
         let mut a = in_call(&["Ana"]);
@@ -2317,6 +2432,11 @@ mod tests {
         let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
         share(&mut a, ShareState::Live);
         print(&a, "tela-transmitindo");
+        call_of(&mut a).own = Some(alocada(480, 270));
+        print(&a, "tela-propria");
+        let _ = a.update(Msg::Focus(false));
+        print(&a, "tela-propria-pausada");
+        let _ = a.update(Msg::Focus(true));
         audio(&mut a, Choice::Silent, &["Google Chrome", "Spotify"], true);
         print(&a, "tela-audio-lista");
         audio(&mut a, Choice::Silent, &[], false);

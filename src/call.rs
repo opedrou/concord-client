@@ -169,6 +169,7 @@ pub struct Call {
     share: UnboundedSender<share::Cmd>,
     engine: Engine,
     screen: Screen,
+    preview: share::Preview,
 }
 
 impl fmt::Debug for Call {
@@ -218,10 +219,12 @@ impl Call {
         let (share, share_rx) = mpsc::unbounded_channel();
         let (room, room_rx) = watch::channel(None);
         let (states, audio) = (tx.clone(), tx.clone());
+        let preview = share::Preview::default();
         let sharing = share::run(
             share_rx,
             room_rx,
             capture,
+            preview.clone(),
             move |state| {
                 let _ = states.send(Event::Share(state));
             },
@@ -257,6 +260,7 @@ impl Call {
             share,
             engine,
             screen,
+            preview,
         };
         (call, events)
     }
@@ -269,6 +273,11 @@ impl Call {
 
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// Prévia da própria transmissão, pro tile local.
+    pub fn preview(&self) -> &share::Preview {
+        &self.preview
     }
 
     pub fn set_mic_muted(&self, muted: bool) {
@@ -289,6 +298,12 @@ impl Call {
     /// [`Event::ShareAudio`].
     pub fn start_share(&self, quality: Quality, audio: bool, target: Option<share::Source>) {
         let _ = self.share.send(share::Cmd::Start(quality, audio, target));
+    }
+
+    /// Troca o que sai sem parar a transmissão: `target` no Windows; no Linux, `None` abre
+    /// o portal. Cancelar mantém o que já saía.
+    pub fn swap_share(&self, target: Option<share::Source>) {
+        let _ = self.share.send(share::Cmd::Swap(target));
     }
 
     pub fn choose_share_audio(&self, choice: Choice) {

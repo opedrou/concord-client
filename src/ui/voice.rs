@@ -92,6 +92,11 @@ pub struct ActiveCall {
     pub screen_pending: bool,
     /// Prévia borrada de cada transmissão no ar, pela identity.
     pub previews: HashMap<String, image::Handle>,
+    /// Prévia da própria transmissão, já na GPU, e se tem uma subindo.
+    pub own: Option<image::Allocation>,
+    pub own_pending: bool,
+    /// Janela sem foco: a prévia própria para, a transmissão não.
+    pub preview_paused: bool,
     /// Tamanho da transmissão assistida.
     pub view: View,
     /// Mouse perto do pé do palco: a barra de controles aparece.
@@ -136,6 +141,9 @@ impl ActiveCall {
             screen: None,
             screen_pending: false,
             previews: HashMap::new(),
+            own: None,
+            own_pending: false,
+            preview_paused: false,
             view: View::Tile,
             bar_near: false,
             cursor: Point::ORIGIN,
@@ -156,6 +164,7 @@ impl ActiveCall {
     }
 
     pub fn attach(&mut self, call: Call, engine: Engine) {
+        call.preview().pause(self.preview_paused);
         self.call = Some(call);
         self.meter = Some(engine.meter());
         self.engine = Some(engine);
@@ -170,6 +179,8 @@ impl ActiveCall {
     /// Botão de tela: abre e fecha o painel; com transmissão em andamento, para.
     pub fn share_button(&mut self) {
         match self.share {
+            // O seletor aberto pra trocar: fecha ele, sem parar.
+            share::State::Live if self.share_panel => self.share_panel = false,
             share::State::Choosing | share::State::Live => self.stop_share(),
             share::State::Off | share::State::Failed => {
                 self.share = share::State::Off;
@@ -179,10 +190,23 @@ impl ActiveCall {
         }
     }
 
+    /// No ar, o seletor do Windows troca o que sai em vez de começar outra.
     pub fn start_share(&mut self, quality: Quality, audio: bool) {
+        if self.share == share::State::Live {
+            return self.swap_share();
+        }
         self.share_panel = false;
         if let Some(call) = &self.call {
             call.start_share(quality, audio, self.share_source.clone());
+        }
+    }
+
+    /// Troca o que sai sem parar: no Windows vai o escolhido no seletor; no Linux, `None`
+    /// abre o portal.
+    pub fn swap_share(&mut self) {
+        self.share_panel = false;
+        if let Some(call) = &self.call {
+            call.swap_share(self.share_source.clone());
         }
     }
 
@@ -221,12 +245,44 @@ impl ActiveCall {
         }
     }
 
-    /// O áudio só existe com a transmissão no ar.
+    /// O áudio e a prévia própria só existem com a transmissão no ar.
     pub fn set_share(&mut self, state: share::State) {
         self.share = state;
         if state != share::State::Live {
             self.share_audio = None;
             self.audio_list = false;
+            self.own = None;
+        }
+    }
+
+    /// Sem foco a prévia própria para de ser gerada; a transmissão segue.
+    pub fn set_focus(&mut self, focused: bool) {
+        self.preview_paused = !focused;
+        if let Some(call) = &self.call {
+            call.preview().pause(!focused);
+        }
+    }
+
+    /// Relógio da prévia própria: só no ar e com foco. Sem foco nada sobe.
+    pub fn preview_clock(&self) -> bool {
+        self.share == share::State::Live && !self.preview_paused
+    }
+
+    /// Prévia própria nova pra subir pra GPU, se chegou uma e a anterior já subiu.
+    pub fn pull_own(&mut self) -> Option<image::Handle> {
+        if self.own_pending || self.share != share::State::Live {
+            return None;
+        }
+        let p = self.call.as_ref()?.preview().take()?;
+        self.own_pending = true;
+        Some(image::Handle::from_rgba(p.width, p.height, p.rgba))
+    }
+
+    /// A prévia subiu: só agora ela troca a do tile.
+    pub fn own_ready(&mut self, allocation: Option<image::Allocation>) {
+        self.own_pending = false;
+        if self.share == share::State::Live && allocation.is_some() {
+            self.own = allocation;
         }
     }
 
