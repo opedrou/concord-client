@@ -1,0 +1,4 @@
+# O libwebrtc pré-compilado do LiveKit vem com CRT estático (/MT): sem isso o link falha com
+# LNK2038 (MT_StaticRelease contra MD_DynamicRelease). Só vale no Windows MSVC.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

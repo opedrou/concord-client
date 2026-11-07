@@ -37,7 +37,7 @@ fn segundos() -> u64 {
 /// CPU: o que a medida pega é conversão, redução e encoder.
 fn padrao(w: usize, h: usize) -> Vec<u8> {
     let mut image = vec![0u8; w * h * 4];
-    for (i, px) in image.chunks_exact_mut(4).enumerate() {
+    for (i, px) in image.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let (x, y) = ((i % w) as u32, (i / w) as u32);
         let cell = (x / 32).wrapping_mul(2654435761) ^ (y / 32).wrapping_mul(2246822519);
         let tint = (cell >> 8) as u8;
@@ -163,6 +163,7 @@ fn som(me: &LocalParticipant) -> Option<livekit::publication::LocalTrackPublicat
 }
 
 /// O áudio sai depois do vídeo no ar.
+#[cfg(target_os = "linux")]
 async fn som_no_ar(me: &LocalParticipant) {
     let inicio = Instant::now();
     while som(me).is_none() {
@@ -174,6 +175,7 @@ async fn som_no_ar(me: &LocalParticipant) {
 }
 
 /// Codec e bytes do áudio que o WebRTC está mandando.
+#[cfg(target_os = "linux")]
 async fn som_enviado(me: &LocalParticipant) -> String {
     let stats = som(me).unwrap().track().unwrap().get_stats().await.unwrap();
     let mut linha = String::from("SOM ENVIADO");
@@ -414,6 +416,7 @@ async fn bancada_tela_call() {
 /// Tela com áudio até o Chrome, com apps falsos num PipeWire isolado: o jogo tem que chegar
 /// nos dois lados certos, e a aba "Concord", este processo e o mic, nunca. Rode por
 /// `src/audio/bancada.sh bancada_tela_audio`, com as variáveis do `share/bancada.sh` e `OUT`.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn bancada_tela_audio() {

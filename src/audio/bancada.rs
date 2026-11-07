@@ -113,7 +113,9 @@ fn prefs(noise: NoiseLevel) -> AudioPrefs {
 
 fn wav(name: &str) -> Vec<i16> {
     fs::read(format!("{WAV_DIR}/{name}")).expect("wav")[44..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| i16::from_le_bytes([b[0], b[1]]))
         .collect()
 }
@@ -127,7 +129,7 @@ impl Far {
         let done = stop.clone();
         thread::spawn(move || {
             let start = Instant::now();
-            for (i, block) in pcm.chunks_exact(FRAME).cycle().enumerate() {
+            for (i, block) in pcm.as_chunks::<FRAME>().0.iter().cycle().enumerate() {
                 if done.load(Ordering::Relaxed) {
                     return;
                 }
@@ -203,7 +205,9 @@ impl Capture {
             let mut bytes = [0u8; FRAME * 2];
             while stdout.read_exact(&mut bytes).is_ok() {
                 let block: Vec<i16> = bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|b| i16::from_le_bytes([b[0], b[1]]))
                     .collect();
                 sum.lock().unwrap().add(&block);
@@ -556,7 +560,9 @@ fn voz() -> Vec<f32> {
     for nome in VOZES {
         let bytes = fs::read(format!("{VOZ_DIR}/{nome}.wav")).expect("wav de voz");
         let base: Vec<f32> = bytes[44..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
             .take(24_000 * 14)
             .collect();
@@ -565,7 +571,12 @@ fn voz() -> Vec<f32> {
             .windows(2)
             .flat_map(|w| [w[0], (w[0] + w[1]) / 2.0])
             .collect();
-        let blocos: Vec<f32> = dobro.chunks_exact(FRAME).map(block_db).collect();
+        let blocos: Vec<f32> = dobro
+            .as_chunks::<FRAME>()
+            .0
+            .iter()
+            .map(|b| block_db(b))
+            .collect();
         let topo = blocos.iter().copied().fold(-200.0, f32::max);
         let ativos: Vec<f32> = blocos.into_iter().filter(|d| *d > topo - 30.0).collect();
         let medio = ativos.iter().map(|d| 10f32.powf(d / 10.0)).sum::<f32>() / ativos.len() as f32;
@@ -640,7 +651,9 @@ fn escuta(sinal: &Sinal, noise: NoiseLevel, sensitivity: Sensitivity) -> Vec<mic
 fn envelope(pcm: impl Iterator<Item = f32>) -> Vec<f32> {
     pcm.map(f32::abs)
         .collect::<Vec<_>>()
-        .chunks_exact(240)
+        .as_chunks::<240>()
+        .0
+        .iter()
         .map(|c| c.iter().sum())
         .collect()
 }
@@ -678,7 +691,9 @@ struct Cortes {
 /// perdeu nas pontas, em ms.
 fn cortes(gabarito: &[f32], trace: &[mic::Traced], atraso: isize) -> Cortes {
     let fala: Vec<bool> = gabarito
-        .chunks_exact(FRAME)
+        .as_chunks::<FRAME>()
+        .0
+        .iter()
         .map(|b| block_db(b) >= COM_FALA_DB)
         .collect();
     let desvio = (atraso + super::gate::LOOKAHEAD as isize) / FRAME as isize;

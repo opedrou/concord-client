@@ -122,8 +122,8 @@ fn pump(mut out: ChildStdout, source: NativeAudioSource) {
     let mut bytes = vec![0u8; FRAME * CHANNELS as usize * 2];
     let mut samples = vec![0i16; FRAME * CHANNELS as usize];
     while out.read_exact(&mut bytes).is_ok() {
-        for (s, b) in samples.iter_mut().zip(bytes.chunks_exact(2)) {
-            *s = i16::from_le_bytes([b[0], b[1]]);
+        for (s, b) in samples.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *s = i16::from_le_bytes(*b);
         }
         let frame = AudioFrame {
             data: samples.as_slice().into(),
@@ -432,7 +432,7 @@ impl Graph {
 }
 
 /// Apps falsos num PipeWire isolado, pras bancadas. Nunca na sessão de verdade.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(super) mod bancada {
     use std::f64::consts::TAU;
 
@@ -886,11 +886,15 @@ mod tests {
         assert_eq!(initial(false, &apps(&["A", "B"])), (Choice::Silent, true));
     }
 
+    #[cfg(target_os = "linux")]
     use bancada::{Ouvido, Sons};
+    #[cfg(target_os = "linux")]
     use livekit::{track::LocalAudioTrack, webrtc::prelude::RtcAudioSource};
+    #[cfg(target_os = "linux")]
     use tokio::{sync::mpsc::unbounded_channel, time::sleep};
 
     /// A cadeia de verdade, num PipeWire isolado: `src/audio/bancada.sh bancada_audio`.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn bancada_audio_cadeia() {
@@ -954,6 +958,7 @@ mod tests {
     }
 
     /// Fica no ar pra derrubar o processo com `kill -9` de fora e ver o `pw-record` sumir.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
     fn bancada_audio_queda() {
