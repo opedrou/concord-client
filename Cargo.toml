@@ -28,5 +28,10 @@ cpal = "0.18"
 cpal = { version = "0.18", features = ["pulseaudio"] }
 livekit = { version = "0.10", features = ["glib-main-loop"] }
 
+# Resolução dos monitores pelo Mutter, pra saber se a transmissão é tela ou janela. Já vem
+# compilado pelo `keyring`.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+
 [dev-dependencies]
 iced_test = "0.14"

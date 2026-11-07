@@ -2,7 +2,7 @@
 use iced::widget::text::Wrapping;
 use iced::widget::{
     Column, Row, button, center, column, container, mouse_area, opaque, pin, responsive, row,
-    slider, space, stack, text,
+    slider, space, stack, text, toggler,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Size, Theme, border};
 
@@ -15,7 +15,7 @@ use super::voice::{self, ActiveCall, GAP, Status};
 use super::{Main, Msg, avatar};
 use crate::call::{Live, MAX_ATTEMPTS};
 use crate::config::Config;
-use crate::share::{Quality, State};
+use crate::share::{Choice, Quality, State, View};
 
 /// Largura fixa e altura aproximada do painel de volume, pra centrar no tile.
 const PANEL: Size = Size::new(280.0, 104.0);
@@ -210,7 +210,7 @@ fn banner<'a>(attempt: u32) -> Element<'a, Msg> {
 }
 
 /// O que a transmissão mostra logo acima da barra: nunca mais de um por vez.
-fn share_overlay<'a>(call: &ActiveCall, config: &'a Config) -> Option<Element<'a, Msg>> {
+fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element<'a, Msg>> {
     let content = match call.share {
         State::Choosing => choosing(),
         State::Failed => {
@@ -223,6 +223,11 @@ fn share_overlay<'a>(call: &ActiveCall, config: &'a Config) -> Option<Element<'a
                 .style(theme::tooltip)
                 .into()
         }
+        State::Live => match &call.share_audio {
+            Some(view) if call.audio_list => audio_card(view),
+            Some(view) => audio_line(view),
+            None => return None,
+        },
         _ if call.share_panel => share_card(config),
         _ => return None,
     };
@@ -296,8 +301,105 @@ fn share_card(config: &Config) -> Element<'_, Msg> {
     .width(Length::Fill)
     .style(theme::primary)
     .on_press(Msg::ShareStart);
+    // Etapa 4: o áudio por app do Windows ainda não existe.
+    let audio: Option<Element<'_, Msg>> = cfg!(target_os = "linux").then(|| {
+        toggler(config.share_audio)
+            .label("Transmitir áudio")
+            .on_toggle(Msg::ShareAudio)
+            .size(20)
+            .text_size(14.4)
+            .into()
+    });
 
-    container(column![head, Column::with_children(options).spacing(2), start].spacing(10))
+    let body = column![head, Column::with_children(options).spacing(2)]
+        .push(audio)
+        .push(start)
+        .spacing(10);
+    container(body)
+        .width(SHARE_PANEL)
+        .padding(12)
+        .style(floating(BORDER))
+        .into()
+}
+
+fn audio_label(choice: &Choice) -> String {
+    match choice {
+        Choice::App(app) => format!("Áudio: {app}"),
+        Choice::All => "Áudio: computador todo".into(),
+        Choice::Silent => "Sem áudio".into(),
+    }
+}
+
+/// O que vai de áudio com a transmissão no ar, com o botão de trocar.
+fn audio_line(view: &View) -> Element<'_, Msg> {
+    let silent = view.choice == Choice::Silent;
+    let change = button(text("Trocar").size(13).font(theme::SEMIBOLD))
+        .padding([5, 12])
+        .style(theme::outline)
+        .on_press(Msg::AudioList);
+    let line = row![
+        icon(if silent { VOLUME_X } else { VOLUME }, 16.0, FG2),
+        text(audio_label(&view.choice))
+            .size(13.5)
+            .font(theme::SEMIBOLD),
+        change,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    container(line)
+        .padding([7, 14])
+        .style(theme::tooltip)
+        .into()
+}
+
+/// Lista de áudio: os apps tocando agora, o computador todo ou nada. Atualiza sozinha.
+fn audio_card(view: &View) -> Element<'_, Msg> {
+    let close = button(container(icon(CLOSE, 16.0, FG2)).center(28))
+        .padding(0)
+        .style(theme::ghost)
+        .on_press(Msg::AudioList);
+    let head = row![
+        text("Áudio da transmissão")
+            .size(14.4)
+            .font(theme::SEMIBOLD)
+            .width(Length::Fill),
+        close
+    ]
+    .align_y(Alignment::Center);
+
+    let option = |label: String, choice: Choice| -> Element<'_, Msg> {
+        button(text(label).size(14).font(theme::MEDIUM))
+            .padding([8, 12])
+            .width(Length::Fill)
+            .style(theme::nav_item(choice == view.choice))
+            .on_press(Msg::AudioChoice(choice))
+            .into()
+    };
+    let mut list: Vec<_> = view
+        .apps
+        .iter()
+        .map(|app| option(app.clone(), Choice::App(app.clone())))
+        .collect();
+    if view.apps.is_empty() {
+        list.push(
+            container(text("Nenhum app tocando agora.").size(13).color(FG2))
+                .padding([6, 12])
+                .into(),
+        );
+    }
+    // O escolhido continua na lista quando para de tocar, senão some a marcação.
+    if let Choice::App(app) = &view.choice
+        && !view.apps.contains(app)
+    {
+        list.push(option(
+            format!("{app} (sem som agora)"),
+            view.choice.clone(),
+        ));
+    }
+    list.push(option("Computador todo".into(), Choice::All));
+    list.push(option("Sem áudio".into(), Choice::Silent));
+
+    container(column![head, Column::with_children(list).spacing(2)].spacing(10))
         .width(SHARE_PANEL)
         .padding(12)
         .style(floating(BORDER))

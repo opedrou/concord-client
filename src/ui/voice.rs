@@ -72,6 +72,10 @@ pub struct ActiveCall {
     pub share: share::State,
     /// Painel de qualidade aberto.
     pub share_panel: bool,
+    /// Áudio da transmissão no ar, por `Event::ShareAudio`.
+    pub share_audio: Option<share::View>,
+    /// Lista de áudio aberta, sobre o palco.
+    pub audio_list: bool,
 }
 
 impl ActiveCall {
@@ -88,6 +92,8 @@ impl ActiveCall {
             volume_panel: None,
             share: share::State::Off,
             share_panel: false,
+            share_audio: None,
+            audio_list: false,
         }
     }
 
@@ -115,10 +121,31 @@ impl ActiveCall {
         }
     }
 
-    pub fn start_share(&mut self, quality: Quality) {
+    pub fn start_share(&mut self, quality: Quality, audio: bool) {
         self.share_panel = false;
         if let Some(call) = &self.call {
-            call.start_share(quality);
+            call.start_share(quality, audio);
+        }
+    }
+
+    /// O áudio só existe com a transmissão no ar.
+    pub fn set_share(&mut self, state: share::State) {
+        self.share = state;
+        if state != share::State::Live {
+            self.share_audio = None;
+            self.audio_list = false;
+        }
+    }
+
+    pub fn set_share_audio(&mut self, view: share::View) {
+        self.audio_list |= view.ask;
+        self.share_audio = Some(view);
+    }
+
+    pub fn choose_share_audio(&mut self, choice: share::Choice) {
+        self.audio_list = false;
+        if let Some(call) = &self.call {
+            call.choose_share_audio(choice);
         }
     }
 

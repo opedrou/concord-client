@@ -37,6 +37,8 @@ pub struct Config {
     /// Nome da pessoa -> slider. Quem não está aqui fica em [`VOLUME_PADRAO`].
     pub volumes: HashMap<String, u8>,
     pub share_quality: Quality,
+    /// Interruptor "Transmitir áudio". Só no Linux por enquanto.
+    pub share_audio: bool,
 }
 
 impl Default for Config {
@@ -56,6 +58,7 @@ impl Default for Config {
             master_volume: VOLUME_PADRAO,
             volumes: HashMap::new(),
             share_quality: Quality::default(),
+            share_audio: true,
         }
     }
 }
@@ -263,6 +266,18 @@ mod tests {
         };
         let c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(c.share_quality, Quality::Economica);
+    }
+
+    #[test]
+    fn audio_da_tela_vem_ligado_e_volta_do_arquivo() {
+        let c: Config = serde_json::from_str(r#"{"mic_muted":true}"#).unwrap();
+        assert!(c.share_audio);
+        let c = Config {
+            share_audio: false,
+            ..Config::default()
+        };
+        let c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(!c.share_audio);
     }
 
     #[test]

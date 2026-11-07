@@ -1,4 +1,5 @@
 //! Transmissão de tela: qualidades, captura numa thread própria e publicação na sala.
+mod app_audio;
 #[cfg(test)]
 mod bancada;
 
@@ -13,16 +14,20 @@ use std::{
 
 use livekit::{
     options::{
-        DegradationPreference, TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding,
+        AudioEncoding, DegradationPreference, TrackPublishOptions, VideoCodec, VideoEncoderBackend,
+        VideoEncoding,
     },
     participant::LocalParticipant,
-    track::{LocalTrack, LocalVideoTrack, TrackSource},
+    track::{LocalAudioTrack, LocalTrack, LocalVideoTrack, TrackSource},
     webrtc::{
+        audio_source::native::NativeAudioSource,
         desktop_capturer::{
             CaptureError, DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions,
         },
         native::yuv_helper,
-        prelude::{I420Buffer, RtcVideoSource, VideoFrame, VideoResolution, VideoRotation},
+        prelude::{
+            I420Buffer, RtcAudioSource, RtcVideoSource, VideoFrame, VideoResolution, VideoRotation,
+        },
         video_source::native::NativeVideoSource,
     },
 };
@@ -34,6 +39,9 @@ use tokio::{
         watch,
     },
 };
+
+use app_audio::AppAudio;
+pub use app_audio::{Choice, View};
 
 /// Tabela da seção 7 do plano, os mesmos presets do `lib/screenShareQuality.ts` da web.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,8 +112,11 @@ pub enum State {
 }
 
 pub enum Cmd {
-    Start(Quality),
+    /// Qualidade, e se leva o áudio junto.
+    Start(Quality, bool),
     Stop,
+    /// Troca o áudio de uma transmissão no ar.
+    Audio(Choice),
 }
 
 /// Reduz pra caber em `limit`, sem aumentar e mantendo a proporção. Lados sempre pares,
@@ -118,8 +129,8 @@ fn fit(width: u32, height: u32, limit: Option<(u32, u32)>) -> (u32, u32) {
 }
 
 enum Note {
-    /// Chegou o primeiro quadro: agora dá pra publicar.
-    Ready(NativeVideoSource),
+    /// Chegou o primeiro quadro, com o tamanho original: agora dá pra publicar.
+    Ready(NativeVideoSource, (u32, u32)),
     /// Não há capturador neste sistema. Fim normal é a thread soltar o canal.
     Failed,
 }
@@ -154,7 +165,9 @@ impl Feed {
                 },
                 true,
             );
-            let _ = self.notes.send(Note::Ready(source.clone()));
+            let _ = self
+                .notes
+                .send(Note::Ready(source.clone(), (width, height)));
             source
         });
         source.capture_frame(&VideoFrame {
@@ -230,10 +243,15 @@ struct Running {
     source: Option<NativeVideoSource>,
     /// Publicada na sala atual.
     published: bool,
+    with_audio: bool,
+    /// Tamanho do primeiro quadro: tela ou janela.
+    frame: (u32, u32),
+    /// Nasce depois do vídeo no ar e morre com o `Running`.
+    audio: Option<AppAudio>,
 }
 
 impl Running {
-    fn start(quality: Quality, capture: Capturer) -> Option<Self> {
+    fn start(quality: Quality, with_audio: bool, capture: Capturer) -> Option<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let (notes_tx, notes) = mpsc::unbounded_channel();
         let feed = Feed {
@@ -258,6 +276,9 @@ impl Running {
             notes,
             source: None,
             published: false,
+            with_audio,
+            frame: (0, 0),
+            audio: None,
         })
     }
 }
@@ -294,6 +315,22 @@ async fn publish(me: &LocalParticipant, source: NativeVideoSource, quality: Qual
         .is_ok()
 }
 
+/// `Unknown` e com nome fixo, como o site: ele só toca pra quem clicou em Assistir.
+async fn publish_audio(me: &LocalParticipant, source: NativeAudioSource) {
+    let track =
+        LocalAudioTrack::create_audio_track(app_audio::TRACK, RtcAudioSource::Native(source));
+    let options = TrackPublishOptions {
+        source: TrackSource::Unknown,
+        audio_encoding: Some(AudioEncoding {
+            max_bitrate: 128_000,
+        }),
+        // Sem DTX: música baixa não pode virar silêncio.
+        dtx: false,
+        ..Default::default()
+    };
+    let _ = me.publish_track(LocalTrack::Audio(track), options).await;
+}
+
 /// Para a captura e despublica. Procura pela lista, não por um sid guardado: a retomada
 /// do SDK republica com outro sid.
 async fn stop(share: &mut Option<Running>, room: &watch::Receiver<Option<LocalParticipant>>) {
@@ -301,29 +338,38 @@ async fn stop(share: &mut Option<Running>, room: &watch::Receiver<Option<LocalPa
     let me = room.borrow().clone();
     let Some(me) = me else { return };
     for (sid, publication) in me.track_publications() {
-        if publication.source() == TrackSource::Screenshare {
+        if publication.source() == TrackSource::Screenshare
+            || publication.name() == app_audio::TRACK
+        {
             let _ = me.unpublish_track(&sid).await;
         }
     }
 }
 
 /// Dono da transmissão durante a call. `room` é a sala atual, `None` entre uma conexão e
-/// outra. Só [`Cmd::Start`] abre captura, e ele só vem do clique da pessoa.
+/// outra. Só [`Cmd::Start`] abre captura, e ele só vem do clique da pessoa. `audio` recebe o
+/// estado do áudio, de outra thread.
 pub async fn run(
     mut cmds: UnboundedReceiver<Cmd>,
     mut room: watch::Receiver<Option<LocalParticipant>>,
     capture: Capturer,
     notify: impl Fn(State),
+    audio: impl Fn(View) + Clone + Send + 'static,
 ) {
     let mut share: Option<Running> = None;
     loop {
         tokio::select! {
             cmd = cmds.recv() => match cmd {
-                Some(Cmd::Start(quality)) if share.is_none() => {
-                    share = Running::start(quality, capture);
+                Some(Cmd::Start(quality, with_audio)) if share.is_none() => {
+                    share = Running::start(quality, with_audio, capture);
                     notify(if share.is_some() { State::Choosing } else { State::Failed });
                 }
-                Some(Cmd::Start(_)) => {}
+                Some(Cmd::Start(..)) => {}
+                Some(Cmd::Audio(choice)) => {
+                    if let Some(a) = share.as_ref().and_then(|r| r.audio.as_ref()) {
+                        a.choose(choice);
+                    }
+                }
                 Some(Cmd::Stop) => {
                     stop(&mut share, &room).await;
                     notify(State::Off);
@@ -331,9 +377,10 @@ pub async fn run(
                 None => return,
             },
             note = next_note(&mut share) => match note {
-                Some(Note::Ready(source)) => {
+                Some(Note::Ready(source, frame)) => {
                     if let Some(r) = &mut share {
                         r.source = Some(source);
+                        r.frame = frame;
                     }
                 }
                 Some(Note::Failed) => {
@@ -367,10 +414,17 @@ pub async fn run(
         let me = room.borrow_and_update().clone();
         let Some(me) = me else { continue };
         if publish(&me, source, quality).await {
+            notify(State::Live);
+            // O áudio vai depois do vídeo, e na sala nova junto com ele.
             if let Some(r) = &mut share {
                 r.published = true;
+                if r.with_audio && r.audio.is_none() {
+                    r.audio = AppAudio::start(r.frame, audio.clone());
+                }
+                if let Some(a) = &r.audio {
+                    publish_audio(&me, a.source.clone()).await;
+                }
             }
-            notify(State::Live);
         } else if !room.has_changed().unwrap_or(false) {
             // Com a sala trocando no meio, não é falha: a próxima volta publica na nova.
             stop(&mut share, &room).await;
@@ -476,9 +530,15 @@ mod tests {
         let (_room, room) = watch::channel(None);
         let tarefa = tokio::spawn(async move {
             let _room = _room;
-            run(cmds, room, capture, move |s| {
-                let _ = states.send(s);
-            })
+            run(
+                cmds,
+                room,
+                capture,
+                move |s| {
+                    let _ = states.send(s);
+                },
+                |_| {},
+            )
             .await;
         });
         (cmd, estados, tarefa)
@@ -515,7 +575,7 @@ mod tests {
             VIVAS.fetch_sub(1, Ordering::SeqCst);
         }
         let (cmd, mut estados, _t) = ator(seletor);
-        cmd.send(Cmd::Start(Quality::Alta)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         cmd.send(Cmd::Stop).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Off);
@@ -526,7 +586,7 @@ mod tests {
     async fn portal_cancelado_volta_a_parado_sem_falha() {
         fn cancela(_: u32, _: &AtomicBool, _: Feed) {}
         let (cmd, mut estados, _t) = ator(cancela);
-        cmd.send(Cmd::Start(Quality::Alta)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         assert_eq!(proximo(&mut estados).await, State::Off);
     }
@@ -537,7 +597,7 @@ mod tests {
             feed.fail();
         }
         let (cmd, mut estados, _t) = ator(sem);
-        cmd.send(Cmd::Start(Quality::Alta)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         assert_eq!(proximo(&mut estados).await, State::Failed);
     }
@@ -550,8 +610,8 @@ mod tests {
             espera_parar(stop);
         }
         let (cmd, mut estados, _t) = ator(uma);
-        cmd.send(Cmd::Start(Quality::Alta)).unwrap();
-        cmd.send(Cmd::Start(Quality::Media)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
+        cmd.send(Cmd::Start(Quality::Media, false)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         while ABERTAS.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -571,7 +631,7 @@ mod tests {
         }
         // Tarefa da call abortada: é o que acontece em qualquer fim da call.
         let (cmd, mut estados, tarefa) = ator(viva);
-        cmd.send(Cmd::Start(Quality::Alta)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         while VIVAS.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -581,7 +641,7 @@ mod tests {
 
         // Todos os `Call` soltos, sem ninguém pedir pra parar.
         let (cmd, mut estados, _t) = ator(viva);
-        cmd.send(Cmd::Start(Quality::Alta)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         drop(cmd);
         soltou(&VIVAS).await;
@@ -596,7 +656,7 @@ mod tests {
             }
         }
         let (cmd, mut estados, _t) = ator(muda);
-        cmd.send(Cmd::Start(Quality::Media)).unwrap();
+        cmd.send(Cmd::Start(Quality::Media, false)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         assert_eq!(proximo(&mut estados).await, State::Off);
     }

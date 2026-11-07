@@ -30,7 +30,7 @@ use tokio::{
 
 use crate::api::{self, Client};
 use crate::audio::{Engine, Meter, MicFrames, RATE};
-use crate::share::{self, Capturer, Quality};
+use crate::share::{self, Capturer, Choice, Quality};
 
 /// Máximo de tentativas de reconexão, como na web.
 pub const MAX_ATTEMPTS: u32 = 10;
@@ -80,6 +80,8 @@ pub enum Event {
     /// Lista inteira, a cada mudança.
     Participants(Vec<Live>),
     Share(share::State),
+    /// Áudio da transmissão no ar: a escolha e os apps tocando.
+    ShareAudio(share::View),
     /// Último evento da call.
     Ended(End),
 }
@@ -143,10 +145,18 @@ impl Call {
         let (cmd, rx) = mpsc::unbounded_channel();
         let (share, share_rx) = mpsc::unbounded_channel();
         let (room, room_rx) = watch::channel(None);
-        let states = tx.clone();
-        let sharing = share::run(share_rx, room_rx, capture, move |state| {
-            let _ = states.send(Event::Share(state));
-        });
+        let (states, audio) = (tx.clone(), tx.clone());
+        let sharing = share::run(
+            share_rx,
+            room_rx,
+            capture,
+            move |state| {
+                let _ = states.send(Event::Share(state));
+            },
+            move |view| {
+                let _ = audio.send(Event::ShareAudio(view));
+            },
+        );
         let task = Task {
             client,
             slug,
@@ -181,9 +191,14 @@ impl Call {
         let _ = self.cmd.send(Cmd::MutedPeople(names));
     }
 
-    /// Abre a captura; o andamento vem em [`Event::Share`].
-    pub fn start_share(&self, quality: Quality) {
-        let _ = self.share.send(share::Cmd::Start(quality));
+    /// Abre a captura; o andamento vem em [`Event::Share`] e o do áudio, se `audio`, em
+    /// [`Event::ShareAudio`].
+    pub fn start_share(&self, quality: Quality, audio: bool) {
+        let _ = self.share.send(share::Cmd::Start(quality, audio));
+    }
+
+    pub fn choose_share_audio(&self, choice: Choice) {
+        let _ = self.share.send(share::Cmd::Audio(choice));
     }
 
     pub fn stop_share(&self) {

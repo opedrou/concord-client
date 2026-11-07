@@ -11,7 +11,8 @@ sobe() {
 }
 limpa() {
   touch "$RAIZ/fim"
-  kill "$(cat "$RAIZ/pulse/pid" 2>/dev/null)" "$WP" "$PW" 2>/dev/null
+  # $WP e $PW são o subshell do `sobe`: o daemon é filho dele.
+  kill "$(cat "$RAIZ/pulse/pid" 2>/dev/null)" $(pgrep -P "$WP") $(pgrep -P "$PW") "$WP" "$PW" 2>/dev/null
   wait 2>/dev/null
   rm -rf "$RAIZ"
 }
@@ -26,5 +27,7 @@ sleep 1
 sobe wireplumber --profile=policy &
 WP=$!
 sleep 2
-export PULSE_SERVER="unix:$RAIZ/pulse/native" BANCADA_RAIZ="$RAIZ"
+# PIPEWIRE_RUNTIME_DIR leva `pw-dump`, `pw-link` e `pw-record` pro PipeWire daqui, não pro
+# da sessão.
+export PULSE_SERVER="unix:$RAIZ/pulse/native" BANCADA_RAIZ="$RAIZ" PIPEWIRE_RUNTIME_DIR="$RAIZ"
 cargo test "${1:-bancada}" -- --ignored --nocapture --test-threads=1

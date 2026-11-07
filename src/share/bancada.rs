@@ -113,9 +113,15 @@ impl Banca {
         let (cmd, cmds) = mpsc::unbounded_channel();
         let (states, estados) = mpsc::unbounded_channel();
         let (room, room_rx) = watch::channel(Some(me));
-        tokio::spawn(run(cmds, room_rx, sintetica, move |s| {
-            let _ = states.send(s);
-        }));
+        tokio::spawn(run(
+            cmds,
+            room_rx,
+            sintetica,
+            move |s| {
+                let _ = states.send(s);
+            },
+            |v| println!("AUDIO {v:?}"),
+        ));
         Self { cmd, estados, room }
     }
 
@@ -127,7 +133,7 @@ impl Banca {
     }
 
     async fn ao_vivo(&mut self, me: &LocalParticipant, quality: Quality) {
-        self.cmd.send(Cmd::Start(quality)).unwrap();
+        self.cmd.send(Cmd::Start(quality, false)).unwrap();
         assert_eq!(self.estado().await, State::Choosing);
         sleep(SELETOR / 2).await;
         assert!(tela(me).is_none(), "publicou antes do primeiro quadro");
@@ -139,6 +145,7 @@ impl Banca {
         self.cmd.send(Cmd::Stop).unwrap();
         assert_eq!(self.estado().await, State::Off);
         assert!(tela(me).is_none(), "ficou publicada");
+        assert!(som(me).is_none(), "o áudio ficou publicado");
         solta().await;
     }
 }
@@ -147,6 +154,48 @@ fn tela(me: &LocalParticipant) -> Option<livekit::publication::LocalTrackPublica
     me.track_publications()
         .into_values()
         .find(|p| p.source() == TrackSource::Screenshare)
+}
+
+fn som(me: &LocalParticipant) -> Option<livekit::publication::LocalTrackPublication> {
+    me.track_publications()
+        .into_values()
+        .find(|p| p.name() == app_audio::TRACK)
+}
+
+/// O áudio sai depois do vídeo no ar.
+async fn som_no_ar(me: &LocalParticipant) {
+    let inicio = Instant::now();
+    while som(me).is_none() {
+        assert!(inicio.elapsed() < ESPERA, "o áudio não foi publicado");
+        sleep(Duration::from_millis(50)).await;
+    }
+    let p = som(me).unwrap();
+    assert_eq!(p.source(), TrackSource::Unknown);
+}
+
+/// Codec e bytes do áudio que o WebRTC está mandando.
+async fn som_enviado(me: &LocalParticipant) -> String {
+    let stats = som(me).unwrap().track().unwrap().get_stats().await.unwrap();
+    let mut linha = String::from("SOM ENVIADO");
+    for s in stats {
+        match s {
+            RtcStats::Codec(c) => {
+                linha += &format!(
+                    " codec={} canais={} fmtp={:?}",
+                    c.codec.mime_type, c.codec.channels, c.codec.sdp_fmtp_line
+                )
+            }
+            RtcStats::OutboundRtp(o) => {
+                linha += &format!(
+                    " bytes={} alvo={:.0} kbps",
+                    o.sent.bytes_sent,
+                    o.outbound.target_bitrate / 1e3
+                )
+            }
+            _ => {}
+        }
+    }
+    linha
 }
 
 /// A thread de captura saiu.
@@ -328,7 +377,7 @@ async fn bancada_tela_call() {
             break;
         }
     }
-    call.start_share(Quality::Economica);
+    call.start_share(Quality::Economica, false);
     let local_no_ar = |e: &Event| match e {
         Event::Participants(list) => list.iter().any(|p| p.is_local && p.screen_share),
         _ => false,
@@ -359,5 +408,59 @@ async fn bancada_tela_call() {
     }
     assert!(viu_off, "sair não parou a transmissão");
     solta().await;
+    println!("FIM");
+}
+
+/// Tela com áudio até o Chrome, com apps falsos num PipeWire isolado: o jogo tem que chegar
+/// nos dois lados certos, e a aba "Concord", este processo e o mic, nunca. Rode por
+/// `src/audio/bancada.sh bancada_tela_audio`, com as variáveis do `share/bancada.sh` e `OUT`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bancada_tela_audio() {
+    super::app_audio::bancada::isolado();
+    let _sons = super::app_audio::bancada::Sons::start();
+    let client = cliente().await;
+    let room = entrar(&client).await;
+    let me = room.local_participant();
+    let mut banca = Banca::new(me.clone());
+    banca.cmd.send(Cmd::Start(Quality::Media, true)).unwrap();
+    assert_eq!(banca.estado().await, State::Choosing);
+    assert_eq!(banca.estado().await, State::Live);
+    som_no_ar(&me).await;
+    println!("PUBLICADO com áudio");
+
+    let web = tokio::task::spawn_blocking(|| {
+        Command::new("node")
+            .arg("src/share/ouve-tela.mjs")
+            .output()
+            .expect("node")
+    });
+    sleep(Duration::from_secs(10)).await;
+    println!("{}", som_enviado(&me).await);
+    let web = web.await.unwrap();
+    let saida = String::from_utf8_lossy(&web.stdout);
+    println!("{saida}{}", String::from_utf8_lossy(&web.stderr));
+    let depois = saida
+        .lines()
+        .find(|l| l.starts_with("DEPOIS"))
+        .expect("DEPOIS");
+    assert!(depois.contains("440="), "o Chrome não recebeu o áudio");
+
+    // Sala nova: o áudio volta junto do vídeo, sem abrir o seletor de novo.
+    banca.room.send_replace(None);
+    let _ = room.close().await;
+    drop((room, me));
+    sleep(Duration::from_secs(3)).await;
+    let room = entrar(&client).await;
+    let me = room.local_participant();
+    banca.room.send_replace(Some(me.clone()));
+    assert_eq!(banca.estado().await, State::Live);
+    som_no_ar(&me).await;
+    sleep(Duration::from_secs(3)).await;
+    println!("SALA NOVA {}", som_enviado(&me).await);
+    assert_eq!(ABERTAS.load(Ordering::SeqCst), 1, "abriu o seletor de novo");
+
+    banca.parar(&me).await;
+    let _ = room.close().await;
     println!("FIM");
 }

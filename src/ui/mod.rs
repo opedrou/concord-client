@@ -21,7 +21,7 @@ use crate::audio::{self, Devices, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
 use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::session;
-use crate::share::Quality;
+use crate::share::{Choice, Quality};
 
 const POLL: Duration = Duration::from_secs(4);
 /// Falhas seguidas de presença até o rodapé trocar "Online" por "Sem conexão".
@@ -150,8 +150,13 @@ pub enum Msg {
     /// Botão de tela da barra.
     ShareButton,
     ShareQuality(Quality),
+    /// Interruptor "Transmitir áudio".
+    ShareAudio(bool),
     ShareStart,
     ShareStop,
+    /// Abre e fecha a lista de áudio da transmissão no ar.
+    AudioList,
+    AudioChoice(Choice),
     Input(Option<String>),
     Output(Option<String>),
     Noise(NoiseLevel),
@@ -444,10 +449,29 @@ impl App {
                 self.persist();
                 Task::none()
             }
+            Msg::ShareAudio(on) => {
+                self.config.share_audio = on;
+                self.persist();
+                Task::none()
+            }
             Msg::ShareStart => {
                 let quality = self.config.share_quality;
+                // Etapa 4: no Windows o interruptor nem aparece.
+                let audio = cfg!(target_os = "linux") && self.config.share_audio;
                 if let Some(call) = self.call_mut() {
-                    call.start_share(quality);
+                    call.start_share(quality, audio);
+                }
+                Task::none()
+            }
+            Msg::AudioList => {
+                if let Some(call) = self.call_mut() {
+                    call.audio_list = !call.audio_list;
+                }
+                Task::none()
+            }
+            Msg::AudioChoice(choice) => {
+                if let Some(call) = self.call_mut() {
+                    call.choose_share_audio(choice);
                 }
                 Task::none()
             }
@@ -650,6 +674,7 @@ impl App {
         if let Some(call) = self.call_mut() {
             call.volume_panel = None;
             call.share_panel = false;
+            call.audio_list = false;
         }
     }
 
@@ -733,7 +758,8 @@ impl App {
                 active.status = voice::Status::Reconnecting(attempt);
             }
             call::Event::Participants(list) => active.participants(list, Instant::now()),
-            call::Event::Share(state) => active.share = state,
+            call::Event::Share(state) => active.set_share(state),
+            call::Event::ShareAudio(view) => active.set_share_audio(view),
             call::Event::Ended(end) => return self.call_ended(end),
         }
         Task::none()
@@ -1600,6 +1626,47 @@ mod tests {
         assert!(!call_of(&mut a).share_panel);
     }
 
+    fn audio(a: &mut App, choice: Choice, apps: &[&str], ask: bool) {
+        let id = call_id(a);
+        let apps = apps.iter().map(|s| s.to_string()).collect();
+        let view = crate::share::View { choice, apps, ask };
+        let _ = a.update(Msg::CallEvent(id, call::Event::ShareAudio(view)));
+    }
+
+    #[test]
+    fn audio_da_tela_abre_a_lista_so_quando_pede_e_some_com_a_transmissao() {
+        let mut a = in_call(&["Ana"]);
+        let antes = saves();
+        let _ = a.update(Msg::ShareAudio(false));
+        assert!(!a.config.share_audio);
+        assert_eq!(saves(), antes + 1);
+
+        share(&mut a, ShareState::Live);
+        audio(&mut a, Choice::All, &["Jogo"], false);
+        assert!(!call_of(&mut a).audio_list, "tela inteira não pergunta");
+        audio(&mut a, Choice::Silent, &["A", "B"], true);
+        assert!(
+            call_of(&mut a).audio_list,
+            "janela sem app óbvio abre a lista"
+        );
+        audio(&mut a, Choice::Silent, &["A"], false);
+        assert!(call_of(&mut a).audio_list, "atualizar não fecha");
+
+        let _ = a.update(Msg::AudioChoice(Choice::App("A".into())));
+        assert!(!call_of(&mut a).audio_list, "escolher fecha");
+        let _ = a.update(Msg::AudioList);
+        assert!(call_of(&mut a).audio_list, "dá pra reabrir pra trocar");
+        let _ = a.update(Msg::Escape);
+        assert!(!call_of(&mut a).audio_list);
+
+        let _ = a.update(Msg::AudioList);
+        share(&mut a, ShareState::Live);
+        assert!(call_of(&mut a).share_audio.is_some(), "sala nova mantém");
+        share(&mut a, ShareState::Off);
+        assert!(call_of(&mut a).share_audio.is_none());
+        assert!(!call_of(&mut a).audio_list);
+    }
+
     #[test]
     fn escape_e_painel_de_volume_fecham_o_painel_de_tela() {
         let mut a = in_call(&["Ana"]);
@@ -2039,6 +2106,18 @@ mod tests {
         let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
         share(&mut a, ShareState::Live);
         print(&a, "tela-transmitindo");
+        audio(&mut a, Choice::Silent, &["Google Chrome", "Spotify"], true);
+        print(&a, "tela-audio-lista");
+        audio(&mut a, Choice::Silent, &[], false);
+        print(&a, "tela-audio-lista-vazia");
+        let _ = a.update(Msg::AudioChoice(Choice::App("Google Chrome".into())));
+        audio(
+            &mut a,
+            Choice::App("Google Chrome".into()),
+            &["Google Chrome"],
+            false,
+        );
+        print(&a, "tela-audio-escolhido");
         let (mut a, _) = palco(4);
         share(&mut a, ShareState::Failed);
         print(&a, "tela-falha");
