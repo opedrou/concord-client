@@ -14,7 +14,7 @@ use super::theme::{self, ACCENT, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, FG, 
 use super::voice::{self, ActiveCall, GAP, Status};
 use super::{Main, Msg, avatar};
 use crate::call::{Live, MAX_ATTEMPTS};
-use crate::config::Config;
+use crate::config::{Config, SCREEN as SCREEN_KEY};
 use crate::share::{Choice, Quality, Source, State, View};
 
 /// Largura fixa e altura aproximada do painel de volume, pra centrar no tile.
@@ -28,20 +28,22 @@ const PICKER_GRID: f32 = 300.0;
 const THUMB_HEIGHT: f32 = 104.0;
 /// Barra de controles com a margem dela, pra os avisos abrirem logo acima.
 const ABOVE_BAR: f32 = 94.0;
+/// Faixa do pé do palco onde o mouse faz a barra aparecer.
+const BAR_ZONE: f32 = 140.0;
+/// Coluna das pessoas ao lado da transmissão grande.
+const SIDE: Size = Size::new(240.0, 135.0);
 
 pub fn view<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
-    let body: Element<_> = match &call.live {
+    let base = with_bar(call, config, move |area| match &call.live {
         Some(live) if !live.is_empty() => {
-            responsive(move |area| grid(m, call, config, live, area)).into()
+            if call.watching.is_some() && call.view == voice::View::Focus {
+                focus(m, call, config, live, area)
+            } else {
+                grid(m, call, config, live, area)
+            }
         }
         _ => center(text("Conectando…").size(15).color(FG2)).into(),
-    };
-    let base = column![
-        container(body).height(Length::Fill).width(Length::Fill),
-        container(bar(call, config))
-            .center_x(Length::Fill)
-            .padding([12, 20]),
-    ];
+    });
 
     let mut layers = vec![container(base).style(theme::fill(theme::STAGE)).into()];
     if let Status::Reconnecting(n) = call.status {
@@ -51,6 +53,131 @@ pub fn view<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Elemen
     stack(layers).into()
 }
 
+/// Palco com a barra de controles por cima, só com o mouse perto do pé.
+fn with_bar<'a>(
+    call: &'a ActiveCall,
+    config: &'a Config,
+    body: impl Fn(Size) -> Element<'a, Msg> + 'a,
+) -> Element<'a, Msg> {
+    responsive(move |area| {
+        let mut layers = stack![
+            container(body(area))
+                .width(Length::Fill)
+                .height(Length::Fill)
+        ];
+        if call.bar_visible() {
+            layers = layers.push(
+                container(bar(call, config))
+                    .center_x(Length::Fill)
+                    .align_bottom(Length::Fill)
+                    .padding([12, 20]),
+            );
+        }
+        // A posição serve também pro painel do botão direito abrir onde foi o clique.
+        mouse_area(layers)
+            .on_move(move |p| Msg::StageMouse(p, p.y > area.height - BAR_ZONE))
+            .on_exit(Msg::BarNear(false))
+            .into()
+    })
+    .into()
+}
+
+/// Transmissão assistida grande, com a outra transmissão e as pessoas numa coluna do lado.
+fn focus<'a>(
+    m: &'a Main,
+    call: &'a ActiveCall,
+    config: &'a Config,
+    live: &'a [Live],
+    area: Size,
+) -> Element<'a, Msg> {
+    let watched = live
+        .iter()
+        .find(|p| Some(&p.identity) == call.watching.as_ref());
+    let big: Element<'_, Msg> = match watched {
+        Some(p) => {
+            let body = stack![screen_image(call, 15.0), screen_tag(p, area.width)];
+            mouse_area(
+                container(body)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .clip(true)
+                    .style(rounded_stage),
+            )
+            .on_press(Msg::FocusScreen)
+            .on_right_press(Msg::OpenVolume(Config::screen_key(voice::name_of(p))))
+            .into()
+        }
+        None => space().into(),
+    };
+    let others = live
+        .iter()
+        .filter(|p| p.screen_share && !p.is_local && Some(&p.identity) != call.watching.as_ref())
+        .map(|p| screen_tile(call, p, SIDE))
+        .chain(live.iter().map(|p| tile(m, call, p, SIDE)));
+    let side = scrollable(Column::with_children(others).spacing(GAP))
+        .width(SIDE.width)
+        .style(theme::thin_scroll);
+    let layout = container(row![big, side].spacing(GAP)).padding(GAP);
+    let panel = call.volume_panel.as_deref().map(|name| {
+        let at = voice::panel_origin(area, call.volume_at, panel_size(name));
+        pin(volume_card(call, config, name)).x(at.x).y(at.y)
+    });
+    match panel {
+        Some(panel) => stack![layout, panel].into(),
+        None => layout.into(),
+    }
+}
+
+/// Tamanho do painel de volume: o da transmissão tem a linha de botões a mais.
+fn panel_size(name: &str) -> Size {
+    if name.ends_with(SCREEN_KEY) {
+        Size::new(PANEL.width, PANEL.height + 46.0)
+    } else {
+        PANEL
+    }
+}
+
+fn rounded_stage(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme::STAGE.into()),
+        border: border::rounded(18),
+        ..Default::default()
+    }
+}
+
+/// O quadro mais novo da transmissão assistida, inteiro na área.
+fn screen_image(call: &ActiveCall, loading: f32) -> Element<'_, Msg> {
+    match &call.screen {
+        Some(a) => image(a.handle().clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .content_fit(ContentFit::Contain)
+            .into(),
+        None => center(text("Carregando a transmissão…").size(loading).color(FG2)).into(),
+    }
+}
+
+/// "Nome · tela" com o selo, no canto de baixo.
+fn screen_tag(p: &Live, width: f32) -> Element<'_, Msg> {
+    let label = text(Config::screen_key(voice::name_of(p)))
+        .size(13)
+        .font(theme::SEMIBOLD)
+        .wrapping(Wrapping::None);
+    let tag = row![
+        live_badge(),
+        container(label)
+            .max_width((width - 110.0).max(40.0))
+            .clip(true)
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    container(container(tag).padding([5, 10]).style(theme::pill))
+        .align_left(Length::Fill)
+        .align_bottom(Length::Fill)
+        .padding(10)
+        .into()
+}
+
 fn grid<'a>(
     m: &'a Main,
     call: &'a ActiveCall,
@@ -58,18 +185,34 @@ fn grid<'a>(
     live: &'a [Live],
     area: Size,
 ) -> Element<'a, Msg> {
-    let size = voice::tile_size(area, live.len());
-    let (cols, _) = voice::grid(live.len());
-    let rows = live.chunks(cols).map(|chunk| {
-        Row::with_children(chunk.iter().map(|p| tile(m, call, p, size)))
-            .spacing(GAP)
-            .into()
+    // Cada transmissão alheia vira um tile próprio, antes das pessoas, como no site.
+    let screens: Vec<&Live> = live
+        .iter()
+        .filter(|p| p.screen_share && !p.is_local)
+        .collect();
+    let cells: Vec<(&Live, bool)> = screens
+        .iter()
+        .map(|p| (*p, true))
+        .chain(live.iter().map(|p| (p, false)))
+        .collect();
+    let count = cells.len();
+    let size = voice::tile_size(area, count);
+    let (cols, _) = voice::grid(count);
+    let rows = cells.chunks(cols).map(|chunk| {
+        Row::with_children(chunk.iter().map(|&(p, screen)| {
+            if screen {
+                screen_tile(call, p, size)
+            } else {
+                tile(m, call, p, size)
+            }
+        }))
+        .spacing(GAP)
+        .into()
     });
     let tiles = center(Column::with_children(rows).spacing(GAP));
-    let panel = call.volume_panel.as_deref().and_then(|name| {
-        let index = live.iter().position(|p| voice::name_of(p) == name)?;
-        let at = voice::panel_origin(area, live.len(), index, PANEL);
-        Some(pin(volume_card(call, config, name)).x(at.x).y(at.y))
+    let panel = call.volume_panel.as_deref().map(|name| {
+        let at = voice::panel_origin(area, call.volume_at, panel_size(name));
+        pin(volume_card(call, config, name)).x(at.x).y(at.y)
     });
     match panel {
         Some(panel) => stack![tiles, panel].into(),
@@ -129,6 +272,65 @@ fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Eleme
     }
 }
 
+/// Tile da transmissão de alguém. Sem assistir: a prévia borrada e o botão. Assistindo: o
+/// vídeo, com tela cheia e parar no canto.
+fn screen_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
+    let watching = call.watching.as_ref() == Some(&p.identity);
+    let mut body = stack![];
+    if watching {
+        body = body.push(screen_image(call, 14.0));
+        let stop = button(text("Parar").size(12.5).font(theme::SEMIBOLD))
+            .padding([5, 10])
+            .style(theme::outline)
+            .on_press(Msg::Watch(None));
+        body = body.push(
+            container(stop)
+                .align_right(Length::Fill)
+                .align_top(Length::Fill)
+                .padding(10),
+        );
+    } else {
+        if let Some(preview) = call.previews.get(&p.identity) {
+            body = body.push(
+                image(preview.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(ContentFit::Cover),
+            );
+        }
+        let watch = button(text("Assistir transmissão").size(14).font(theme::BOLD))
+            .padding([9, 18])
+            .style(theme::primary)
+            .on_press(Msg::Watch(Some(p.identity.clone())));
+        body = body.push(
+            container(center(watch))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(theme::fill(Color::from_rgba8(0, 0, 0, 0.45))),
+        );
+    }
+    body = body.push(screen_tag(p, size.width));
+    let tile = container(body)
+        .width(size.width)
+        .height(size.height)
+        .clip(true)
+        .style(rounded_stage);
+    // Clique na assistida aumenta; botão direito abre o volume dela e a tela cheia.
+    let mut area =
+        mouse_area(tile).on_right_press(Msg::OpenVolume(Config::screen_key(voice::name_of(p))));
+    if watching {
+        area = area.on_press(Msg::FocusScreen);
+    }
+    area.into()
+}
+
+/// Transmissão assistida em tela cheia, sem a barra lateral. A barra de controles aparece
+/// com o mouse perto do pé, com "Fechar transmissão" no lugar de sair; Esc volta.
+pub fn full<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
+    let base = with_bar(call, config, move |_| screen_image(call, 15.0));
+    container(base).style(theme::fill(theme::STAGE)).into()
+}
+
 fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     let square = |glyph, off, msg, tip| {
         let color = if off { DANGER } else { FG2 };
@@ -180,8 +382,15 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
         .width(1)
         .height(28)
         .style(theme::fill(BORDER2));
+    // Com a transmissão grande ou em tela cheia, o botão vermelho fecha ela, não a call.
+    let closing = call.watching.is_some() && call.view != voice::View::Tile;
+    let (label, msg) = if closing {
+        ("Fechar transmissão", Msg::Watch(None))
+    } else {
+        ("Sair", Msg::Leave)
+    };
     let leave = button(
-        text("Sair")
+        text(label)
             .size(15)
             .font(theme::BOLD)
             .center()
@@ -190,7 +399,7 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     .padding([0, 20])
     .height(46)
     .style(theme::leave)
-    .on_press(Msg::Leave);
+    .on_press(msg);
 
     container(
         row![mic, ears, screen, separator, leave]
@@ -549,6 +758,7 @@ fn floating(ring: Color) -> impl Fn(&Theme) -> container::Style {
 /// Volume de uma pessoa. Sem fundo clicável: fecha no X ou no Escape, e a call segue.
 fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> Element<'a, Msg> {
     let volume = config.volume_of(name);
+    let screen = name.ends_with(SCREEN_KEY);
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(28))
         .padding(0)
         .style(theme::ghost)
@@ -576,14 +786,38 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
             18.0,
             if volume == 0 { DANGER } else { FG2 }
         ),
-        text("Voz").size(13).color(FG2),
+        text(if screen { "Transmissão" } else { "Voz" })
+            .size(13)
+            .color(FG2),
         level,
     ]
     .spacing(10)
     .align_y(Alignment::Center);
 
+    // Da transmissão assistida: tela cheia completa e parar, só por aqui.
+    let watched = call
+        .live
+        .iter()
+        .flatten()
+        .find(|l| Some(&l.identity) == call.watching.as_ref())
+        .is_some_and(|l| Config::screen_key(voice::name_of(l)) == name);
+    let actions = watched.then(|| {
+        let small = |label, msg| {
+            button(text(label).size(13).font(theme::SEMIBOLD).center())
+                .padding([6, 12])
+                .width(Length::Fill)
+                .style(theme::outline)
+                .on_press(msg)
+        };
+        row![
+            small("Tela cheia", Msg::Fullscreen),
+            small("Parar de assistir", Msg::Watch(None))
+        ]
+        .spacing(8)
+    });
+
     let ring = if call.speaking(name) { ACCENT } else { BORDER };
-    container(column![head, line].spacing(10))
+    container(column![head, line].push(actions).spacing(10))
         .width(PANEL.width)
         .padding(12)
         .style(floating(ring))

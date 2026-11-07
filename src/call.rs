@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -12,11 +13,12 @@ use livekit::{
     options::TrackPublishOptions,
     participant::LocalParticipant,
     publication::LocalTrackPublication,
-    track::{LocalAudioTrack, LocalTrack, RemoteTrack, TrackSource},
+    track::{LocalAudioTrack, LocalTrack, RemoteTrack, RemoteVideoTrack, TrackSource},
     webrtc::{
         audio_source::native::NativeAudioSource,
         audio_stream::native::NativeAudioStream,
-        prelude::{AudioFrame, AudioSourceOptions, RtcAudioSource},
+        prelude::{AudioFrame, AudioSourceOptions, RtcAudioSource, VideoFormatType},
+        video_stream::native::NativeVideoStream,
     },
 };
 use tokio::{
@@ -30,6 +32,7 @@ use tokio::{
 
 use crate::api::{self, Client};
 use crate::audio::{Engine, Meter, MicFrames, RATE};
+use crate::config::Config;
 use crate::share::{self, Capturer, Choice, Quality};
 
 /// Máximo de tentativas de reconexão, como na web.
@@ -82,6 +85,8 @@ pub enum Event {
     Share(share::State),
     /// Áudio da transmissão no ar: a escolha e os apps tocando.
     ShareAudio(share::View),
+    /// Prévia pequena da transmissão de alguém, pela identity: um quadro só.
+    Preview(String, Picture),
     /// Último evento da call.
     Ended(End),
 }
@@ -89,7 +94,73 @@ pub enum Event {
 enum Cmd {
     Mute(bool),
     MutedPeople(Vec<String>),
+    /// Identity de quem assistir; `None` para de assistir.
+    Watch(Option<String>),
     Leave,
+}
+
+/// Quadro de transmissão em RGBA: o assistido, inteiro, ou a prévia, pequena.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Picture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Largura da prévia. Esticada no tile, ela mesma fica borrada.
+const PREVIEW_WIDTH: u32 = 96;
+
+impl Picture {
+    /// Quadro do WebRTC em RGBA. ABGR do libyuv é R, G, B, A na memória: o RGBA do iced.
+    fn of(frame: &livekit::webrtc::video_frame::BoxVideoFrame) -> Self {
+        let (width, height) = (frame.buffer.width(), frame.buffer.height());
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        let stride = width * 4;
+        frame.buffer.to_argb(
+            VideoFormatType::ABGR,
+            &mut rgba,
+            stride,
+            width as i32,
+            height as i32,
+        );
+        Self {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    /// Reduzida pra [`PREVIEW_WIDTH`], na mesma proporção.
+    fn preview(&self) -> Self {
+        let width = PREVIEW_WIDTH.min(self.width).max(1);
+        let height = (self.height * width / self.width.max(1)).max(1);
+        let full = image::RgbaImage::from_raw(self.width, self.height, self.rgba.clone())
+            .unwrap_or_default();
+        Self {
+            width,
+            height,
+            rgba: image::imageops::thumbnail(&full, width, height).into_raw(),
+        }
+    }
+}
+
+/// Último quadro da transmissão assistida. A interface pega no relógio dela: quadro que
+/// ela não chegou a desenhar é trocado pelo novo, sem fila.
+#[derive(Clone, Default)]
+pub struct Screen(Arc<Mutex<Option<Picture>>>);
+
+impl Screen {
+    pub fn take(&self) -> Option<Picture> {
+        self.0.lock().unwrap().take()
+    }
+
+    fn put(&self, picture: Picture) {
+        *self.0.lock().unwrap() = Some(picture);
+    }
+
+    fn clear(&self) {
+        self.0.lock().unwrap().take();
+    }
 }
 
 #[derive(Clone)]
@@ -97,6 +168,7 @@ pub struct Call {
     cmd: UnboundedSender<Cmd>,
     share: UnboundedSender<share::Cmd>,
     engine: Engine,
+    screen: Screen,
 }
 
 impl fmt::Debug for Call {
@@ -165,16 +237,38 @@ impl Call {
             room,
         };
         let (speech_tx, speech_rx) = mpsc::unbounded_channel();
+        let (peek_tx, peek_rx) = mpsc::unbounded_channel();
+        let screen = Screen::default();
         let ctl = Ctl {
             rx,
             engine: engine.clone(),
             muted: mic_muted,
             people: Vec::new(),
+            watching: None,
+            screen: screen.clone(),
+            peek_tx,
+            peek_rx,
             speech_tx,
             speech_rx,
         };
         tokio::spawn(task.run(ctl, mic, AbortOnDrop(tokio::spawn(sharing))));
-        (Call { cmd, share, engine }, events)
+        let call = Call {
+            cmd,
+            share,
+            engine,
+            screen,
+        };
+        (call, events)
+    }
+
+    /// Assiste a transmissão de `identity`, com o áudio dela, ou para com `None`. Os
+    /// quadros chegam em [`Call::screen`].
+    pub fn watch(&self, identity: Option<String>) {
+        let _ = self.cmd.send(Cmd::Watch(identity));
+    }
+
+    pub fn screen(&self) -> &Screen {
+        &self.screen
     }
 
     pub fn set_mic_muted(&self, muted: bool) {
@@ -299,6 +393,12 @@ struct Ctl {
     /// Último estado pedido do mic.
     muted: bool,
     people: Vec<String>,
+    /// Quem está sendo assistido: vale entre reconexões.
+    watching: Option<String>,
+    screen: Screen,
+    /// Sid da tela cuja prévia já saiu: a assinatura pode ser solta.
+    peek_tx: UnboundedSender<String>,
+    peek_rx: UnboundedReceiver<String>,
     /// Quem começou ou parou de falar, medido no PCM.
     speech_tx: UnboundedSender<(String, bool)>,
     speech_rx: UnboundedReceiver<(String, bool)>,
@@ -379,6 +479,10 @@ struct Session {
     sent_muted: String,
     reconnecting: bool,
     speaking: HashSet<String>,
+    /// Vídeo e áudio da transmissão assistida, por sid da publicação.
+    watched: HashMap<String, AbortOnDrop>,
+    /// Telas assinadas só pra tirar a prévia, por sid.
+    peeks: HashMap<String, AbortOnDrop>,
 }
 
 impl Ctl {
@@ -395,10 +499,46 @@ impl Ctl {
                         self.engine.set_mic_muted(m);
                     }
                     Some(Cmd::MutedPeople(p)) => self.people = p,
+                    Some(Cmd::Watch(w)) => self.watching = w,
                 }
             }
         }
     }
+}
+
+/// Vídeo da transmissão assistida, quadro a quadro, até a tarefa cair.
+fn stream_screen(video: RemoteVideoTrack, screen: Screen) -> AbortOnDrop {
+    let mut stream = NativeVideoStream::new(video.rtc_track());
+    AbortOnDrop(tokio::spawn(async move {
+        while let Some(frame) = stream.next().await {
+            screen.put(Picture::of(&frame));
+        }
+    }))
+}
+
+/// Um quadro só, reduzido pra prévia, e avisa pela `done` que a assinatura pode cair.
+fn peek(
+    video: RemoteVideoTrack,
+    identity: String,
+    sid: String,
+    events: &UnboundedSender<Event>,
+    done: &UnboundedSender<String>,
+) -> AbortOnDrop {
+    let mut stream = NativeVideoStream::new(video.rtc_track());
+    let (events, done) = (events.clone(), done.clone());
+    AbortOnDrop(tokio::spawn(async move {
+        if let Some(frame) = stream.next().await {
+            let preview = Picture::of(&frame).preview();
+            let _ = events.send(Event::Preview(identity, preview));
+        }
+        let _ = done.send(sid);
+    }))
+}
+
+/// Faixas que só são assinadas por quem clicou em Assistir: a tela e o áudio de app,
+/// pelo nome que o site usa.
+fn is_watch_track(source: TrackSource, name: &str) -> bool {
+    source == TrackSource::Screenshare || name == share::TRACK
 }
 
 /// Fechar o motor antes da faixa, abrir a faixa antes do motor: nenhum bloco sai
@@ -563,11 +703,14 @@ impl Task {
             sent_muted: String::new(),
             reconnecting: false,
             speaking: HashSet::new(),
+            watched: HashMap::new(),
+            peeks: HashMap::new(),
         })
     }
 
     async fn serve(&self, s: &mut Session, ctl: &mut Ctl) -> Outcome {
-        s.subscribe_all();
+        s.subscribe_all(ctl.watching.as_deref());
+        s.peek_all(ctl.watching.as_deref());
         s.send_muted(&ctl.people);
         self.refresh(s);
         let mut debounce: Option<Instant> = None;
@@ -598,8 +741,10 @@ impl Task {
                         ctl.people = p;
                         debounce = Some(Instant::now() + MUTED_DEBOUNCE);
                     }
+                    Some(Cmd::Watch(w)) => s.watch(ctl, w),
                     None | Some(Cmd::Leave) => return Outcome::End(s.close().await),
                 },
+                Some(sid) = ctl.peek_rx.recv() => s.end_peek(ctl, &sid),
                 _ = wait_until(debounce) => {
                     debounce = None;
                     s.send_muted(&ctl.people);
@@ -622,6 +767,60 @@ impl Task {
                 if publication.source() == TrackSource::Microphone =>
             {
                 publication.set_subscribed(true);
+            }
+            RoomEvent::TrackPublished {
+                publication,
+                participant,
+            } if is_watch_track(publication.source(), &publication.name())
+                && ctl.watching.as_deref() == Some(participant.identity().as_str()) =>
+            {
+                publication.set_subscribed(true);
+            }
+            // Tela nova de quem não está sendo assistido: assina só pra tirar a prévia.
+            RoomEvent::TrackPublished { publication, .. }
+                if publication.source() == TrackSource::Screenshare =>
+            {
+                publication.set_subscribed(true);
+            }
+            RoomEvent::TrackSubscribed {
+                track: RemoteTrack::Video(video),
+                publication,
+                participant,
+            } if publication.source() == TrackSource::Screenshare => {
+                let sid = publication.sid().to_string();
+                let identity = participant.identity().to_string();
+                if ctl.watching.as_deref() == Some(identity.as_str()) {
+                    s.watched
+                        .insert(sid, stream_screen(video.clone(), ctl.screen.clone()));
+                } else {
+                    let task = peek(video.clone(), identity, sid.clone(), &self.tx, &ctl.peek_tx);
+                    s.peeks.insert(sid, task);
+                }
+            }
+            RoomEvent::TrackSubscribed {
+                track: RemoteTrack::Audio(audio),
+                publication,
+                participant,
+            } if publication.name() == share::TRACK
+                && ctl.watching.as_deref() == Some(participant.identity().as_str()) =>
+            {
+                let sid = publication.sid().to_string();
+                s.watched.remove(&sid);
+                let name = participant.name();
+                let name = if name.is_empty() {
+                    participant.identity().to_string()
+                } else {
+                    name
+                };
+                // Chave própria: o volume da transmissão não mexe no da voz.
+                let mut sink = ctl.engine.add_voice(sid.clone(), Config::screen_key(&name));
+                let mut stream = NativeAudioStream::new(audio.rtc_track(), RATE as i32, 1);
+                let task = tokio::spawn(async move {
+                    while let Some(frame) = stream.next().await {
+                        sink.push(&frame.data);
+                    }
+                });
+                s.watched.insert(sid, AbortOnDrop(task));
             }
             RoomEvent::TrackSubscribed {
                 track: RemoteTrack::Audio(audio),
@@ -662,14 +861,25 @@ impl Task {
                 );
             }
             RoomEvent::TrackUnsubscribed { publication, .. } => {
-                if let Some(voice) = s.voices.remove(&publication.sid().to_string()) {
+                let sid = publication.sid().to_string();
+                if let Some(voice) = s.voices.remove(&sid) {
                     s.speaking.remove(&voice.identity);
+                }
+                s.peeks.remove(&sid);
+                if s.watched.remove(&sid).is_some()
+                    && publication.source() == TrackSource::Screenshare
+                {
+                    ctl.screen.clear();
                 }
             }
             RoomEvent::ParticipantDisconnected(p) => {
                 let identity = p.identity().to_string();
                 s.voices.retain(|_, v| v.identity != identity);
                 s.speaking.remove(&identity);
+                if ctl.watching.as_deref() == Some(identity.as_str()) {
+                    s.watched.clear();
+                    ctl.screen.clear();
+                }
             }
             RoomEvent::Reconnecting => {
                 s.reconnecting = true;
@@ -679,7 +889,8 @@ impl Task {
                 s.reconnecting = false;
                 self.emit(Event::Connected);
                 // A retomada pode ter perdido assinaturas e atributos.
-                s.subscribe_all();
+                s.subscribe_all(ctl.watching.as_deref());
+                s.peek_all(ctl.watching.as_deref());
                 s.sent_muted.clear();
                 s.send_muted(&ctl.people);
             }
@@ -739,12 +950,85 @@ fn hold_remotes(list: Vec<Live>, last: &[Live]) -> Vec<Live> {
 }
 
 impl Session {
-    /// Só a voz: tela, áudio de tela e `concord-app-audio` ficam sem assinar.
-    fn subscribe_all(&self) {
+    /// A voz de todo mundo. Tela e `concord-app-audio` só de quem está sendo assistido.
+    fn subscribe_all(&self, watching: Option<&str>) {
         for p in self.room.remote_participants().values() {
+            let watched = watching == Some(p.identity().as_str());
             for publication in p.track_publications().values() {
-                if publication.source() == TrackSource::Microphone {
+                let watch = is_watch_track(publication.source(), &publication.name());
+                if publication.source() == TrackSource::Microphone || (watched && watch) {
                     publication.set_subscribed(true);
+                }
+            }
+        }
+    }
+
+    /// Troca quem está sendo assistido: solta as faixas do anterior e assina as do novo.
+    fn watch(&mut self, ctl: &mut Ctl, identity: Option<String>) {
+        if ctl.watching == identity {
+            return;
+        }
+        if let Some(old) = ctl.watching.take() {
+            for p in self.room.remote_participants().values() {
+                if p.identity().as_str() != old {
+                    continue;
+                }
+                for publication in p.track_publications().values() {
+                    if is_watch_track(publication.source(), &publication.name()) {
+                        publication.set_subscribed(false);
+                    }
+                }
+            }
+        }
+        self.watched.clear();
+        ctl.screen.clear();
+        ctl.watching = identity;
+        self.subscribe_all(ctl.watching.as_deref());
+        // A tela já assinada pela prévia não gera outro `TrackSubscribed`: o vídeo
+        // começa daqui, e a prévia em andamento deixa de soltar a assinatura.
+        let Some(who) = ctl.watching.as_deref() else {
+            return;
+        };
+        for p in self.room.remote_participants().values() {
+            if p.identity().as_str() != who {
+                continue;
+            }
+            for (sid, publication) in p.track_publications() {
+                if let (TrackSource::Screenshare, Some(RemoteTrack::Video(video))) =
+                    (publication.source(), publication.track())
+                {
+                    self.peeks.remove(&sid.to_string());
+                    let task = stream_screen(video, ctl.screen.clone());
+                    self.watched.insert(sid.to_string(), task);
+                }
+            }
+        }
+    }
+
+    /// Prévia de todas as telas no ar, menos a assistida, que já tem o vídeo.
+    fn peek_all(&self, watching: Option<&str>) {
+        for p in self.room.remote_participants().values() {
+            if watching == Some(p.identity().as_str()) {
+                continue;
+            }
+            for publication in p.track_publications().values() {
+                if publication.source() == TrackSource::Screenshare {
+                    publication.set_subscribed(true);
+                }
+            }
+        }
+    }
+
+    /// A prévia saiu: solta a tela, a não ser que a pessoa tenha passado a ser assistida.
+    fn end_peek(&mut self, ctl: &Ctl, sid: &str) {
+        self.peeks.remove(sid);
+        for p in self.room.remote_participants().values() {
+            if ctl.watching.as_deref() == Some(p.identity().as_str()) {
+                continue;
+            }
+            for (id, publication) in p.track_publications() {
+                if id.as_str() == sid {
+                    publication.set_subscribed(false);
                 }
             }
         }
@@ -805,6 +1089,41 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn so_tela_e_audio_de_app_esperam_o_assistir() {
+        assert!(is_watch_track(TrackSource::Screenshare, "screen_share"));
+        assert!(is_watch_track(TrackSource::Unknown, share::TRACK));
+        assert!(!is_watch_track(TrackSource::Microphone, "microphone"));
+        assert!(!is_watch_track(TrackSource::Unknown, "outra"));
+    }
+
+    #[test]
+    fn previa_fica_pequena_na_mesma_proporcao() {
+        let quadro = Picture {
+            width: 1920,
+            height: 1080,
+            rgba: vec![200; 1920 * 1080 * 4],
+        };
+        let p = quadro.preview();
+        assert_eq!((p.width, p.height), (96, 54));
+        assert_eq!(p.rgba.len(), 96 * 54 * 4);
+        assert_eq!(p.rgba[0], 200, "cor preservada");
+    }
+
+    #[test]
+    fn quadro_novo_substitui_o_que_nao_foi_desenhado() {
+        let screen = Screen::default();
+        let quadro = |w| Picture {
+            width: w,
+            height: 1,
+            rgba: vec![0; w as usize * 4],
+        };
+        screen.put(quadro(1));
+        screen.put(quadro(2));
+        assert_eq!(screen.take().map(|p| p.width), Some(2));
+        assert!(screen.take().is_none(), "sem quadro novo, nada");
+    }
 
     #[tokio::test]
     async fn anel_local_segue_o_limitador_e_so_emite_quando_muda() {

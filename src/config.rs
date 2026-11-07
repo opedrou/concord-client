@@ -15,6 +15,8 @@ pub const SIDEBAR_MAX: f32 = 480.0;
 const SIDEBAR_PADRAO: f32 = 288.0;
 /// Posição do slider em que o ganho é 1: a mesma da web.
 pub const VOLUME_PADRAO: u8 = 71;
+/// Sufixo da chave de volume da transmissão de alguém. Ver [`Config::screen_key`].
+pub const SCREEN: &str = " · tela";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -122,16 +124,22 @@ impl Config {
         }
     }
 
+    /// Chave do volume da transmissão de `name`: separada da voz, e é o rótulo do tile.
+    pub fn screen_key(name: &str) -> String {
+        format!("{name}{SCREEN}")
+    }
+
     pub fn volume_of(&self, name: &str) -> u8 {
         self.volumes.get(name).copied().unwrap_or(VOLUME_PADRAO)
     }
 
-    /// Nomes com voz em zero, em ordem, pra `concord.muted`.
+    /// Nomes com voz em zero, em ordem, pra `concord.muted`. Volume de transmissão não
+    /// é voz: fica fora.
     pub fn muted_people(&self) -> Vec<String> {
         let mut names: Vec<_> = self
             .volumes
             .iter()
-            .filter(|(_, v)| **v == 0)
+            .filter(|(n, v)| **v == 0 && !n.ends_with(SCREEN))
             .map(|(n, _)| n.clone())
             .collect();
         names.sort();
@@ -246,6 +254,17 @@ mod tests {
             (None, NoiseLevel::Rnnoise, 71)
         );
         assert!(p.volumes.is_empty());
+    }
+
+    #[test]
+    fn volume_de_transmissao_em_zero_nao_vira_mudo_de_voz() {
+        let mut c = Config::default();
+        let tela = Config::screen_key("Ana");
+        assert_eq!(tela, "Ana · tela");
+        c.set_volume(&tela, 0);
+        c.set_volume("Bia", 0);
+        assert_eq!(c.muted_people(), ["Bia"]);
+        assert_eq!(c.volume_of("Ana"), VOLUME_PADRAO, "a voz da Ana não mudou");
     }
 
     #[test]

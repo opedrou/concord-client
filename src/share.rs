@@ -46,7 +46,7 @@ use tokio::{
 
 #[cfg(not(windows))]
 use app_audio::AppAudio as Audio;
-pub use app_audio::{Choice, View};
+pub use app_audio::{Choice, TRACK, View};
 #[cfg(windows)]
 use loopback::Loopback as Audio;
 

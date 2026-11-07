@@ -33,6 +33,8 @@ const ESPERA_AO_FECHAR: Duration = Duration::from_secs(2);
 const QUADRO: Duration = Duration::from_millis(100);
 /// Relógio do medidor de entrada: uns 30 quadros por segundo.
 const MEDIDOR: Duration = Duration::from_millis(33);
+/// Relógio da transmissão assistida: 60 por segundo, pra não atrasar a de 30 fps.
+const TELA: Duration = Duration::from_millis(16);
 
 // Quantas vezes `persist` rodou nesta thread de teste.
 #[cfg(test)]
@@ -101,6 +103,8 @@ struct Main {
     open: bool,
     /// Janela que pediu pra fechar e espera a call terminar.
     closing: Option<window::Id>,
+    /// Modo em que a janela está de verdade: segue a tela cheia da transmissão assistida.
+    full_window: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,6 +163,20 @@ pub enum Msg {
     ShareSource(Source),
     /// Aba do seletor: `true` em Aplicativos.
     ShareTab(bool),
+    /// Assiste a transmissão de alguém, pela identity; `None` volta pro palco.
+    Watch(Option<String>),
+    /// Relógio da transmissão assistida: pega o quadro mais novo.
+    ScreenTick,
+    /// Quadro da transmissão já na GPU.
+    ScreenReady(Option<image::Allocation>),
+    /// Põe a transmissão assistida em tela cheia, pelo menu do botão direito.
+    Fullscreen,
+    /// Clique na transmissão assistida: alterna entre o tile e grande com as pessoas do lado.
+    FocusScreen,
+    /// Mouse perto ou longe do pé do palco: mostra ou esconde a barra.
+    BarNear(bool),
+    /// Mouse no palco: onde está e se está perto do pé.
+    StageMouse(iced::Point, bool),
     /// Abre e fecha a lista de áudio da transmissão no ar.
     AudioList,
     AudioChoice(Choice),
@@ -264,6 +282,9 @@ impl App {
             if m.call.as_ref().is_some_and(ActiveCall::holding) {
                 subs.push(time::every(QUADRO).map(Msg::Frame));
             }
+            if m.call.as_ref().is_some_and(|c| c.watching.is_some()) {
+                subs.push(time::every(TELA).map(|_| Msg::ScreenTick));
+            }
             if m.meter_clock() {
                 subs.push(time::every(MEDIDOR).map(|_| Msg::MeterTick));
             }
@@ -281,6 +302,9 @@ impl App {
             Screen::Login(f) => screens::login(f),
             Screen::Offline(server) => screens::offline(server),
             Screen::Main(m) => {
+                if let Some(call) = m.call.as_ref().filter(|c| c.fullscreen()) {
+                    return stage::full(call, &self.config);
+                }
                 let content = match &m.call {
                     Some(call) => stage::view(m, call, &self.config),
                     None => screens::home(&m.user.username, m.notice.as_deref()),
@@ -299,6 +323,30 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Task<Msg> {
+        let task = self.handle(msg);
+        Task::batch([task, self.sync_window()])
+    }
+
+    /// A janela sai da tela cheia por qualquer caminho que pare de assistir: botão, Esc,
+    /// a pessoa parar de transmitir ou a call acabar.
+    fn sync_window(&mut self) -> Task<Msg> {
+        let Screen::Main(m) = &mut self.screen else {
+            return Task::none();
+        };
+        let want = m.call.as_ref().is_some_and(ActiveCall::fullscreen);
+        if want == m.full_window {
+            return Task::none();
+        }
+        m.full_window = want;
+        let mode = if want {
+            window::Mode::Fullscreen
+        } else {
+            window::Mode::Windowed
+        };
+        window::latest().and_then(move |id| window::set_mode(id, mode))
+    }
+
+    fn handle(&mut self, msg: Msg) -> Task<Msg> {
         match msg {
             Msg::Connected {
                 server,
@@ -412,6 +460,7 @@ impl App {
             Msg::OpenVolume(name) => {
                 if let Some(call) = self.call_mut() {
                     call.volume_panel = Some(name);
+                    call.volume_at = call.cursor;
                     call.share_panel = false;
                 }
                 Task::none()
@@ -619,9 +668,61 @@ impl App {
                 Task::none()
             }
             Msg::Escape => {
-                match &self.screen {
+                match &mut self.screen {
                     Screen::Main(m) if m.settings.is_some() => self.close_settings(),
+                    Screen::Main(m) if m.call.as_ref().is_some_and(ActiveCall::fullscreen) => {
+                        if let Some(c) = &mut m.call {
+                            c.view = voice::View::Focus;
+                        }
+                    }
                     _ => self.close_volume(),
+                }
+                Task::none()
+            }
+            Msg::Watch(identity) => {
+                if let Some(call) = self.call_mut() {
+                    call.watch(identity);
+                }
+                Task::none()
+            }
+            Msg::ScreenTick => match self.call_mut().and_then(ActiveCall::pull_screen) {
+                // Handle novo direto no widget pisca enquanto sobe pra GPU: só troca
+                // depois do `allocate`.
+                Some(handle) => image::allocate(handle).map(|r| Msg::ScreenReady(r.ok())),
+                None => Task::none(),
+            },
+            Msg::ScreenReady(allocation) => {
+                if let Some(call) = self.call_mut() {
+                    call.screen_ready(allocation);
+                }
+                Task::none()
+            }
+            Msg::Fullscreen => {
+                if let Some(call) = self.call_mut().filter(|c| c.watching.is_some()) {
+                    call.view = voice::View::Full;
+                    call.volume_panel = None;
+                }
+                Task::none()
+            }
+            Msg::FocusScreen => {
+                if let Some(call) = self.call_mut().filter(|c| c.watching.is_some()) {
+                    call.view = match call.view {
+                        voice::View::Tile => voice::View::Focus,
+                        _ => voice::View::Tile,
+                    };
+                }
+                Task::none()
+            }
+            Msg::BarNear(near) => {
+                if let Some(call) = self.call_mut() {
+                    call.bar_near = near;
+                }
+                Task::none()
+            }
+            Msg::StageMouse(at, near) => {
+                if let Some(call) = self.call_mut() {
+                    call.cursor = at;
+                    call.bar_near = near;
                 }
                 Task::none()
             }
@@ -791,6 +892,7 @@ impl App {
             call::Event::Participants(list) => active.participants(list, Instant::now()),
             call::Event::Share(state) => active.set_share(state),
             call::Event::ShareAudio(view) => active.set_share_audio(view),
+            call::Event::Preview(identity, picture) => active.set_preview(identity, picture),
             call::Event::Ended(end) => return self.call_ended(end),
         }
         Task::none()
@@ -982,6 +1084,7 @@ impl App {
             resizing: false,
             vault_ok,
             call: None,
+            full_window: false,
             next_call: 0,
             notice: None,
             devices: None,
@@ -1589,6 +1692,59 @@ mod tests {
         assert!(call_of(&mut a).speaking("Zé"));
         let _ = a.update(Msg::Frame(parou + Duration::from_secs(1)));
         assert!(!call_of(&mut a).speaking("Zé"));
+    }
+
+    #[test]
+    fn assistir_tela_cheia_e_volta_quando_a_pessoa_para() {
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        let transmitindo = |on| {
+            let mut l = voice::test_live("Ana", false);
+            l.screen_share = on;
+            vec![l]
+        };
+        let _ = a.update(Msg::CallEvent(
+            id,
+            call::Event::Participants(transmitindo(true)),
+        ));
+        let _ = a.update(Msg::Watch(Some("Ana__1".into())));
+        assert_eq!(call_of(&mut a).watching.as_deref(), Some("Ana__1"));
+        assert_eq!(call_of(&mut a).view, voice::View::Tile, "começa no tile");
+
+        let _ = a.update(Msg::FocusScreen);
+        assert_eq!(call_of(&mut a).view, voice::View::Focus, "clique aumenta");
+        let _ = a.update(Msg::FocusScreen);
+        assert_eq!(
+            call_of(&mut a).view,
+            voice::View::Tile,
+            "outro clique volta"
+        );
+
+        let _ = a.update(Msg::Fullscreen);
+        assert!(main_of(&mut a).full_window, "a janela segue a tela cheia");
+        let _ = a.update(Msg::Escape);
+        assert_eq!(
+            call_of(&mut a).view,
+            voice::View::Focus,
+            "Esc volta pro grande"
+        );
+        assert_eq!(
+            call_of(&mut a).watching.as_deref(),
+            Some("Ana__1"),
+            "e segue assistindo"
+        );
+        assert!(!main_of(&mut a).full_window);
+
+        let _ = a.update(Msg::Fullscreen);
+        let _ = a.update(Msg::CallEvent(
+            id,
+            call::Event::Participants(transmitindo(false)),
+        ));
+        assert_eq!(call_of(&mut a).watching, None, "parou de transmitir");
+        assert!(
+            !main_of(&mut a).full_window,
+            "a janela não fica presa em tela cheia"
+        );
     }
 
     #[test]

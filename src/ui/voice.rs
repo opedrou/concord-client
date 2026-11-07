@@ -84,6 +84,33 @@ pub struct ActiveCall {
     pub share_audio: Option<share::View>,
     /// Lista de áudio aberta, sobre o palco.
     pub audio_list: bool,
+    /// Identity de quem está sendo assistido.
+    pub watching: Option<String>,
+    /// Último quadro da transmissão assistida, já na GPU: trocar não pisca.
+    pub screen: Option<image::Allocation>,
+    /// Um quadro esperando subir pra GPU; o próximo só sai depois.
+    pub screen_pending: bool,
+    /// Prévia borrada de cada transmissão no ar, pela identity.
+    pub previews: HashMap<String, image::Handle>,
+    /// Tamanho da transmissão assistida.
+    pub view: View,
+    /// Mouse perto do pé do palco: a barra de controles aparece.
+    pub bar_near: bool,
+    /// Último ponto do mouse no palco, e onde o painel de volume foi aberto.
+    pub cursor: Point,
+    pub volume_at: Point,
+}
+
+/// Como a transmissão assistida aparece, como no site.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum View {
+    /// Num tile da grade, do tamanho das pessoas.
+    #[default]
+    Tile,
+    /// Grande, com as pessoas numa coluna do lado.
+    Focus,
+    /// A janela inteira, em tela cheia.
+    Full,
 }
 
 impl ActiveCall {
@@ -105,7 +132,27 @@ impl ActiveCall {
             share_windows: false,
             share_audio: None,
             audio_list: false,
+            watching: None,
+            screen: None,
+            screen_pending: false,
+            previews: HashMap::new(),
+            view: View::Tile,
+            bar_near: false,
+            cursor: Point::ORIGIN,
+            volume_at: Point::ORIGIN,
         }
+    }
+
+    pub fn fullscreen(&self) -> bool {
+        self.watching.is_some() && self.view == View::Full
+    }
+
+    /// A barra fica com o mouse perto, ou enquanto algo dela está aberto.
+    pub fn bar_visible(&self) -> bool {
+        self.bar_near
+            || self.share_panel
+            || self.audio_list
+            || matches!(self.share, share::State::Choosing | share::State::Failed)
     }
 
     pub fn attach(&mut self, call: Call, engine: Engine) {
@@ -245,7 +292,51 @@ impl ActiveCall {
         }
         self.fading
             .retain(|n, _| names.contains(n.as_str()) && !talking.contains(n.as_str()));
+        // Quem estava sendo assistido parou de transmitir ou saiu: volta pro palco.
+        let still = self.watching.as_ref().is_some_and(|w| {
+            live.iter()
+                .any(|l| &l.identity == w && l.screen_share && !l.is_local)
+        });
+        self.previews
+            .retain(|id, _| live.iter().any(|l| &l.identity == id && l.screen_share));
         self.live = Some(live);
+        if self.watching.is_some() && !still {
+            self.watch(None);
+        }
+    }
+
+    /// Assiste a transmissão de `identity`, ou volta pro palco com `None`.
+    pub fn watch(&mut self, identity: Option<String>) {
+        self.screen = None;
+        self.screen_pending = false;
+        self.view = View::Tile;
+        if let Some(call) = &self.call {
+            call.watch(identity.clone());
+        }
+        self.watching = identity;
+    }
+
+    /// Quadro novo pra subir pra GPU, se chegou um e o anterior já subiu.
+    pub fn pull_screen(&mut self) -> Option<image::Handle> {
+        if self.screen_pending || self.watching.is_none() {
+            return None;
+        }
+        let p = self.call.as_ref()?.screen().take()?;
+        self.screen_pending = true;
+        Some(image::Handle::from_rgba(p.width, p.height, p.rgba))
+    }
+
+    /// O quadro subiu: só agora ele troca o que está na tela.
+    pub fn screen_ready(&mut self, allocation: Option<image::Allocation>) {
+        self.screen_pending = false;
+        if self.watching.is_some() && allocation.is_some() {
+            self.screen = allocation;
+        }
+    }
+
+    pub fn set_preview(&mut self, identity: String, p: crate::call::Picture) {
+        let handle = image::Handle::from_rgba(p.width, p.height, p.rgba);
+        self.previews.insert(identity, handle);
     }
 
     pub fn tick(&mut self, now: Instant) {
@@ -316,16 +407,10 @@ pub fn tile_size(area: Size, n: usize) -> Size {
     Size::new(h * 16.0 / 9.0, h)
 }
 
-/// Onde abrir o painel de volume: centrado no tile clicado, sem sair do palco. O `iced`
-/// não informa a posição do clique, então a âncora é o tile.
-pub fn panel_origin(area: Size, n: usize, index: usize, panel: Size) -> Point {
-    let tile = tile_size(area, n);
-    let (cols, rows) = grid(n);
-    let block = |count: usize, side: f32| count as f32 * side + GAP * (count - 1) as f32;
-    let left = (area.width - block(cols, tile.width)) / 2.0;
-    let top = (area.height - block(rows, tile.height)) / 2.0;
-    let x = left + (index % cols) as f32 * (tile.width + GAP) + (tile.width - panel.width) / 2.0;
-    let y = top + (index / cols) as f32 * (tile.height + GAP) + (tile.height - panel.height) / 2.0;
+/// Onde abrir o painel de volume: com o canto no ponto do clique direito, empurrado pra
+/// dentro quando passaria da borda do palco.
+pub fn panel_origin(area: Size, at: Point, panel: Size) -> Point {
+    let (x, y) = (at.x, at.y);
     let fit = |value: f32, free: f32| value.min(free - PANEL_MARGIN).max(PANEL_MARGIN);
     Point::new(
         fit(x, area.width - panel.width),
@@ -383,24 +468,21 @@ mod tests {
     }
 
     #[test]
-    fn painel_abre_em_cima_do_tile_clicado() {
+    fn painel_abre_no_ponto_do_clique() {
         let area = Size::new(900.0, 600.0);
-        let panel = Size::new(280.0, 100.0);
-        let esquerda = panel_origin(area, 4, 0, panel);
-        let direita = panel_origin(area, 4, 1, panel);
-        let embaixo = panel_origin(area, 4, 2, panel);
-        assert!(esquerda.x < direita.x);
-        assert_eq!(esquerda.y, direita.y);
-        assert!(esquerda.y < embaixo.y);
-        assert_eq!(esquerda.x, embaixo.x);
+        let panel = Size::new(280.0, 150.0);
+        assert_eq!(
+            panel_origin(area, Point::new(120.0, 80.0), panel),
+            Point::new(120.0, 80.0)
+        );
     }
 
     #[test]
-    fn painel_nao_sai_do_palco_com_tile_pequeno() {
+    fn painel_perto_da_borda_entra_no_palco() {
         let area = Size::new(500.0, 300.0);
-        let panel = Size::new(280.0, 100.0);
-        for index in 0..16 {
-            let p = panel_origin(area, 16, index, panel);
+        let panel = Size::new(280.0, 150.0);
+        for at in [(0.0, 0.0), (499.0, 299.0), (480.0, 10.0), (10.0, 290.0)] {
+            let p = panel_origin(area, Point::new(at.0, at.1), panel);
             assert!(p.x >= PANEL_MARGIN && p.x + panel.width <= area.width - PANEL_MARGIN + 0.01);
             assert!(p.y >= PANEL_MARGIN && p.y + panel.height <= area.height - PANEL_MARGIN + 0.01);
         }
