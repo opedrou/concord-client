@@ -3,7 +3,7 @@
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::api::Client;
-use crate::audio::Engine;
+use crate::audio::{Engine, MicFrames};
 
 /// Máximo de tentativas de reconexão, como na web.
 pub const MAX_ATTEMPTS: u32 = 10;
@@ -59,6 +59,7 @@ impl Call {
         slug: String,
         install_id: String,
         engine: Engine,
+        mic: MicFrames,
         mic_muted: bool,
     ) -> (Call, UnboundedReceiver<Event>) {
         todo!()

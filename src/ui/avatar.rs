@@ -73,6 +73,18 @@ pub fn view<'a>(name: &str, photo: Option<&image::Handle>, size: f32) -> Element
     .into()
 }
 
+/// Anel verde de quem está falando. Apagado, continua ocupando os 2 px, pra nada pular.
+pub fn ringed<'a>(inner: Element<'a, Msg>, size: f32, on: bool) -> Element<'a, Msg> {
+    let color = if on { theme::GREEN } else { Color::TRANSPARENT };
+    container(inner)
+        .padding(2)
+        .style(move |_| container::Style {
+            border: border::rounded((size + 4.0) / 2.0).color(color).width(2),
+            ..Default::default()
+        })
+        .into()
+}
+
 /// Corta no centro e reduz, como o `object-fit: cover` da web. Os limites barram
 /// imagem pequena em bytes e gigante na memória.
 fn decode(bytes: &[u8]) -> Option<image::Handle> {
