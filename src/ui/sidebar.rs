@@ -27,6 +27,7 @@ pub const VOLUME: &[u8] = icon!("volume");
 pub const VOLUME_X: &[u8] = icon!("volume-x");
 const SETTINGS: &[u8] = icon!("settings");
 const VIDEO: &[u8] = icon!("video");
+pub const SCREEN: &[u8] = icon!("screen-share");
 pub const CLOSE: &[u8] = icon!("close");
 pub const MARK: &[u8] = icon!("mark");
 
@@ -35,6 +36,14 @@ pub fn icon<'a>(bytes: &'static [u8], size: f32, color: Color) -> Element<'a, Ms
         .width(size)
         .height(size)
         .style(move |_, _| svg::Style { color: Some(color) })
+        .into()
+}
+
+pub fn live_badge<'a>() -> Element<'a, Msg> {
+    let label = text("LIVE").size(9).font(theme::BOLD).color(FG);
+    container(label)
+        .padding([1, 5])
+        .style(theme::live_badge)
         .into()
 }
 
@@ -209,12 +218,8 @@ fn occupant<'a>(
     speaking: bool,
 ) -> Element<'a, Msg> {
     let (muted, camera, screen_share) = badges;
-    let live = screen_share.then(|| {
-        let label = text("LIVE").size(9).font(theme::BOLD).color(FG);
-        container(label).padding([1, 5]).style(theme::live_badge)
-    });
     let badges = row![]
-        .push(live)
+        .push(screen_share.then(live_badge))
         .push(camera.then(|| icon(VIDEO, 14.0, FG2)))
         .push(muted.then(|| icon(MIC_OFF, 14.0, DANGER)))
         .spacing(4)

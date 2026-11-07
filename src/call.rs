@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use livekit::{
     DisconnectReason, Room, RoomEvent, RoomOptions,
     options::TrackPublishOptions,
+    participant::LocalParticipant,
     publication::LocalTrackPublication,
     track::{LocalAudioTrack, LocalTrack, RemoteTrack, TrackSource},
     webrtc::{
@@ -29,6 +30,7 @@ use tokio::{
 
 use crate::api::{self, Client};
 use crate::audio::{Engine, MicFrames, RATE};
+use crate::share::{self, Capturer, Quality};
 
 /// Máximo de tentativas de reconexão, como na web.
 pub const MAX_ATTEMPTS: u32 = 10;
@@ -77,6 +79,7 @@ pub enum Event {
     },
     /// Lista inteira, a cada mudança.
     Participants(Vec<Live>),
+    Share(share::State),
     /// Último evento da call.
     Ended(End),
 }
@@ -90,6 +93,7 @@ enum Cmd {
 #[derive(Clone)]
 pub struct Call {
     cmd: UnboundedSender<Cmd>,
+    share: UnboundedSender<share::Cmd>,
     engine: Engine,
 }
 
@@ -110,17 +114,45 @@ impl Call {
         mic: MicFrames,
         mic_muted: bool,
     ) -> (Call, UnboundedReceiver<Event>) {
+        Self::join_with(
+            client,
+            slug,
+            install_id,
+            engine,
+            mic,
+            mic_muted,
+            share::desktop,
+        )
+    }
+
+    /// [`Call::join`] com a captura trocável, pra bancada publicar sem abrir o portal.
+    pub(crate) fn join_with(
+        client: Client,
+        slug: String,
+        install_id: String,
+        engine: Engine,
+        mic: MicFrames,
+        mic_muted: bool,
+        capture: Capturer,
+    ) -> (Call, UnboundedReceiver<Event>) {
         // Fecha o mic antes de qualquer coisa: entrar nunca abre o mic sozinho.
         if mic_muted {
             engine.set_mic_muted(true);
         }
         let (tx, events) = mpsc::unbounded_channel();
         let (cmd, rx) = mpsc::unbounded_channel();
+        let (share, share_rx) = mpsc::unbounded_channel();
+        let (room, room_rx) = watch::channel(None);
+        let states = tx.clone();
+        let sharing = share::run(share_rx, room_rx, capture, move |state| {
+            let _ = states.send(Event::Share(state));
+        });
         let task = Task {
             client,
             slug,
             install_id,
             tx,
+            room,
         };
         let (speech_tx, speech_rx) = mpsc::unbounded_channel();
         let ctl = Ctl {
@@ -131,8 +163,8 @@ impl Call {
             speech_tx,
             speech_rx,
         };
-        tokio::spawn(task.run(ctl, mic));
-        (Call { cmd, engine }, events)
+        tokio::spawn(task.run(ctl, mic, AbortOnDrop(tokio::spawn(sharing))));
+        (Call { cmd, share, engine }, events)
     }
 
     pub fn set_mic_muted(&self, muted: bool) {
@@ -149,8 +181,18 @@ impl Call {
         let _ = self.cmd.send(Cmd::MutedPeople(names));
     }
 
+    /// Abre a captura; o andamento vem em [`Event::Share`].
+    pub fn start_share(&self, quality: Quality) {
+        let _ = self.share.send(share::Cmd::Start(quality));
+    }
+
+    pub fn stop_share(&self) {
+        let _ = self.share.send(share::Cmd::Stop);
+    }
+
     /// Sai de forma limpa, com `room.close()`. Termina em `Ended(End::Left)`.
     pub fn leave(&self) {
+        self.stop_share();
         let _ = self.cmd.send(Cmd::Leave);
     }
 }
@@ -231,6 +273,8 @@ struct Task {
     slug: String,
     install_id: String,
     tx: UnboundedSender<Event>,
+    /// Sala atual, pra transmissão: ao mudar, ela republica sem abrir o seletor.
+    room: watch::Sender<Option<LocalParticipant>>,
 }
 
 /// Estado que atravessa as reconexões.
@@ -394,12 +438,14 @@ impl Task {
         let _ = self.tx.send(event);
     }
 
-    async fn run(self, mut ctl: Ctl, mic: MicFrames) {
+    async fn run(self, mut ctl: Ctl, mic: MicFrames, sharing: AbortOnDrop) {
         let (source, source_rx) = watch::channel(None);
         let speech = ctl.speech_tx.clone();
         let _forward = AbortOnDrop(tokio::spawn(forward_mic(mic, source_rx, speech)));
         let end = self.lifecycle(&mut ctl, &source).await;
-        // Faixa e vozes já caíram aqui: `Ended` é sempre o último evento.
+        // Faixa e vozes já caíram aqui: `Ended` é sempre o último evento. Soltar a tarefa
+        // da tela para a captura também nos fins que não passam por `leave`.
+        drop(sharing);
         self.emit(Event::Ended(end));
     }
 
@@ -416,6 +462,7 @@ impl Task {
                     self.emit(Event::Connected);
                     let outcome = self.serve(&mut session, ctl).await;
                     source.send_replace(None);
+                    self.room.send_replace(None);
                     drop(session);
                     if let Outcome::End(end) = outcome {
                         return end;
@@ -484,6 +531,7 @@ impl Task {
         // Publica mudo antes de a faixa receber o primeiro bloco.
         apply_mute(&ctl.engine, Some(&mic), ctl.muted);
         source.send_replace(Some(src));
+        self.room.send_replace(Some(room.local_participant()));
 
         Ok(Session {
             room,

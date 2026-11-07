@@ -10,6 +10,7 @@ use crate::api::{self, Participant};
 use crate::audio::{Engine, Meter, MicFrames};
 use crate::call::{Call, End, Live};
 use crate::config::Config;
+use crate::share::{self, Quality};
 
 /// Quanto o anel de fala fica aceso depois que a pessoa cala, como na web.
 const SPEAKING_HOLD: Duration = Duration::from_millis(400);
@@ -67,6 +68,10 @@ pub struct ActiveCall {
     fading: HashMap<String, Instant>,
     /// Pessoa com o painel de volume aberto.
     pub volume_panel: Option<String>,
+    /// Vem da call, por `Event::Share`.
+    pub share: share::State,
+    /// Painel de qualidade aberto.
+    pub share_panel: bool,
 }
 
 impl ActiveCall {
@@ -81,6 +86,8 @@ impl ActiveCall {
             live: None,
             fading: HashMap::new(),
             volume_panel: None,
+            share: share::State::Off,
+            share_panel: false,
         }
     }
 
@@ -93,6 +100,31 @@ impl ActiveCall {
     pub fn leave(&self) {
         if let Some(call) = &self.call {
             call.leave();
+        }
+    }
+
+    /// Botão de tela: abre e fecha o painel; com transmissão em andamento, para.
+    pub fn share_button(&mut self) {
+        match self.share {
+            share::State::Choosing | share::State::Live => self.stop_share(),
+            share::State::Off | share::State::Failed => {
+                self.share = share::State::Off;
+                self.share_panel = !self.share_panel;
+                self.volume_panel = None;
+            }
+        }
+    }
+
+    pub fn start_share(&mut self, quality: Quality) {
+        self.share_panel = false;
+        if let Some(call) = &self.call {
+            call.start_share(quality);
+        }
+    }
+
+    pub fn stop_share(&self) {
+        if let Some(call) = &self.call {
+            call.stop_share();
         }
     }
 

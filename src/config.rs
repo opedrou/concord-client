@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::audio::{
     AudioPrefs, MANUAL_DEFAULT_DB, MANUAL_MAX_DB, MANUAL_MIN_DB, NoiseLevel, Sensitivity,
 };
+use crate::share::Quality;
 
 pub const SIDEBAR_MIN: f32 = 200.0;
 pub const SIDEBAR_MAX: f32 = 480.0;
@@ -35,6 +36,7 @@ pub struct Config {
     pub master_volume: u8,
     /// Nome da pessoa -> slider. Quem não está aqui fica em [`VOLUME_PADRAO`].
     pub volumes: HashMap<String, u8>,
+    pub share_quality: Quality,
 }
 
 impl Default for Config {
@@ -53,6 +55,7 @@ impl Default for Config {
             manual_db: MANUAL_DEFAULT_DB,
             master_volume: VOLUME_PADRAO,
             volumes: HashMap::new(),
+            share_quality: Quality::default(),
         }
     }
 }
@@ -248,6 +251,18 @@ mod tests {
         assert_eq!(c.sensitivity, Sensitivity::Auto);
         assert_eq!(c.manual_db, MANUAL_DEFAULT_DB);
         assert_eq!(c.audio_prefs().sensitivity, Sensitivity::Auto);
+    }
+
+    #[test]
+    fn qualidade_da_tela_vem_alta_e_volta_do_arquivo() {
+        let c: Config = serde_json::from_str(r#"{"mic_muted":true}"#).unwrap();
+        assert_eq!(c.share_quality, Quality::Alta);
+        let c = Config {
+            share_quality: Quality::Economica,
+            ..Config::default()
+        };
+        let c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c.share_quality, Quality::Economica);
     }
 
     #[test]

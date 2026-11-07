@@ -5,6 +5,7 @@ mod audio;
 mod call;
 mod config;
 mod session;
+mod share;
 mod ui;
 
 use iced::{Size, window};

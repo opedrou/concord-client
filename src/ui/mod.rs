@@ -21,6 +21,7 @@ use crate::audio::{self, Devices, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
 use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::session;
+use crate::share::Quality;
 
 const POLL: Duration = Duration::from_secs(4);
 /// Falhas seguidas de presença até o rodapé trocar "Online" por "Sem conexão".
@@ -146,6 +147,11 @@ pub enum Msg {
     Master(u8),
     /// Solta um slider: grava na config.
     VolumeDone,
+    /// Botão de tela da barra.
+    ShareButton,
+    ShareQuality(Quality),
+    ShareStart,
+    ShareStop,
     Input(Option<String>),
     Output(Option<String>),
     Noise(NoiseLevel),
@@ -396,6 +402,7 @@ impl App {
             Msg::OpenVolume(name) => {
                 if let Some(call) = self.call_mut() {
                     call.volume_panel = Some(name);
+                    call.share_panel = false;
                 }
                 Task::none()
             }
@@ -424,6 +431,30 @@ impl App {
             }
             Msg::VolumeDone => {
                 self.persist();
+                Task::none()
+            }
+            Msg::ShareButton => {
+                if let Some(call) = self.call_mut() {
+                    call.share_button();
+                }
+                Task::none()
+            }
+            Msg::ShareQuality(quality) => {
+                self.config.share_quality = quality;
+                self.persist();
+                Task::none()
+            }
+            Msg::ShareStart => {
+                let quality = self.config.share_quality;
+                if let Some(call) = self.call_mut() {
+                    call.start_share(quality);
+                }
+                Task::none()
+            }
+            Msg::ShareStop => {
+                if let Some(call) = self.call_mut() {
+                    call.stop_share();
+                }
                 Task::none()
             }
             Msg::Input(name) => {
@@ -618,6 +649,7 @@ impl App {
     fn close_volume(&mut self) {
         if let Some(call) = self.call_mut() {
             call.volume_panel = None;
+            call.share_panel = false;
         }
     }
 
@@ -701,6 +733,7 @@ impl App {
                 active.status = voice::Status::Reconnecting(attempt);
             }
             call::Event::Participants(list) => active.participants(list, Instant::now()),
+            call::Event::Share(state) => active.share = state,
             call::Event::Ended(end) => return self.call_ended(end),
         }
         Task::none()
@@ -1081,6 +1114,7 @@ fn drag(event: Event, _: event::Status, _: window::Id) -> Option<Msg> {
 mod tests {
     use super::*;
     use crate::api::{ChannelKind, Participant};
+    use crate::share::State as ShareState;
 
     fn app(screen: Screen) -> App {
         App {
@@ -1543,6 +1577,103 @@ mod tests {
         }
     }
 
+    fn share(a: &mut App, state: ShareState) {
+        let id = call_id(a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Share(state)));
+    }
+
+    #[test]
+    fn painel_de_tela_abre_escolhe_e_grava() {
+        let mut a = in_call(&["Ana"]);
+        assert!(!call_of(&mut a).share_panel);
+        assert_eq!(a.config.share_quality, Quality::Alta);
+        let _ = a.update(Msg::ShareButton);
+        assert!(call_of(&mut a).share_panel);
+
+        let antes = saves();
+        let _ = a.update(Msg::ShareQuality(Quality::Economica));
+        assert_eq!(a.config.share_quality, Quality::Economica);
+        assert_eq!(saves(), antes + 1);
+        assert!(call_of(&mut a).share_panel, "trocar não fecha");
+
+        let _ = a.update(Msg::ShareStart);
+        assert!(!call_of(&mut a).share_panel);
+    }
+
+    #[test]
+    fn escape_e_painel_de_volume_fecham_o_painel_de_tela() {
+        let mut a = in_call(&["Ana"]);
+        let _ = a.update(Msg::ShareButton);
+        let _ = a.update(Msg::Escape);
+        assert!(!call_of(&mut a).share_panel);
+
+        let _ = a.update(Msg::ShareButton);
+        let _ = a.update(Msg::OpenVolume("Ana".into()));
+        assert!(!call_of(&mut a).share_panel);
+        let _ = a.update(Msg::ShareButton);
+        assert!(call_of(&mut a).volume_panel.is_none(), "um painel por vez");
+    }
+
+    #[test]
+    fn estados_da_transmissao_vem_da_call() {
+        let mut a = in_call(&["Ana"]);
+        for state in [ShareState::Choosing, ShareState::Live, ShareState::Off] {
+            share(&mut a, state);
+            assert_eq!(call_of(&mut a).share, state);
+        }
+    }
+
+    #[test]
+    fn com_transmissao_em_andamento_o_botao_nao_abre_o_painel() {
+        for state in [ShareState::Choosing, ShareState::Live] {
+            let mut a = in_call(&["Ana"]);
+            share(&mut a, state);
+            let _ = a.update(Msg::ShareButton);
+            assert!(!call_of(&mut a).share_panel);
+        }
+    }
+
+    #[test]
+    fn falha_fica_ate_a_pessoa_tentar_de_novo() {
+        let mut a = in_call(&["Ana"]);
+        share(&mut a, ShareState::Failed);
+        assert_eq!(call_of(&mut a).share, ShareState::Failed);
+        let _ = a.update(Msg::ShareButton);
+        assert_eq!(call_of(&mut a).share, ShareState::Off);
+        assert!(call_of(&mut a).share_panel);
+    }
+
+    #[test]
+    fn sair_ou_trocar_de_canal_zera_a_transmissao() {
+        for msg in [Msg::Leave, Msg::JoinChannel("jogando".into())] {
+            let mut a = in_call(&["Ana"]);
+            let antiga = call_id(&mut a);
+            share(&mut a, ShareState::Live);
+            let _ = a.update(msg);
+            // A call antiga ainda avisa que parou; isso não pode cair na nova.
+            let _ = a.update(Msg::CallEvent(
+                antiga,
+                call::Event::Share(ShareState::Failed),
+            ));
+            if let Some(nova) = main_of(&mut a).call.as_ref() {
+                assert_eq!(nova.share, ShareState::Off);
+            }
+        }
+    }
+
+    #[test]
+    fn fim_da_call_leva_a_transmissao_junto() {
+        for end in [End::RoomClosed, End::Unauthorized] {
+            let mut a = in_call(&["Ana"]);
+            let id = call_id(&mut a);
+            share(&mut a, ShareState::Live);
+            let _ = a.update(Msg::CallEvent(id, call::Event::Ended(end)));
+            if let Screen::Main(m) = &a.screen {
+                assert!(m.call.is_none());
+            }
+        }
+    }
+
     fn probe_of(a: &mut App) -> &Probe {
         &main_of(a).probe
     }
@@ -1871,6 +2002,46 @@ mod tests {
         let _ = a.update(Msg::ToggleDeafen);
         a.config.volumes.insert("Ana".into(), 40);
         print(&a, "palco-surdo-volume");
+
+        // Transmissão: painel de qualidade, seletor do sistema, no ar e falha.
+        let (mut a, id) = palco(4);
+        a.config.share_quality = Quality::Media;
+        let _ = a.update(Msg::ShareButton);
+        print(&a, "tela-painel");
+        print_at(&a, "tela-painel-janela-minima", Size::new(860.0, 560.0));
+        // Clique de verdade: a camada do painel não pode tampar a barra de baixo.
+        let settings = Settings {
+            fonts: theme::FONTS.map(Into::into).to_vec(),
+            default_font: theme::BODY,
+            ..Settings::default()
+        };
+        let mut ui = Simulator::with_size(settings, Size::new(1200.0, 760.0), a.view());
+        ui.click("Transmitir").unwrap();
+        ui.click("Sair").unwrap();
+        let cliques: Vec<Msg> = ui.into_messages().collect();
+        assert!(
+            matches!(cliques[..], [Msg::ShareStart, Msg::Leave]),
+            "{cliques:?}"
+        );
+        let _ = a.update(Msg::ShareStart);
+        share(&mut a, ShareState::Choosing);
+        print(&a, "tela-escolhendo");
+        let lista = nomes[..4]
+            .iter()
+            .enumerate()
+            .map(|(i, nome)| {
+                let mut l = voice::test_live(nome, false);
+                l.is_local = i == 0;
+                l.screen_share = i == 0;
+                l
+            })
+            .collect();
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
+        share(&mut a, ShareState::Live);
+        print(&a, "tela-transmitindo");
+        let (mut a, _) = palco(4);
+        share(&mut a, ShareState::Failed);
+        print(&a, "tela-falha");
 
         let mut a = voice_app();
         let _ = a.update(Msg::JoinChannel("call".into()));

@@ -279,6 +279,25 @@ pub fn bar_button(off: bool) -> impl Fn(&Theme, button::Status) -> button::Style
     }
 }
 
+/// Quadrado da barra que acende em roxo, como o item ativo do menu.
+pub fn bar_toggle(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    let plain = bar_button(false);
+    move |theme, status| {
+        let mut style = plain(theme, status);
+        if on {
+            let hot = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            let soft = if hot {
+                Color { a: 0.35, ..ACCENT }
+            } else {
+                SOFT
+            };
+            style.background = Some(soft.into());
+            style.text_color = ACCENT2;
+        }
+        style
+    }
+}
+
 /// "Sair" da barra: o único cheio de vermelho.
 pub fn leave(_: &Theme, status: button::Status) -> button::Style {
     let hot = matches!(status, button::Status::Hovered | button::Status::Pressed);
