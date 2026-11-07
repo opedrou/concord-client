@@ -7,7 +7,7 @@ use std::{
 use tokio::sync::mpsc::Sender;
 
 use super::{
-    AudioPrefs, FRAME, NoiseLevel,
+    AudioPrefs, FRAME, Meter, NoiseLevel, Sensitivity,
     device::{self, Opened},
     mic::MicChain,
     mixer::{Mixer, VoiceQueue},
@@ -22,6 +22,7 @@ pub enum Command {
     Master(u8),
     Person(String, u8),
     Noise(NoiseLevel),
+    Sensitivity(Sensitivity),
     Input(Option<String>),
     Output(Option<String>),
     Voice {
@@ -74,12 +75,13 @@ impl<T> Side<T> {
 
 pub fn run(
     prefs: AudioPrefs,
+    meter: Meter,
     commands: mpsc::Receiver<Command>,
     frames: Sender<Vec<i16>>,
     ready: mpsc::Sender<Result<(), String>>,
 ) {
     let mut mixer = Mixer::new(prefs.master, prefs.volumes);
-    let mut chain = MicChain::new(prefs.noise);
+    let mut chain = MicChain::new(prefs.noise, prefs.sensitivity, meter);
     let mut input = Side::new(prefs.input);
     let mut output = Side::new(prefs.output);
     let mut mix = [0f32; FRAME];
@@ -111,6 +113,7 @@ pub fn run(
                 Command::Master(slider) => mixer.master = slider,
                 Command::Person(name, slider) => mixer.set_person(name, slider),
                 Command::Noise(level) => chain.set_noise(level),
+                Command::Sensitivity(sensitivity) => chain.gate.set_sensitivity(sensitivity),
                 Command::Input(name) => input.switch(name),
                 Command::Output(name) => output.switch(name),
                 Command::Voice { key, name, queue } => mixer.add(key, name, queue),

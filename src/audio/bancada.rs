@@ -19,6 +19,20 @@ const WAV_DIR: &str = match option_env!("CONCORD_BANCADA") {
     Some(p) => p,
     None => "",
 };
+/// Frases em português de TTS, fora do repositório como os wav do spike. `fala.wav` é
+/// rajada sintética, não voz: o RNNoise quase nunca passa de 0,9 nela.
+const VOZ_DIR: &str = match option_env!("CONCORD_VOZES") {
+    Some(p) => p,
+    None => "",
+};
+const VOZES: [&str; 6] = [
+    "local_Portuguese",
+    "local_PortugueseBusiness",
+    "local_PortugueseGrandpaFarm",
+    "Portuguese_stable",
+    "Portuguese_expressive",
+    "podcast_pizza",
+];
 const FONE: &str = "BancadaFone";
 const MIC: &str = "BancadaMic";
 
@@ -473,4 +487,422 @@ fn bancada_queda() {
     thread::sleep(Duration::from_millis(500));
     assert_eq!(audio_threads(), 0);
     println!("BANCADA fim: {}", streams());
+}
+
+// --- Calibração do limitador -------------------------------------------------
+
+/// Nível da fala normal, e o gabarito: bloco com fala é o que passa de 20 dB abaixo dela.
+const FALA_DB: f32 = -24.0;
+const COM_FALA_DB: f32 = FALA_DB - 20.0;
+/// Pausa maior que isto começa outra frase.
+const PAUSA_BLOCOS: usize = 25;
+/// Ruído de fundo que toda sala tem, e o RNNoise trata silêncio digital à parte.
+const PISO_DB: f32 = -78.0;
+/// Depois do aquecimento do gate, pra medir a fala e não o aquecimento.
+const SOBRA: f32 = 3.0;
+const MANUAL: Sensitivity = Sensitivity::Manual(MANUAL_DEFAULT_DB);
+
+fn amp(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+fn block_db(block: &[f32]) -> f32 {
+    let sum: f32 = block.iter().map(|s| s * s).sum();
+    10.0 * (sum / block.len() as f32).max(1e-12).log10()
+}
+
+/// Ruído previsível entre rodadas.
+struct Dado(u32);
+
+impl Dado {
+    /// De -1 a 1.
+    fn next(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0 as f32 / u32::MAX as f32 * 2.0 - 1.0
+    }
+
+    /// Ruído branco com o RMS pedido.
+    fn ruido(&mut self, secs: f32, db: f32) -> Vec<f32> {
+        let rms = amp(db) * 3f32.sqrt();
+        (0..(secs * RATE as f32) as usize)
+            .map(|_| self.next() * rms)
+            .collect()
+    }
+
+    /// Tecla descendo e subindo, seis por segundo em média. `decay_ms` longo é mecânico.
+    fn cliques(&mut self, secs: f32, pico_db: f32, decay_ms: f32) -> Vec<f32> {
+        let mut pcm = self.ruido(secs, -72.0);
+        let (decay, ms) = (decay_ms * 48.0, RATE as f32 / 1000.0);
+        let mut at = 300.0;
+        while at < (secs - 0.5) * 1000.0 {
+            for (extra, pico) in [(0.0, 1.0), (80.0 + self.next().abs() * 40.0, 0.5)] {
+                let start = ((at + extra) * ms) as usize;
+                for (i, s) in pcm[start..].iter_mut().take(decay as usize * 7).enumerate() {
+                    let envelope = (-(i as f32) / decay).exp();
+                    *s += self.next() * envelope * pico * amp(pico_db);
+                }
+            }
+            at += 60.0 + self.next().abs() * 2000.0 / 6.0;
+        }
+        pcm
+    }
+}
+
+/// As vozes em sequência, com 1 s entre elas, em [`FALA_DB`].
+fn voz() -> Vec<f32> {
+    let mut pcm = vec![];
+    for nome in VOZES {
+        let bytes = fs::read(format!("{VOZ_DIR}/{nome}.wav")).expect("wav de voz");
+        let base: Vec<f32> = bytes[44..]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .take(24_000 * 14)
+            .collect();
+        // Arquivos em 24 kHz.
+        let dobro: Vec<f32> = base
+            .windows(2)
+            .flat_map(|w| [w[0], (w[0] + w[1]) / 2.0])
+            .collect();
+        let blocos: Vec<f32> = dobro.chunks_exact(FRAME).map(block_db).collect();
+        let topo = blocos.iter().copied().fold(-200.0, f32::max);
+        let ativos: Vec<f32> = blocos.into_iter().filter(|d| *d > topo - 30.0).collect();
+        let medio = ativos.iter().map(|d| 10f32.powf(d / 10.0)).sum::<f32>() / ativos.len() as f32;
+        let ganho = amp(FALA_DB - 10.0 * medio.log10());
+        pcm.extend(vec![0.0; RATE as usize]);
+        pcm.extend(dobro.iter().map(|s| s * ganho));
+    }
+    pcm.extend(vec![0.0; RATE as usize]);
+    pcm
+}
+
+fn soma(a: &[f32], ganho_a: f32, b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b).map(|(a, b)| a * ganho_a + b).collect()
+}
+
+fn write_wav(path: &str, pcm: &[f32]) {
+    let bytes = pcm.len() as u32 * 2;
+    let mut wav = Vec::with_capacity(44 + bytes as usize);
+    wav.extend(b"RIFF");
+    wav.extend((36 + bytes).to_le_bytes());
+    wav.extend(b"WAVEfmt ");
+    wav.extend(16u32.to_le_bytes());
+    wav.extend(1u16.to_le_bytes());
+    wav.extend(1u16.to_le_bytes());
+    wav.extend(RATE.to_le_bytes());
+    wav.extend((RATE * 2).to_le_bytes());
+    wav.extend(2u16.to_le_bytes());
+    wav.extend(16u16.to_le_bytes());
+    wav.extend(b"data");
+    wav.extend(bytes.to_le_bytes());
+    for s in pcm {
+        wav.extend(((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+    }
+    fs::write(path, wav).expect("wav");
+}
+
+/// `gabarito` é a fala limpa, se tiver: diz onde cada frase começa e termina.
+struct Sinal {
+    nome: &'static str,
+    pcm: Vec<f32>,
+    gabarito: Option<Vec<f32>>,
+}
+
+/// Toca o sinal e sobe o motor com a sala já soando, como numa call de verdade.
+fn escuta(sinal: &Sinal, noise: NoiseLevel, sensitivity: Sensitivity) -> Vec<mic::Traced> {
+    let raiz = std::env::var("BANCADA_RAIZ").expect("rode por src/audio/bancada.sh");
+    let path = format!("{raiz}/sinal.wav");
+    write_wav(&path, &sinal.pcm);
+    let _near = Killed(
+        Command::new("paplay")
+            .args(["--device=bancada_sala", &path])
+            .spawn()
+            .expect("paplay"),
+    );
+    let inicio = Instant::now();
+    thread::sleep(Duration::from_millis(500));
+    mic::TRACE.lock().unwrap().clear();
+    let (engine, mut mic) = Engine::start(AudioPrefs {
+        sensitivity,
+        ..prefs(noise)
+    })
+    .expect("start");
+    engine.set_mic_muted(false);
+    // Para antes do fim: o som cortando seco engana o RNNoise e não existe na sala.
+    let fim = Duration::from_secs_f32(sinal.pcm.len() as f32 / RATE as f32 - 0.5);
+    drain(&mut mic, fim.saturating_sub(inicio.elapsed()), None);
+    drop(engine);
+    std::mem::take(&mut *mic::TRACE.lock().unwrap())
+}
+
+/// Envelope em janelas de 5 ms.
+fn envelope(pcm: impl Iterator<Item = f32>) -> Vec<f32> {
+    pcm.map(f32::abs)
+        .collect::<Vec<_>>()
+        .chunks_exact(240)
+        .map(|c| c.iter().sum())
+        .collect()
+}
+
+/// Em quantas amostras o sinal que entrou no gate está depois do `gabarito`. Compara os
+/// envelopes, que resistem ao AGC. O motor sobe 500 ms depois do som: dá negativo.
+fn atraso(gabarito: &[f32], trace: &[mic::Traced]) -> isize {
+    let a = envelope(gabarito.iter().copied());
+    let b = envelope(
+        trace
+            .iter()
+            .flat_map(|t| t.entered)
+            .map(|s| s as f32 / 32768.0),
+    );
+    let casa = |lag: isize| -> f32 {
+        a.iter()
+            .enumerate()
+            .filter_map(|(i, x)| Some(x * b.get(usize::try_from(i as isize + lag).ok()?)?))
+            .sum()
+    };
+    (-200..100)
+        .max_by(|x, y| casa(*x).total_cmp(&casa(*y)))
+        .unwrap()
+        * 240
+}
+
+#[derive(Default)]
+struct Cortes {
+    passou: f32,
+    inicio: Vec<usize>,
+    fim: Vec<usize>,
+}
+
+/// Blocos do gabarito com fala saindo com ganho de pelo menos metade, e quanto cada frase
+/// perdeu nas pontas, em ms.
+fn cortes(gabarito: &[f32], trace: &[mic::Traced], atraso: isize) -> Cortes {
+    let fala: Vec<bool> = gabarito
+        .chunks_exact(FRAME)
+        .map(|b| block_db(b) >= COM_FALA_DB)
+        .collect();
+    let desvio = (atraso + super::gate::LOOKAHEAD as isize) / FRAME as isize;
+    let saiu = |i: usize| {
+        usize::try_from(i as isize + desvio)
+            .ok()
+            .and_then(|k| trace.get(k))
+            .is_some_and(|t| t.gain >= 0.5)
+    };
+    let com_fala: Vec<usize> = (0..fala.len()).filter(|i| fala[*i]).collect();
+    let passou = com_fala.iter().filter(|i| saiu(**i)).count();
+    let mut frases: Vec<(usize, usize)> = vec![];
+    for &i in &com_fala {
+        match frases.last_mut() {
+            Some((_, fim)) if i - *fim <= PAUSA_BLOCOS => *fim = i,
+            _ => frases.push((i, i)),
+        }
+    }
+    let mut medido = Cortes {
+        passou: passou as f32 * 100.0 / com_fala.len().max(1) as f32,
+        ..Default::default()
+    };
+    for (a, b) in frases.into_iter().filter(|(a, b)| b - a >= 3) {
+        let dentro: Vec<usize> = (a..=b).filter(|i| saiu(*i)).collect();
+        let (primeiro, ultimo) = match (dentro.first(), dentro.last()) {
+            (Some(p), Some(u)) => (*p, *u),
+            _ => (b + 1, b + 1),
+        };
+        medido.inicio.push((primeiro - a) * 10);
+        medido.fim.push((b + 1).saturating_sub(ultimo + 1) * 10);
+    }
+    medido
+}
+
+fn resumo(ms: &mut [usize]) -> String {
+    if ms.is_empty() {
+        return "-".into();
+    }
+    ms.sort_unstable();
+    let media = ms.iter().sum::<usize>() / ms.len();
+    let p90 = ms[ms.len() * 9 / 10];
+    format!("{media}/{p90}/{}", ms[ms.len() - 1])
+}
+
+/// Quanto o gate atrasa na cadeia real: acha na entrada o bloco que saiu com ganho cheio.
+fn atraso_gate_ms(trace: &[mic::Traced]) -> Option<f32> {
+    let entrou: Vec<i16> = trace.iter().flat_map(|t| t.entered).collect();
+    let k = trace
+        .windows(2)
+        .position(|w| w[0].gain == 1.0 && w[1].gain == 1.0 && block_db_i16(&w[1].left) > -40.0)?
+        + 1;
+    let at = entrou.windows(FRAME).position(|w| w == trace[k].left)?;
+    Some((k * FRAME - at) as f32 / 48.0)
+}
+
+fn block_db_i16(block: &[i16]) -> f32 {
+    let pcm: Vec<f32> = block.iter().map(|s| *s as f32 / 32768.0).collect();
+    block_db(&pcm)
+}
+
+/// Uma linha da tabela. Devolve quantas vezes abriu e a porcentagem de fala que passou.
+fn mede(sinal: &Sinal, noise: NoiseLevel, sensitivity: Sensitivity) -> (usize, f32) {
+    let trace = escuta(sinal, noise, sensitivity);
+    let minutos = trace.len() as f32 / 6000.0;
+    let aberturas = trace
+        .windows(2)
+        .filter(|w| !w[0].passing && w[1].passing)
+        .count();
+    let aberto = trace.iter().filter(|t| t.passing).count() as f32 * 100.0 / trace.len() as f32;
+    let mut medido = Cortes::default();
+    if let Some(gabarito) = &sinal.gabarito {
+        medido = cortes(gabarito, &trace, atraso(gabarito, &trace));
+    }
+    println!(
+        "GATE | {:<26} | {noise:?} {sensitivity:?} | fala {:5.1}% | início {} | fim {} | \
+         aberturas {aberturas} ({:.1}/min) | aberto {aberto:.0}% | atraso {:?} ms",
+        sinal.nome,
+        medido.passou,
+        resumo(&mut medido.inicio),
+        resumo(&mut medido.fim),
+        aberturas as f32 / minutos,
+        atraso_gate_ms(&trace),
+    );
+    (aberturas, medido.passou)
+}
+
+#[test]
+#[ignore = "precisa do PipeWire próprio: src/audio/bancada.sh"]
+fn bancada_gate() {
+    let _rig = Rig::new();
+    let mut dado = Dado(0x1234_5678);
+    let silencio = vec![0.0; RATE as usize * SOBRA as usize];
+    let fala: Vec<f32> = silencio.iter().copied().chain(voz()).collect();
+    let segundos = fala.len() as f32 / RATE as f32;
+    let piso = dado.ruido(segundos, PISO_DB);
+
+    let wav_com_sobra = |nome: &str| -> Vec<f32> {
+        silencio
+            .iter()
+            .copied()
+            .chain(wav(nome).iter().map(|s| *s as f32 / 32768.0))
+            .collect()
+    };
+    let (sintetica, tom) = (wav_com_sobra("fala.wav"), wav_com_sobra("perto.wav"));
+    // Perto até a metade, depois a mesma voz 30 dB mais longe.
+    let meio = fala.len() / 2;
+    let distante: Vec<f32> = fala[RATE as usize..]
+        .iter()
+        .enumerate()
+        .map(|(i, s)| if i < meio { *s } else { *s * amp(-30.0) })
+        .collect();
+    let liga: Vec<f32> = dado
+        .ruido(8.0, PISO_DB)
+        .into_iter()
+        .chain(dado.ruido(20.0, -40.0))
+        .collect();
+
+    let vozes = [
+        ("voz normal (-24)", 0.0, PISO_DB),
+        ("voz baixa + ruído (-36/-52)", -12.0, -52.0),
+        ("voz + ruído forte (-30/-40)", -6.0, -40.0),
+    ];
+    let mut sinais: Vec<Sinal> = vozes
+        .into_iter()
+        .map(|(nome, ganho, ruido_db)| Sinal {
+            nome,
+            pcm: soma(&fala, amp(ganho), &dado.ruido(segundos, ruido_db)),
+            gabarito: Some(fala.clone()),
+        })
+        .collect();
+    sinais.extend([
+        Sinal {
+            nome: "voz perto, depois longe",
+            pcm: soma(&distante, 1.0, &piso),
+            gabarito: None,
+        },
+        Sinal {
+            nome: "fala.wav (sintética)",
+            pcm: sintetica.clone(),
+            gabarito: Some(sintetica),
+        },
+        Sinal {
+            nome: "perto.wav (tom)",
+            pcm: tom.clone(),
+            gabarito: Some(tom),
+        },
+    ]);
+    for (nome, pcm) in [
+        ("ruído branco -60", dado.ruido(40.0, -60.0)),
+        ("ruído branco -50", dado.ruido(40.0, -50.0)),
+        ("ruído branco -40", dado.ruido(40.0, -40.0)),
+        ("ruído liga do nada (-40)", liga),
+        ("clique -30", dado.cliques(40.0, -30.0, 2.0)),
+        ("clique -20", dado.cliques(40.0, -20.0, 2.0)),
+        ("clique -10", dado.cliques(40.0, -10.0, 2.0)),
+        ("clique mecânico -12", dado.cliques(40.0, -12.0, 6.0)),
+    ] {
+        sinais.push(Sinal {
+            nome,
+            pcm,
+            gabarito: None,
+        });
+    }
+
+    // Rodada completa leva 35 min: `BANCADA_SO=clique` mede só o que tem esse nome.
+    let so = std::env::var("BANCADA_SO").unwrap_or_default();
+    sinais.retain(|s| s.nome.contains(&so));
+    let mut falhou = vec![];
+    for sinal in &sinais {
+        let (aberturas, passou) = mede(sinal, NoiseLevel::Rnnoise, Sensitivity::Auto);
+        mede(sinal, NoiseLevel::Rnnoise, MANUAL);
+        let so_ruido = sinal.nome.contains("ruído branco") || sinal.nome.contains("clique");
+        if so_ruido && aberturas > 0 {
+            falhou.push(sinal.nome);
+        }
+        if sinal.nome.starts_with("voz normal") && passou < 95.0 {
+            falhou.push(sinal.nome);
+        }
+    }
+    // Os outros níveis mudam o que o gate vê: sem RNNoise o ruído chega inteiro nele.
+    for noise in [NoiseLevel::Off, NoiseLevel::Apm] {
+        for sinal in sinais.iter().filter(|s| {
+            s.nome.starts_with("voz normal")
+                || s.nome == "ruído branco -50"
+                || s.nome == "clique -20"
+        }) {
+            mede(sinal, noise, Sensitivity::Auto);
+            mede(sinal, noise, MANUAL);
+        }
+    }
+    assert!(falhou.is_empty(), "{falhou:?}");
+}
+
+/// Eco de voz de verdade: quando o AEC ainda não convergiu, é voz chegando no mic.
+#[test]
+#[ignore = "precisa do PipeWire próprio: src/audio/bancada.sh"]
+fn bancada_gate_eco() {
+    let _rig = Rig::new();
+    let pcm: Vec<i16> = voz().iter().map(|s| (s * 32767.0) as i16).collect();
+    for sensitivity in [Sensitivity::Auto, MANUAL] {
+        mic::TRACE.lock().unwrap().clear();
+        let (engine, mut mic) = Engine::start(AudioPrefs {
+            sensitivity,
+            ..prefs(NoiseLevel::Rnnoise)
+        })
+        .expect("start");
+        engine.set_mic_muted(false);
+        let raw = Capture::start("bancada_mic");
+        let sink = engine.add_voice("far".into(), "ana".into());
+        let _far = Far::play(sink, pcm.clone());
+        drain(&mut mic, Duration::from_secs(60), None);
+        drop(engine);
+        let trace = std::mem::take(&mut *mic::TRACE.lock().unwrap());
+        let abriu: Vec<usize> = trace
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| !w[0].passing && w[1].passing)
+            .map(|(i, _)| i / 100)
+            .collect();
+        let aberto = trace.iter().filter(|t| t.passing).count() as f32 * 100.0 / trace.len() as f32;
+        println!(
+            "GATE | eco de voz | {sensitivity:?} | mic_rms={:.4} | abriu nos segundos {abriu:?} | \
+             aberto {aberto:.1}%",
+            raw.rms(),
+        );
+    }
 }

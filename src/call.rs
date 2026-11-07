@@ -29,7 +29,7 @@ use tokio::{
 };
 
 use crate::api::{self, Client};
-use crate::audio::{Engine, MicFrames, RATE};
+use crate::audio::{Engine, Meter, MicFrames, RATE};
 use crate::share::{self, Capturer, Quality};
 
 /// Máximo de tentativas de reconexão, como na web.
@@ -324,8 +324,9 @@ const SPEECH_HOLD: usize = RATE as usize * 150 / 1000;
 /// Chave da pessoa local em [`Session::speaking`].
 const LOCAL: &str = "";
 
-/// Anel de fala medido no PCM que chega, como o site faz. O `ActiveSpeakersChanged`
-/// dá uma volta pelo servidor, com o intervalo de agregação dele, e chega atrasado.
+/// Anel de fala das faixas remotas, medido no PCM que chega, como o site faz. O
+/// `ActiveSpeakersChanged` dá uma volta pelo servidor, com o intervalo de agregação dele,
+/// e chega atrasado. O anel local vem do [`Meter`].
 #[derive(Default)]
 struct Speech {
     on: bool,
@@ -405,13 +406,17 @@ fn apply_mute(engine: &Engine, mic: Option<&LocalTrackPublication>, muted: bool)
 /// não há sala.
 async fn forward_mic(
     mut mic: MicFrames,
+    meter: Meter,
     source: watch::Receiver<Option<NativeAudioSource>>,
     speech: UnboundedSender<(String, bool)>,
 ) {
-    let mut detector = Speech::default();
+    let mut speaking = false;
     while let Some(block) = mic.recv().await {
-        if let Some(on) = detector.update(&block) {
-            let _ = speech.send((LOCAL.to_owned(), on));
+        // O anel local é o próprio limitador: acende quando o mic está saindo pra sala.
+        let open = meter.open();
+        if open != speaking {
+            speaking = open;
+            let _ = speech.send((LOCAL.to_owned(), open));
         }
         let Some(src) = source.borrow().clone() else {
             continue;
@@ -441,7 +446,8 @@ impl Task {
     async fn run(self, mut ctl: Ctl, mic: MicFrames, sharing: AbortOnDrop) {
         let (source, source_rx) = watch::channel(None);
         let speech = ctl.speech_tx.clone();
-        let _forward = AbortOnDrop(tokio::spawn(forward_mic(mic, source_rx, speech)));
+        let meter = ctl.engine.meter();
+        let _forward = AbortOnDrop(tokio::spawn(forward_mic(mic, meter, source_rx, speech)));
         let end = self.lifecycle(&mut ctl, &source).await;
         // Faixa e vozes já caíram aqui: `Ended` é sempre o último evento. Soltar a tarefa
         // da tela para a captura também nos fins que não passam por `leave`.
@@ -784,6 +790,28 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn anel_local_segue_o_limitador_e_so_emite_quando_muda() {
+        let (frames, mic) = mpsc::channel(8);
+        let meter = Meter::new();
+        let (_source, source_rx) = watch::channel(None);
+        let (speech_tx, mut speech) = mpsc::unbounded_channel();
+        let task = tokio::spawn(forward_mic(mic, meter.clone(), source_rx, speech_tx));
+        for open in [false, true, true, false, false, true] {
+            meter.update(-30.0, open);
+            frames.send(vec![0; 480]).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        drop(frames);
+        task.await.unwrap();
+        let mut got = Vec::new();
+        while let Ok((who, on)) = speech.try_recv() {
+            assert_eq!(who, LOCAL);
+            got.push(on);
+        }
+        assert_eq!(got, [true, false, true]);
+    }
 
     #[test]
     fn fala_acende_no_primeiro_bloco_e_segura_a_queda() {

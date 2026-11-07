@@ -1,6 +1,5 @@
 //! Motor de áudio: mic -> APM -> RNNoise -> gate -> sala, e sala -> mixer -> saída,
 //! com o som final como referência do eco. Fixo em 48 kHz e blocos de 10 ms.
-// Sem uso até a call e a interface chegarem nesta branch.
 #[cfg(test)]
 mod bancada;
 mod device;
@@ -11,7 +10,11 @@ mod worker;
 
 use std::{
     collections::HashMap,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -51,19 +54,41 @@ pub const MANUAL_MIN_DB: f32 = -80.0;
 pub const MANUAL_MAX_DB: f32 = 0.0;
 pub const MANUAL_DEFAULT_DB: f32 = -40.0;
 
+/// Quanto o medidor cai por bloco de 10 ms: do topo ao fundo em 600 ms.
+const METER_DECAY_DB: f32 = (MANUAL_MAX_DB - MANUAL_MIN_DB) / 60.0;
+
 /// Leitura do mic pra interface e pra sala, sem travar a thread de áudio.
 #[derive(Clone)]
-pub struct Meter {}
+pub struct Meter {
+    /// Bits do `f32`: não existe `AtomicF32`.
+    level: Arc<AtomicU32>,
+    open: Arc<AtomicBool>,
+}
 
 impl Meter {
-    /// Nível atual em dBFS, já com o decaimento do medidor.
+    pub(crate) fn new() -> Self {
+        Meter {
+            level: Arc::new(AtomicU32::new(MANUAL_MIN_DB.to_bits())),
+            open: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Nível atual em dBFS, já com o decaimento do medidor. Nunca abaixo de
+    /// [`MANUAL_MIN_DB`].
     pub fn level_db(&self) -> f32 {
-        todo!()
+        f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
     /// O limitador está deixando o mic passar.
     pub fn open(&self) -> bool {
-        todo!()
+        self.open.load(Ordering::Relaxed)
+    }
+
+    /// Só a thread de áudio escreve, então ler e gravar em duas etapas não perde nada.
+    pub(crate) fn update(&self, db: f32, open: bool) {
+        let shown = db.max(self.level_db() - METER_DECAY_DB);
+        self.level.store(shown.to_bits(), Ordering::Relaxed);
+        self.open.store(open, Ordering::Relaxed);
     }
 }
 
@@ -104,6 +129,7 @@ pub fn devices() -> Devices {
 #[derive(Clone)]
 pub struct Engine {
     commands: mpsc::Sender<Command>,
+    meter: Meter,
 }
 
 impl Engine {
@@ -115,14 +141,22 @@ impl Engine {
         let (commands, received) = mpsc::channel();
         let (frames, mic) = tokio::sync::mpsc::channel(MIC_QUEUE);
         let (ready, started) = mpsc::channel();
+        let meter = Meter::new();
+        let reader = meter.clone();
         thread::Builder::new()
             .name("concord-audio".into())
-            .spawn(move || worker::run(prefs, received, frames, ready))
+            .spawn(move || worker::run(prefs, meter, received, frames, ready))
             .map_err(|e| e.to_string())?;
         started
             .recv()
             .map_err(|_| "thread de áudio caiu".to_string())??;
-        Ok((Engine { commands }, mic))
+        Ok((
+            Engine {
+                commands,
+                meter: reader,
+            },
+            mic,
+        ))
     }
 
     fn send(&self, command: Command) {
@@ -149,14 +183,14 @@ impl Engine {
         self.send(Command::Person(name.to_string(), slider));
     }
 
+    /// Vale na hora, sem recriar o APM: a adaptação do eco continua.
     pub fn set_sensitivity(&self, sensitivity: Sensitivity) {
-        let _ = sensitivity;
-        todo!()
+        self.send(Command::Sensitivity(sensitivity));
     }
 
     /// Mede também com o mic mudo.
     pub fn meter(&self) -> Meter {
-        todo!()
+        self.meter.clone()
     }
 
     pub fn set_noise(&self, level: NoiseLevel) {
@@ -214,6 +248,31 @@ mod tests {
     fn handles_cruzam_threads() {
         fn cross<T: Send + Sync>() {}
         cross::<Engine>();
+        cross::<Meter>();
         cross::<VoiceSink>();
+    }
+
+    #[test]
+    fn medidor_sobe_na_hora_e_cai_suave() {
+        let meter = Meter::new();
+        let reader = meter.clone();
+        assert_eq!(reader.level_db(), MANUAL_MIN_DB);
+        assert!(!reader.open());
+
+        meter.update(-20.0, true);
+        assert_eq!(reader.level_db(), -20.0, "sobe no primeiro bloco");
+        assert!(reader.open());
+
+        meter.update(-70.0, false);
+        assert_eq!(reader.level_db(), -20.0 - METER_DECAY_DB, "cai um degrau");
+        assert!(!reader.open());
+
+        meter.update(-10.0, false);
+        assert_eq!(reader.level_db(), -10.0);
+
+        for _ in 0..60 {
+            meter.update(MANUAL_MIN_DB, false);
+        }
+        assert_eq!(reader.level_db(), MANUAL_MIN_DB, "600 ms até o fundo");
     }
 }
