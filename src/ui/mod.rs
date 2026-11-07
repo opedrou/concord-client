@@ -105,6 +105,8 @@ struct Main {
     closing: Option<window::Id>,
     /// Modo em que a janela está de verdade: segue a tela cheia da transmissão assistida.
     full_window: bool,
+    /// Versão nova já baixada e instalada, que vale na próxima abertura.
+    update: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -177,6 +179,10 @@ pub enum Msg {
     BarNear(bool),
     /// Mouse no palco: onde está e se está perto do pé.
     StageMouse(iced::Point, bool),
+    /// Fim da conferência de atualização: a versão instalada, se teve.
+    Updated(Option<String>),
+    /// Clique no ícone de atualização: abre a versão nova agora.
+    RestartForUpdate,
     /// Abre e fecha a lista de áudio da transmissão no ar.
     AudioList,
     AudioChoice(Choice),
@@ -719,6 +725,22 @@ impl App {
                 }
                 Task::none()
             }
+            Msg::Updated(version) => {
+                if let Screen::Main(m) = &mut self.screen
+                    && version.is_some()
+                {
+                    m.update = version;
+                }
+                Task::none()
+            }
+            // Só fora de call: reiniciar derrubaria a sala sem o `close` limpo.
+            Msg::RestartForUpdate => match &self.screen {
+                Screen::Main(m) if m.call.is_none() && m.update.is_some() => {
+                    crate::update::restart();
+                    iced::exit()
+                }
+                _ => Task::none(),
+            },
             Msg::StageMouse(at, near) => {
                 if let Some(call) = self.call_mut() {
                     call.cursor = at;
@@ -1093,11 +1115,13 @@ impl App {
             level: MANUAL_MIN_DB,
             open: false,
             closing: None,
+            update: None,
         };
         let avatars = main.fetch_avatars();
         self.screen = Screen::Main(Box::new(main));
         Task::batch([
             avatars,
+            Task::future(async { Msg::Updated(crate::update::run().await) }),
             Task::future(async move { Msg::Channels(a.channels().await) }),
             Task::future(async move { Msg::Members(b.members().await) }),
             Task::future(async move { Msg::Presence(c.presence().await) }),

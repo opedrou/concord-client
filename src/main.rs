@@ -7,11 +7,13 @@ mod config;
 mod session;
 mod share;
 mod ui;
+mod update;
 
 use iced::{Size, window};
 use ui::{App, theme};
 
 fn main() -> iced::Result {
+    update::cleanup();
     let window = window::Settings {
         size: Size::new(1200.0, 760.0),
         min_size: Some(Size::new(860.0, 560.0)),

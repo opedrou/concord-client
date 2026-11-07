@@ -18,6 +18,8 @@ futures-util = "0.3"
 livekit = { version = "0.10", features = ["rustls-tls-native-roots"] }
 nnnoiseless = "0.5"
 rtrb = "0.4"
+# Confere o binário baixado pelo autoupdater contra o digest da release.
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.18"

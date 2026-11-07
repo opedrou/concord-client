@@ -1,0 +1,74 @@
+name: Release
+
+# Tag `v1.2.3` no main: compila Windows e Linux e publica a release com os nomes que o
+# autoupdater procura (`src/update.rs`). O GitHub calcula o SHA-256 de cada arquivo.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            built: target/release/concord-client.exe
+            asset: concord-client-windows-x86_64.exe
+          - os: ubuntu-latest
+            built: target/release/concord-client
+            asset: concord-client-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag igual à versão do Cargo.toml
+        shell: bash
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $v"; exit 1; }
+      # ponytail: lista de pacotes do Linux não testada no Actions; ajustar
+      # pelo que o build local pedir.
+      - name: Dependências do Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libglib2.0-dev libx11-dev libxext-dev libxfixes-dev \
+            libxdamage-dev libxrandr-dev libxcomposite-dev libxtst-dev libdrm-dev libgbm-dev \
+            libva-dev libpipewire-0.3-dev libdbus-1-dev
+      - run: rustup update stable && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Compila
+        shell: bash
+        env:
+          LIBCLANG_PATH: ${{ runner.os == 'Windows' && 'C:\Program Files\LLVM\bin' || '' }}
+        run: cargo build --release
+      - shell: bash
+        run: cp "${{ matrix.built }}" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publica a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            concord-client-windows-x86_64.exe concord-client-linux-x86_64 \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

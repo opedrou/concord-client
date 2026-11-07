@@ -30,6 +30,7 @@ const VIDEO: &[u8] = icon!("video");
 pub const SCREEN: &[u8] = icon!("screen-share");
 pub const CLOSE: &[u8] = icon!("close");
 pub const MARK: &[u8] = icon!("mark");
+pub const DOWNLOAD: &[u8] = icon!("download");
 
 pub fn icon<'a>(bytes: &'static [u8], size: f32, color: Color) -> Element<'a, Msg> {
     svg(svg::Handle::from_memory(bytes))
@@ -55,8 +56,29 @@ pub fn mark<'a>(size: f32) -> Element<'a, Msg> {
 }
 
 pub fn view<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
+    // Versão nova já instalada: seta verde discreta, que abre a nova fora de call.
+    let update = m.update.as_deref().map(|version| {
+        let tip = if m.call.is_some() {
+            format!("Versão {version} baixada. Vale na próxima vez que tu abrir o Concord.")
+        } else {
+            format!("Versão {version} baixada. Clique pra reiniciar agora.")
+        };
+        let arrow = button(container(icon(DOWNLOAD, 18.0, GREEN)).center(28))
+            .padding(0)
+            .style(theme::ghost)
+            .on_press_maybe(m.call.is_none().then_some(Msg::RestartForUpdate));
+        tooltip(
+            arrow,
+            container(text(tip).size(12.5))
+                .padding([6, 10])
+                .style(theme::tooltip),
+            tooltip::Position::Bottom,
+        )
+    });
     let brand = container(
         row![mark(34.0), text("Concord").size(17).font(theme::DISPLAY)]
+            .push(space().width(Length::Fill))
+            .push(update)
             .spacing(11)
             .align_y(Alignment::Center),
     )
