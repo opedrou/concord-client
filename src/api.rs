@@ -96,6 +96,21 @@ pub struct Member {
     pub avatar_url: Option<String>,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionDetails {
+    pub server_url: String,
+    pub participant_token: String,
+}
+
+impl fmt::Debug for ConnectionDetails {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionDetails")
+            .field("server_url", &self.server_url)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Deserialize)]
 struct PresenceBody {
     channels: Vec<PresenceChannel>,
@@ -232,6 +247,21 @@ impl Client {
 
     pub async fn channels(&self) -> Result<Vec<Channel>, Error> {
         self.json("/api/channels").await
+    }
+
+    /// Token da sala, válido por 5 min. `tab` vira o sufixo da identity: fixo por
+    /// instalação, pra sessão antiga cair sozinha ao reconectar.
+    pub async fn connection_details(
+        &self,
+        room: &str,
+        tab: &str,
+    ) -> Result<ConnectionDetails, Error> {
+        let req = self
+            .get("/api/connection-details")
+            .query(&[("roomName", room), ("tabSessionId", tab)]);
+        let resp = req.send().await.map_err(|_| Error::Offline)?;
+        let bytes = read_limited(check(resp)?, MAX_JSON).await?;
+        serde_json::from_slice(&bytes).map_err(|_| Error::NotConcord)
     }
 
     pub async fn presence(&self) -> Result<Presence, Error> {

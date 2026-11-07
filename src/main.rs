@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod audio;
+mod call;
 mod config;
 mod session;
 mod ui;
