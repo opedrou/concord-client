@@ -2422,6 +2422,32 @@ mod tests {
             default_font: theme::BODY,
             ..Settings::default()
         };
+        // Seletor do Windows, que no Linux não abre: nome comprido corta na miniatura.
+        let janela = |id, title: &str| {
+            let source = crate::share::Source {
+                window: true,
+                id,
+                title: title.into(),
+            };
+            (source, None)
+        };
+        call_of(&mut a).set_share_tab(true);
+        call_of(&mut a).set_share_sources(vec![
+            janela(
+                1,
+                "Concord - chamada de voz self-hosted, sem anúncio - Google Chrome",
+            ),
+            janela(2, "Spotify"),
+            janela(3, "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"),
+            janela(4, "Planilha de gastos de novembro.xlsx - Excel"),
+        ]);
+        if let Screen::Main(m) = &a.screen {
+            let seletor = stage::picker(m.call.as_ref().unwrap(), &a.config);
+            let mut ui = Simulator::with_size(settings.clone(), Size::new(660.0, 480.0), seletor);
+            let foto = ui.snapshot(&a.theme()).unwrap();
+            assert!(foto.matches_image("snapshots/tela-seletor.png").unwrap());
+        }
+        call_of(&mut a).set_share_tab(false);
         let mut ui = Simulator::with_size(settings, Size::new(1200.0, 760.0), a.view());
         ui.click("Transmitir").unwrap();
         ui.click("Sair").unwrap();

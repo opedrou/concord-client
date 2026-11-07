@@ -14,6 +14,10 @@ use iced::{Size, window};
 use ui::{App, theme};
 
 fn main() -> iced::Result {
+    #[cfg(windows)]
+    if update::setup() {
+        return Ok(());
+    }
     update::cleanup();
     #[cfg(target_os = "linux")]
     update::register();

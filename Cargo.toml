@@ -6,7 +6,8 @@ license = "MIT"
 description = "Cliente desktop nativo do Concord"
 
 [dependencies]
-iced = { version = "0.14", features = ["wgpu", "tokio", "image", "svg"] }
+# `advanced`: mede texto pra cortar com reticências (`ui::stage`).
+iced = { version = "0.14", features = ["wgpu", "tokio", "image", "svg", "advanced"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +26,16 @@ sha2 = "0.10"
 cpal = "0.18"
 # Áudio da transmissão: WASAPI process loopback, como no spike.
 wasapi = "0.26"
+# Atalho no Menu Iniciar e "Aplicativos instalados" (`update::win`). A mesma versão que o
+# `wasapi` já puxa.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+] }
 
 # O libwebrtc embute `pw_*` vazios: linkar libpipewire derruba o processo. Por isso
 # `cpal` só pelo backend PulseAudio.
