@@ -11,6 +11,9 @@ use std::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+#[cfg(windows)]
+mod win;
+
 const LATEST: &str = "https://api.github.com/repos/opedrou/concord-client/releases/latest";
 
 /// Nome do binário de cada sistema na release. O CI de release sobe com estes nomes.
@@ -95,6 +98,67 @@ fn desktop_entry(exe: &Path, icon: &Path) -> String {
          StartupWMClass={APP_ID}\n",
         icon.display()
     )
+}
+
+/// No Windows, vira programa instalado ([`win`]). O exe baixado se copia pra pasta fixa se
+/// ainda não tem cópia lá, abre a cópia e sai; se já tem, só abre ela, que se atualiza
+/// sozinha. Devolve `true` quando este processo deve sair: abriu a instalada ou desinstalou.
+#[cfg(windows)]
+pub fn setup() -> bool {
+    let Some(target) = win::exe() else {
+        return false;
+    };
+    if std::env::args_os().any(|a| a == "--uninstall") {
+        win::uninstall();
+        return true;
+    }
+    let Some(exe) = installed() else {
+        return false;
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let relaunched = std::env::var_os(RELAUNCHED).is_some();
+    match launch(&canon(&exe), &canon(&target), target.exists(), relaunched) {
+        Launch::Installed => {
+            win::register(&target);
+            false
+        }
+        Launch::Copy => win::copy(&exe, &target).is_ok() && win::open(&target),
+        Launch::Open => win::open(&target),
+    }
+}
+
+/// Variável que a cópia de fora passa ao abrir a instalada.
+#[cfg_attr(not(windows), allow(dead_code))]
+const RELAUNCHED: &str = "CONCORD_INSTALLED";
+
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum Launch {
+    /// É a cópia instalada: confere atalho e registro, e segue.
+    Installed,
+    /// Não tem cópia instalada: copia, abre ela e sai.
+    Copy,
+    /// Já tem cópia instalada: só abre ela e sai. Nunca sobrescreve, nem com versão mais
+    /// nova, que ela baixa sozinha.
+    Open,
+}
+
+/// O que o Windows faz ao abrir, pelo caminho deste exe e o da instalação. `relaunched`
+/// conta como instalada: se a comparação errar, abre a cópia uma vez só, sem laço.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn launch(exe: &Path, target: &Path, exists: bool, relaunched: bool) -> Launch {
+    // O Windows ignora maiúscula, e o `canonicalize` põe `\\?\` na frente.
+    let plain = |p: &Path| {
+        let p = p.to_string_lossy();
+        p.trim_start_matches(r"\\?\").to_lowercase()
+    };
+    if relaunched || plain(exe) == plain(target) {
+        Launch::Installed
+    } else if exists {
+        Launch::Open
+    } else {
+        Launch::Copy
+    }
 }
 
 /// Apaga o `.old` da troca anterior. Chamar ao abrir.
@@ -239,6 +303,26 @@ mod tests {
         );
         assert!(e.contains("Icon=/d/concord/icon.png\n"));
         assert!(e.contains("StartupWMClass=concord\n"));
+    }
+
+    #[test]
+    fn windows_copia_abre_ou_segue_conforme_o_caminho() {
+        let alvo = Path::new(r"C:\Users\Ana\AppData\Local\Programs\Concord\Concord.exe");
+        let baixado = Path::new(r"C:\Users\Ana\Downloads\concord-client-windows-x86_64.exe");
+        assert_eq!(launch(baixado, alvo, false, false), Launch::Copy);
+        assert_eq!(
+            launch(baixado, alvo, true, false),
+            Launch::Open,
+            "nunca sobrescreve"
+        );
+        assert_eq!(launch(alvo, alvo, true, false), Launch::Installed);
+        let canonico = Path::new(r"\\?\c:\users\ana\appdata\local\programs\concord\CONCORD.EXE");
+        assert_eq!(launch(canonico, alvo, true, false), Launch::Installed);
+        assert_eq!(
+            launch(baixado, alvo, true, true),
+            Launch::Installed,
+            "aberto pela cópia de fora não abre de novo"
+        );
     }
 
     #[test]
