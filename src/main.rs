@@ -15,10 +15,17 @@ use ui::{App, theme};
 
 fn main() -> iced::Result {
     update::cleanup();
+    #[cfg(target_os = "linux")]
+    update::register();
     let window = window::Settings {
         size: Size::new(1200.0, 760.0),
         min_size: Some(Size::new(860.0, 560.0)),
         icon: icon::window(),
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: update::APP_ID.into(),
+            ..Default::default()
+        },
         // Com call ativa, a saída espera o `Ended` antes de fechar.
         exit_on_close_request: false,
         ..window::Settings::default()

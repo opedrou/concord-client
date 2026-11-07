@@ -45,6 +45,58 @@ fn is_newer(tag: &str, current: &str) -> bool {
     matches!((parse(tag), parse(current)), (Some(t), Some(c)) if t > c)
 }
 
+/// Id da janela no Wayland. O GNOME casa a janela com o `.desktop` de mesmo nome pra mostrar
+/// o ícone; sem ele aparece a engrenagem genérica.
+pub const APP_ID: &str = "concord";
+
+/// No Linux, põe o app no menu: `.desktop` apontando pra este executável, e o ícone. Só na
+/// cópia instalada, e só reescreve o que mudou (o caminho muda se a pessoa mover o arquivo).
+#[cfg(target_os = "linux")]
+pub fn register() {
+    let Some(exe) = installed() else { return };
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    let Some(data) = data else { return };
+    let icon = data.join("concord/icon.png");
+    let entry = data.join(format!("applications/{APP_ID}.desktop"));
+    let _ = write_if_changed(&icon, crate::icon::PNG);
+    let _ = write_if_changed(&entry, desktop_entry(&exe, &icon).as_bytes());
+}
+
+#[cfg(target_os = "linux")]
+fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if std::fs::read(path).is_ok_and(|old| old == bytes) {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, bytes)
+}
+
+/// `Exec` entre aspas, porque o caminho pode ter espaço. Escapes da especificação: dentro
+/// das aspas `"`, `` ` `` e `$` levam `\\`, a barra vira quatro, e `%` vira `%%`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn desktop_entry(exe: &Path, icon: &Path) -> String {
+    let mut quoted = String::new();
+    for c in exe.to_string_lossy().chars() {
+        match c {
+            '"' | '`' | '$' => quoted.extend(['\\', '\\', c]),
+            '\\' => quoted.push_str(r"\\\\"),
+            '%' => quoted.push_str("%%"),
+            c => quoted.push(c),
+        }
+    }
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Concord\nComment=Voz e transmissão de tela\n\
+         Exec=\"{quoted}\"\nIcon={}\nTerminal=false\nCategories=Network;Chat;\n\
+         StartupWMClass={APP_ID}\n",
+        icon.display()
+    )
+}
+
 /// Apaga o `.old` da troca anterior. Chamar ao abrir.
 pub fn cleanup() {
     if let Some(exe) = installed() {
@@ -173,6 +225,20 @@ mod tests {
         assert_eq!(std::fs::read(old_of(&exe)).unwrap(), b"velho");
         assert!(!exe.with_extension("new").exists());
         std::fs::remove_dir_all(&pasta).unwrap();
+    }
+
+    #[test]
+    fn entrada_do_menu_aguenta_caminho_estranho() {
+        let e = desktop_entry(
+            Path::new("/home/a b/50% $x/concord-client"),
+            Path::new("/d/concord/icon.png"),
+        );
+        assert!(
+            e.contains(r#"Exec="/home/a b/50%% \\$x/concord-client""#),
+            "{e}"
+        );
+        assert!(e.contains("Icon=/d/concord/icon.png\n"));
+        assert!(e.contains("StartupWMClass=concord\n"));
     }
 
     #[test]

@@ -1,10 +1,13 @@
-//! Ícone do app: a marca do Concord (três barras roxas) desenhada aqui, sem SVG.
-//! `assets/icon.png` vai na janela; `assets/icon.ico` vai no `.exe` pelo `build.rs`.
-//! Regerar: `cargo test -- --ignored gera_icone`.
+//! Ícone do app: as três barras da marca, brancas, num círculo roxo, como o favicon do site.
+//! A marca solta, roxa sem fundo, sumia no painel escuro e ficava fina em 16 px.
+//! `assets/icon.png` vai na janela e no menu do Linux; `assets/icon.ico` vai no `.exe` pelo
+//! `build.rs`. Regerar: `cargo test -- --ignored gera_icone`.
 use iced::window;
 
+pub const PNG: &[u8] = include_bytes!("../assets/icon.png");
+
 pub fn window() -> Option<window::Icon> {
-    window::icon::from_file_data(include_bytes!("../assets/icon.png"), None).ok()
+    window::icon::from_file_data(PNG, None).ok()
 }
 
 /// Barras do `mark.svg` (x, y, largura, altura) no quadro 100x100, todas com ponta redonda.
@@ -26,24 +29,38 @@ fn inside(x: f32, y: f32) -> bool {
     })
 }
 
-/// Marca em `size` x `size` RGBA, recortada em volta das barras, com 4x4 amostras por pixel.
+/// Tamanho das barras dentro do círculo.
+const ESCALA: f32 = 1.0;
+
+/// Ícone em `size` x `size` RGBA, com 4x4 amostras por pixel. Quadro 100x100: círculo de
+/// raio 50 no centro, e as barras na `ESCALA`, em volta do centro delas, (50, 51), postas no meio.
 #[cfg_attr(not(test), allow(dead_code))]
 fn render(size: u32) -> Vec<u8> {
-    // Recorte quadrado de 18 a 82: as barras ocupam quase tudo, como ícone tem que ser.
-    let (start, span) = (18.0, 64.0);
     let mut out = Vec::with_capacity((size * size * 4) as usize);
     for py in 0..size {
         for px in 0..size {
-            let mut hits = 0;
+            let (mut fundo, mut barra) = (0u32, 0u32);
             for sy in 0..4 {
                 for sx in 0..4 {
-                    let x = start + (px as f32 + (sx as f32 + 0.5) / 4.0) * span / size as f32;
-                    let y = start + (py as f32 + (sy as f32 + 0.5) / 4.0) * span / size as f32;
-                    hits += u8::from(inside(x, y));
+                    let x = (px as f32 + (sx as f32 + 0.5) / 4.0) * 100.0 / size as f32;
+                    let y = (py as f32 + (sy as f32 + 0.5) / 4.0) * 100.0 / size as f32;
+                    if (x - 50.0).powi(2) + (y - 50.0).powi(2) > 2500.0 {
+                        continue;
+                    }
+                    if inside(50.0 + (x - 50.0) / ESCALA, 51.0 + (y - 50.0) / ESCALA) {
+                        barra += 1;
+                    } else {
+                        fundo += 1;
+                    }
                 }
             }
-            out.extend_from_slice(&ROXO);
-            out.push((u32::from(hits) * 255 / 16) as u8);
+            let cobertura = fundo + barra;
+            let cor = |c: u8| match cobertura {
+                0 => 0,
+                n => ((u32::from(c) * fundo + 255 * barra) / n) as u8,
+            };
+            out.extend(ROXO.map(cor));
+            out.push((cobertura * 255 / 16) as u8);
         }
     }
     out
@@ -54,11 +71,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn barra_do_meio_aparece_e_o_canto_fica_transparente() {
+    fn barra_branca_no_circulo_roxo_e_canto_transparente() {
         let px = render(64);
-        let alpha = |x: usize, y: usize| px[(y * 64 + x) * 4 + 3];
-        assert_eq!(alpha(0, 0), 0, "canto transparente");
-        assert_eq!(alpha(32, 40), 255, "meio da barra do meio cheio");
+        let rgba = |x: usize, y: usize| &px[(y * 64 + x) * 4..][..4];
+        assert_eq!(rgba(0, 0)[3], 0, "canto transparente");
+        assert_eq!(rgba(32, 40), [255, 255, 255, 255], "meio da barra do meio");
+        assert_eq!(
+            rgba(32, 4),
+            [0x9d, 0x4e, 0xdd, 255],
+            "círculo acima das barras"
+        );
     }
 
     #[test]
