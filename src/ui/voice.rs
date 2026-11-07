@@ -52,8 +52,8 @@ pub struct ActiveCall {
     pub engine: Option<Engine>,
     /// Sem duplicados e em ordem de nome. `None` até a primeira lista da sala.
     pub live: Option<Vec<Live>>,
-    /// Nome -> última vez que falou. Quem passou de [`SPEAKING_HOLD`] sai.
-    speaking: HashMap<String, Instant>,
+    /// Nome -> quando parou de falar. Quem passou de [`SPEAKING_HOLD`] sai.
+    fading: HashMap<String, Instant>,
     /// Pessoa com o painel de volume aberto.
     pub volume_panel: Option<String>,
 }
@@ -67,7 +67,7 @@ impl ActiveCall {
             call: None,
             engine: None,
             live: None,
-            speaking: HashMap::new(),
+            fading: HashMap::new(),
             volume_panel: None,
         }
     }
@@ -116,26 +116,37 @@ impl ActiveCall {
             .filter_map(|id| by_identity.remove(id).cloned())
             .collect();
 
+        // O evento só chega quando o estado muda: o hold conta a partir de quem parou,
+        // não de quem começou.
         let names: HashSet<&str> = live.iter().map(name_of).collect();
-        self.speaking.retain(|n, _| names.contains(n.as_str()));
-        for l in live.iter().filter(|l| l.speaking) {
-            self.speaking.insert(name_of(l).to_owned(), now);
+        let talking: HashSet<&str> = live.iter().filter(|l| l.speaking).map(name_of).collect();
+        for l in self.live.iter().flatten().filter(|l| l.speaking) {
+            if names.contains(name_of(l)) && !talking.contains(name_of(l)) {
+                self.fading.insert(name_of(l).to_owned(), now);
+            }
         }
+        self.fading
+            .retain(|n, _| names.contains(n.as_str()) && !talking.contains(n.as_str()));
         self.live = Some(live);
     }
 
     pub fn tick(&mut self, now: Instant) {
-        self.speaking
+        self.fading
             .retain(|_, t| now.saturating_duration_since(*t) < SPEAKING_HOLD);
     }
 
     pub fn speaking(&self, name: &str) -> bool {
-        self.speaking.contains_key(name)
+        self.fading.contains_key(name)
+            || self
+                .live
+                .iter()
+                .flatten()
+                .any(|l| l.speaking && name_of(l) == name)
     }
 
     /// Pede quadros de relógio só enquanto algum anel pode estar por apagar.
     pub fn holding(&self) -> bool {
-        !self.speaking.is_empty()
+        !self.fading.is_empty()
     }
 }
 
@@ -265,17 +276,19 @@ mod tests {
     }
 
     #[test]
-    fn anel_acende_na_hora_e_apaga_depois_de_400_ms() {
+    fn anel_fica_aceso_enquanto_fala_e_apaga_400_ms_depois_de_parar() {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
         let mut c = ActiveCall::new(1, "call".into());
         c.participants(vec![live("Ana", true)], t0);
-        assert!(c.speaking("Ana") && c.holding());
+        c.tick(ms(5000));
+        assert!(c.speaking("Ana"), "segue aceso sem evento novo");
+        assert!(!c.holding(), "falando não precisa de relógio");
 
-        c.participants(vec![live("Ana", false)], ms(100));
-        c.tick(ms(399));
-        assert!(c.speaking("Ana"), "segura durante o hold");
-        c.tick(ms(400));
+        c.participants(vec![live("Ana", false)], ms(5000));
+        c.tick(ms(5399));
+        assert!(c.speaking("Ana") && c.holding(), "segura durante o hold");
+        c.tick(ms(5400));
         assert!(!c.speaking("Ana") && !c.holding());
     }
 
@@ -285,10 +298,13 @@ mod tests {
         let ms = |n| t0 + Duration::from_millis(n);
         let mut c = ActiveCall::new(1, "call".into());
         c.participants(vec![live("Ana", true)], t0);
+        c.participants(vec![live("Ana", false)], ms(100));
         c.participants(vec![live("Ana", true)], ms(300));
-        c.tick(ms(600));
+        assert!(c.speaking("Ana") && !c.holding());
+        c.participants(vec![live("Ana", false)], ms(400));
+        c.tick(ms(799));
         assert!(c.speaking("Ana"));
-        c.tick(ms(700));
+        c.tick(ms(800));
         assert!(!c.speaking("Ana"));
     }
 

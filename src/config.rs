@@ -81,6 +81,7 @@ impl Config {
             input: self.input.clone(),
             output: self.output.clone(),
             noise: self.noise,
+            sensitivity: Default::default(),
             master: self.master_volume,
             volumes: self.volumes.clone(),
         }

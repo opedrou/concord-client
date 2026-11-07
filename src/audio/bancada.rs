@@ -91,6 +91,7 @@ fn prefs(noise: NoiseLevel) -> AudioPrefs {
         input: Some(MIC.into()),
         output: Some(FONE.into()),
         noise,
+        sensitivity: Sensitivity::Auto,
         master: 71,
         volumes: HashMap::new(),
     }

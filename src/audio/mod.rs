@@ -36,12 +36,44 @@ pub enum NoiseLevel {
     Rnnoise,
 }
 
+/// Quando o mic abre, como a sensibilidade de entrada do Discord.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum Sensitivity {
+    /// Detecta voz: ruído e clique de teclado não abrem.
+    #[default]
+    Auto,
+    /// Abre com o nível acima deste valor, em dBFS.
+    Manual(f32),
+}
+
+/// Faixa do slider de sensibilidade manual, em dBFS.
+pub const MANUAL_MIN_DB: f32 = -80.0;
+pub const MANUAL_MAX_DB: f32 = 0.0;
+pub const MANUAL_DEFAULT_DB: f32 = -40.0;
+
+/// Leitura do mic pra interface e pra sala, sem travar a thread de áudio.
+#[derive(Clone)]
+pub struct Meter {}
+
+impl Meter {
+    /// Nível atual em dBFS, já com o decaimento do medidor.
+    pub fn level_db(&self) -> f32 {
+        todo!()
+    }
+
+    /// O limitador está deixando o mic passar.
+    pub fn open(&self) -> bool {
+        todo!()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioPrefs {
     /// Nome do dispositivo; `None` usa o padrão do sistema.
     pub input: Option<String>,
     pub output: Option<String>,
     pub noise: NoiseLevel,
+    pub sensitivity: Sensitivity,
     /// Slider de 0 a 100; ver [`gain`].
     pub master: u8,
     /// Nome da pessoa -> slider.
@@ -115,6 +147,16 @@ impl Engine {
     /// Vale para todas as faixas de voz dessa pessoa, atuais e futuras.
     pub fn set_person_volume(&self, name: &str, slider: u8) {
         self.send(Command::Person(name.to_string(), slider));
+    }
+
+    pub fn set_sensitivity(&self, sensitivity: Sensitivity) {
+        let _ = sensitivity;
+        todo!()
+    }
+
+    /// Mede também com o mic mudo.
+    pub fn meter(&self) -> Meter {
+        todo!()
     }
 
     pub fn set_noise(&self, level: NoiseLevel) {

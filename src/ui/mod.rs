@@ -1341,9 +1341,18 @@ mod tests {
         assert_eq!(nomes, ["ana", "Zé"]);
         assert!(call_of(&mut a).speaking("Zé"));
 
-        let _ = a.update(Msg::Frame(antes + Duration::from_millis(300)));
+        let _ = a.update(Msg::Frame(antes + Duration::from_secs(5)));
+        assert!(call_of(&mut a).speaking("Zé"), "falando não apaga sozinho");
+
+        let lista = vec![
+            voice::test_live("Zé", false),
+            voice::test_live("ana", false),
+        ];
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
+        let parou = Instant::now();
+        let _ = a.update(Msg::Frame(parou + Duration::from_millis(300)));
         assert!(call_of(&mut a).speaking("Zé"));
-        let _ = a.update(Msg::Frame(antes + Duration::from_secs(1)));
+        let _ = a.update(Msg::Frame(parou + Duration::from_secs(1)));
         assert!(!call_of(&mut a).speaking("Zé"));
     }
 
