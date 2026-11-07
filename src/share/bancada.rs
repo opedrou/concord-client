@@ -49,10 +49,16 @@ fn padrao(w: usize, h: usize) -> Vec<u8> {
 }
 
 fn sintetica(fps: u32, stop: &AtomicBool, mut feed: Feed) {
-    ABERTAS.fetch_add(1, Ordering::SeqCst);
+    // A segunda abertura é a da troca: outra tela, de outro tamanho.
+    let troca = ABERTAS.fetch_add(1, Ordering::SeqCst) > 0;
     VIVAS.fetch_add(1, Ordering::SeqCst);
     const FOLGA: usize = 2048;
-    let tela = std::env::var("FONTE").unwrap_or_else(|_| "2560x1440".into());
+    let (var, padrao_tela) = if troca {
+        ("FONTE2", "1280x1024")
+    } else {
+        ("FONTE", "2560x1440")
+    };
+    let tela = std::env::var(var).unwrap_or_else(|_| padrao_tela.into());
     let (w, h) = tela.split_once('x').expect("FONTE");
     let (w, h): (usize, usize) = (w.parse().unwrap(), h.parse().unwrap());
     let image = padrao(w + FOLGA, h + 1);
@@ -117,6 +123,7 @@ impl Banca {
             cmds,
             room_rx,
             sintetica,
+            Preview::default(),
             move |s| {
                 let _ = states.send(s);
             },
@@ -330,6 +337,64 @@ async fn bancada_tela_retomada() {
     }
 
     assert_eq!(ABERTAS.load(Ordering::SeqCst), 1, "abriu o seletor de novo");
+    banca.parar(&me).await;
+    let _ = room.close().await;
+    println!("FIM");
+}
+
+/// Troca de tela no ar com o Chrome assistindo: a faixa é a mesma do começo ao fim, o
+/// tamanho muda e os quadros não param. Com o `npm run dev` do site e as variáveis do
+/// `bancada.sh`: `cargo test bancada_tela_troca -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bancada_tela_troca() {
+    let client = cliente().await;
+    let room = entrar(&client).await;
+    let me = room.local_participant();
+    let mut banca = Banca::new(me.clone());
+    banca.ao_vivo(&me, Quality::Media).await;
+    andando(&me).await;
+    let antes = tela(&me).expect("publicada").sid();
+
+    let web = tokio::task::spawn_blocking(|| {
+        Command::new("node")
+            .arg("src/share/assiste-troca.mjs")
+            .output()
+            .expect("node")
+    });
+    // O Chrome entra, clica em Assistir e já está medindo quando a troca sai.
+    sleep(Duration::from_secs(15)).await;
+    banca.cmd.send(Cmd::Swap(None)).unwrap();
+    println!("TROCOU");
+    sleep(SELETOR + Duration::from_secs(2)).await;
+    assert_eq!(ABERTAS.load(Ordering::SeqCst), 2);
+    assert_eq!(VIVAS.load(Ordering::SeqCst), 1, "a captura antiga não saiu");
+    assert_eq!(tela(&me).expect("despublicou").sid(), antes, "republicou");
+    andando(&me).await;
+
+    let web = web.await.unwrap();
+    let saida = String::from_utf8_lossy(&web.stdout);
+    println!("{saida}{}", String::from_utf8_lossy(&web.stderr));
+    let linha = |nome: &str| {
+        saida
+            .lines()
+            .find_map(|l| l.strip_prefix(nome))
+            .unwrap_or_else(|| panic!("faltou {nome}"))
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(
+        linha("FAIXAS").matches(',').count(),
+        0,
+        "o Chrome viu outra faixa"
+    );
+    assert_eq!(linha("SEM_VIDEO"), "0", "o vídeo sumiu no meio");
+    assert!(
+        linha("TAMANHOS").contains("900x720"),
+        "o Chrome não viu a tela nova"
+    );
+    assert!(banca.estados.try_recv().is_err(), "a troca mexeu no estado");
+
     banca.parar(&me).await;
     let _ = room.close().await;
     println!("FIM");

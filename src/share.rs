@@ -9,7 +9,7 @@ mod loopback;
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -30,7 +30,8 @@ use livekit::{
         },
         native::yuv_helper,
         prelude::{
-            I420Buffer, RtcAudioSource, RtcVideoSource, VideoFrame, VideoResolution, VideoRotation,
+            I420Buffer, RtcAudioSource, RtcVideoSource, VideoBuffer, VideoFormatType, VideoFrame,
+            VideoResolution, VideoRotation,
         },
         video_source::native::NativeVideoSource,
     },
@@ -148,9 +149,8 @@ impl std::fmt::Display for Source {
     }
 }
 
-/// Miniatura RGBA do seletor.
+/// Miniatura RGBA do seletor, e a prévia da própria transmissão.
 #[derive(Clone, Debug)]
-#[cfg_attr(not(windows), allow(dead_code))]
 pub struct Thumb {
     pub width: u32,
     pub height: u32,
@@ -184,7 +184,6 @@ fn thumb_of(bgra: &[u8], stride: u32, width: u32, height: u32) -> Thumb {
 /// quadros pra entregar o primeiro.
 #[cfg(windows)]
 fn snapshot(kind: DesktopCaptureSourceType, id: u64) -> Option<Thumb> {
-    use std::sync::Mutex;
     let mut capturer = DesktopCapturer::new(DesktopCapturerOptions::new(kind))?;
     let source = capturer
         .get_source_list()
@@ -254,6 +253,9 @@ pub enum Cmd {
     /// Qualidade, se leva o áudio junto e, no Windows, o que transmitir (`None`: a
     /// primeira tela).
     Start(Quality, bool, Option<Source>),
+    /// Troca o que sai sem despublicar: no Windows, o alvo do seletor; no Linux, `None` abre
+    /// o portal de novo.
+    Swap(Option<Source>),
     Stop,
     /// Troca o áudio de uma transmissão no ar.
     Audio(Choice),
@@ -275,13 +277,42 @@ enum Note {
     Failed,
 }
 
+/// Largura da prévia própria, perto da de um tile.
+// ponytail: fixa; tile bem maior que isso estica a prévia, e aí vale passar a largura dele.
+const PREVIEW_WIDTH: u32 = 480;
+/// Uma prévia a cada 200 ms: 5 por segundo.
+const PREVIEW_EVERY: Duration = Duration::from_millis(200);
+
+/// Prévia da própria transmissão, pro tile local: o quadro mais novo, já pequeno. Pausada
+/// (janela sem foco), o [`Feed`] nem converte.
+#[derive(Clone, Default)]
+pub struct Preview {
+    picture: Arc<Mutex<Option<Thumb>>>,
+    paused: Arc<AtomicBool>,
+}
+
+impl Preview {
+    pub fn take(&self) -> Option<Thumb> {
+        self.picture.lock().unwrap().take()
+    }
+
+    pub fn pause(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+}
+
 /// Saída da thread de captura: reduz cada quadro e entrega à fonte de vídeo. Leva junto o
 /// alvo escolhido no seletor do Windows.
 pub struct Feed {
     limit: Option<(u32, u32)>,
+    /// Na troca já vem com a fonte publicada: a faixa segue a mesma.
     source: Option<NativeVideoSource>,
     notes: UnboundedSender<Note>,
     target: Option<Source>,
+    /// Já avisou o primeiro quadro.
+    started: bool,
+    preview: Preview,
+    previewed: Option<Instant>,
 }
 
 impl Feed {
@@ -299,30 +330,55 @@ impl Feed {
         let (y, u, v) = full.data_mut();
         let size = (width as i32, height as i32);
         yuv_helper::argb_to_i420(argb, stride, y, sy, u, su, v, sv, size.0, size.1);
-        let buffer = if (w, h) == (width, height) {
+        let mut buffer = if (w, h) == (width, height) {
             full
         } else {
             full.scale(w as i32, h as i32)
         };
         let source = self.source.get_or_insert_with(|| {
-            let source = NativeVideoSource::new(
+            NativeVideoSource::new(
                 VideoResolution {
                     width: w,
                     height: h,
                 },
                 true,
-            );
+            )
+        });
+        if !self.started {
+            self.started = true;
             let _ = self
                 .notes
                 .send(Note::Ready(source.clone(), (width, height)));
-            source
-        });
+        }
         source.capture_frame(&VideoFrame {
             rotation: VideoRotation::VideoRotation0,
             timestamp_us: 0,
             frame_metadata: None,
             buffer: &buffer,
         });
+        self.preview(&mut buffer);
+    }
+
+    /// Prévia do quadro que acabou de sair, a cada [`PREVIEW_EVERY`] e só sem pausa.
+    fn preview(&mut self, buffer: &mut I420Buffer) {
+        let due = self.previewed.is_none_or(|t| t.elapsed() >= PREVIEW_EVERY);
+        if !due || self.preview.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        self.previewed = Some(Instant::now());
+        let limit = Some((PREVIEW_WIDTH, u32::MAX));
+        let (w, h) = fit(buffer.width(), buffer.height(), limit);
+        let small = buffer.scale(w as i32, h as i32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        // ABGR do libyuv é R, G, B, A na memória: o RGBA do iced.
+        let small: &dyn VideoBuffer = &small;
+        small.to_argb(VideoFormatType::ABGR, &mut rgba, w * 4, w as i32, h as i32);
+        let thumb = Thumb {
+            width: w,
+            height: h,
+            rgba,
+        };
+        *self.preview.picture.lock().unwrap() = Some(thumb);
     }
 
     pub fn fail(&self) {
@@ -395,42 +451,36 @@ fn pace(fps: u32, mut step: impl FnMut() -> bool) {
     }
 }
 
-/// Uma captura em andamento. Soltar pede pra thread parar, inclusive quando a tarefa da
-/// call é abortada.
-struct Running {
-    quality: Quality,
+/// Uma thread de captura. Soltar pede pra ela parar, inclusive quando a tarefa da call é
+/// abortada.
+struct Capture {
     stop: Arc<AtomicBool>,
     /// Fecha quando a thread termina.
     notes: UnboundedReceiver<Note>,
-    /// Sobrevive à troca de sala: republicar não abre o seletor de novo.
-    source: Option<NativeVideoSource>,
-    /// Publicada na sala atual.
-    published: bool,
-    with_audio: bool,
-    /// Tamanho do primeiro quadro: no Linux decide entre tela e janela.
-    #[cfg_attr(windows, allow(dead_code))]
-    frame: (u32, u32),
     /// Alvo do seletor: no Windows decide o que o áudio leva.
     #[cfg_attr(not(windows), allow(dead_code))]
     target: Option<Source>,
-    /// Nasce depois do vídeo no ar e morre com o `Running`.
-    audio: Option<Audio>,
 }
 
-impl Running {
+impl Capture {
+    /// `source` é a fonte já publicada, na troca; `None` cria uma no primeiro quadro.
     fn start(
         quality: Quality,
-        with_audio: bool,
         target: Option<Source>,
+        source: Option<NativeVideoSource>,
+        preview: &Preview,
         capture: Capturer,
     ) -> Option<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let (notes_tx, notes) = mpsc::unbounded_channel();
         let feed = Feed {
             limit: quality.limit(),
-            source: None,
+            source,
             notes: notes_tx,
             target: target.clone(),
+            started: false,
+            preview: preview.clone(),
+            previewed: None,
         };
         let flag = stop.clone();
         let runtime = Handle::current();
@@ -444,29 +494,85 @@ impl Running {
             })
             .ok()?;
         Some(Self {
-            quality,
             stop,
             notes,
-            source: None,
-            published: false,
-            with_audio,
             target,
-            frame: (0, 0),
-            audio: None,
         })
     }
 }
 
-impl Drop for Running {
+impl Drop for Capture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 }
 
-async fn next_note(share: &mut Option<Running>) -> Option<Note> {
-    match share {
-        Some(r) => r.notes.recv().await,
-        None => std::future::pending().await,
+/// Uma transmissão em andamento.
+struct Running {
+    quality: Quality,
+    capture: Capture,
+    /// Troca em andamento: vira a `capture` no primeiro quadro dela. Até lá a antiga segue
+    /// no ar, e se a troca acabar sem quadro (seletor cancelado), fica a antiga.
+    next: Option<Capture>,
+    /// Sobrevive à troca de sala e à de tela: a faixa publicada é sempre esta.
+    source: Option<NativeVideoSource>,
+    /// Publicada na sala atual.
+    published: bool,
+    with_audio: bool,
+    /// Tamanho do primeiro quadro: no Linux decide entre tela e janela.
+    #[cfg_attr(windows, allow(dead_code))]
+    frame: (u32, u32),
+    /// Nasce depois do vídeo no ar e morre com o `Running`.
+    audio: Option<Audio>,
+}
+
+impl Running {
+    fn start(
+        quality: Quality,
+        with_audio: bool,
+        target: Option<Source>,
+        preview: &Preview,
+        capture: Capturer,
+    ) -> Option<Self> {
+        Some(Self {
+            quality,
+            capture: Capture::start(quality, target, None, preview, capture)?,
+            next: None,
+            source: None,
+            published: false,
+            with_audio,
+            frame: (0, 0),
+            audio: None,
+        })
+    }
+
+    /// Primeiro quadro da troca: a captura nova assume e a antiga para. O áudio vai junto.
+    fn swapped(&mut self, frame: (u32, u32)) {
+        let Some(next) = self.next.take() else { return };
+        self.capture = next;
+        self.frame = frame;
+        #[cfg(not(windows))]
+        if let Some(a) = &self.audio {
+            a.reframe(frame);
+        }
+        #[cfg(windows)]
+        if let Some(a) = &mut self.audio {
+            a.retarget(self.capture.target.as_ref());
+        }
+    }
+}
+
+/// Próximo aviso da captura no ar ou da troca; `true` quando veio da troca.
+async fn next_note(share: &mut Option<Running>) -> (bool, Option<Note>) {
+    let Some(r) = share else {
+        return std::future::pending().await;
+    };
+    match &mut r.next {
+        Some(next) => tokio::select! {
+            n = r.capture.notes.recv() => (false, n),
+            n = next.notes.recv() => (true, n),
+        },
+        None => (false, r.capture.notes.recv().await),
     }
 }
 
@@ -521,24 +627,66 @@ async fn stop(share: &mut Option<Running>, room: &watch::Receiver<Option<LocalPa
 }
 
 /// Dono da transmissão durante a call. `room` é a sala atual, `None` entre uma conexão e
-/// outra. Só [`Cmd::Start`] abre captura, e ele só vem do clique da pessoa. `audio` recebe o
-/// estado do áudio, de outra thread.
+/// outra. Só [`Cmd::Start`] e [`Cmd::Swap`] abrem captura, e eles só vêm do clique da
+/// pessoa. `audio` recebe o estado do áudio, de outra thread; `preview`, a prévia própria.
 pub async fn run(
     mut cmds: UnboundedReceiver<Cmd>,
     mut room: watch::Receiver<Option<LocalParticipant>>,
     capture: Capturer,
+    preview: Preview,
     notify: impl Fn(State),
     audio: impl Fn(View) + Clone + Send + 'static,
 ) {
     let mut share: Option<Running> = None;
     loop {
         tokio::select! {
+            // Avisos antes dos comandos: um Trocar logo depois do primeiro quadro já acha a
+            // fonte.
+            biased;
+            note = next_note(&mut share) => match note {
+                (false, Some(Note::Ready(source, frame))) => {
+                    if let Some(r) = &mut share {
+                        r.source = Some(source);
+                        r.frame = frame;
+                    }
+                }
+                (true, Some(Note::Ready(_, frame))) => {
+                    if let Some(r) = &mut share {
+                        r.swapped(frame);
+                    }
+                }
+                // Troca sem quadro: seletor cancelado, ou a janela fechou. Fica a antiga.
+                (true, Some(Note::Failed) | None) => {
+                    if let Some(r) = &mut share {
+                        r.next = None;
+                    }
+                }
+                (false, Some(Note::Failed)) => {
+                    stop(&mut share, &room).await;
+                    notify(State::Failed);
+                }
+                // A thread acabou sozinha: portal cancelado ou encerrado por fora.
+                (false, None) => {
+                    stop(&mut share, &room).await;
+                    notify(State::Off);
+                }
+            },
             cmd = cmds.recv() => match cmd {
                 Some(Cmd::Start(quality, with_audio, target)) if share.is_none() => {
-                    share = Running::start(quality, with_audio, target, capture);
+                    // Sem sobra da transmissão anterior no tile.
+                    preview.take();
+                    share = Running::start(quality, with_audio, target, &preview, capture);
                     notify(if share.is_some() { State::Choosing } else { State::Failed });
                 }
                 Some(Cmd::Start(..)) => {}
+                // Só com a fonte criada: é nela que a captura nova entra. Outro Trocar no
+                // meio solta a troca anterior.
+                Some(Cmd::Swap(target)) => {
+                    if let Some(r) = share.as_mut().filter(|r| r.source.is_some()) {
+                        let source = r.source.clone();
+                        r.next = Capture::start(r.quality, target, source, &preview, capture);
+                    }
+                }
                 Some(Cmd::Audio(choice)) => {
                     if let Some(a) = share.as_ref().and_then(|r| r.audio.as_ref()) {
                         a.choose(choice);
@@ -549,23 +697,6 @@ pub async fn run(
                     notify(State::Off);
                 }
                 None => return,
-            },
-            note = next_note(&mut share) => match note {
-                Some(Note::Ready(source, frame)) => {
-                    if let Some(r) = &mut share {
-                        r.source = Some(source);
-                        r.frame = frame;
-                    }
-                }
-                Some(Note::Failed) => {
-                    stop(&mut share, &room).await;
-                    notify(State::Failed);
-                }
-                // A thread acabou sozinha: portal cancelado ou encerrado por fora.
-                None => {
-                    stop(&mut share, &room).await;
-                    notify(State::Off);
-                }
             },
             changed = room.changed() => {
                 if changed.is_err() {
@@ -601,7 +732,7 @@ pub async fn run(
                     #[cfg(windows)]
                     {
                         let _ = &audio;
-                        r.audio = Audio::start(r.target.as_ref());
+                        r.audio = Audio::start(r.capture.target.as_ref());
                     }
                 }
                 if let Some(a) = &r.audio {
@@ -772,6 +903,7 @@ mod tests {
                 cmds,
                 room,
                 capture,
+                Preview::default(),
                 move |s| {
                     let _ = states.send(s);
                 },
@@ -897,5 +1029,183 @@ mod tests {
         cmd.send(Cmd::Start(Quality::Media, false, None)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         assert_eq!(proximo(&mut estados).await, State::Off);
+    }
+
+    /// Um quadro pequeno: cria a fonte, ou faz a troca assumir.
+    fn quadro(feed: &mut Feed) {
+        let argb = vec![128u8; 64 * 36 * 4];
+        feed.frame(&argb, 64 * 4, 64, 36);
+    }
+
+    async fn ate(cond: impl Fn() -> bool) {
+        let inicio = Instant::now();
+        while !cond() {
+            assert!(inicio.elapsed() < ESPERA, "não aconteceu");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn troca_entra_na_mesma_fonte_e_a_antiga_so_para_no_primeiro_quadro_novo() {
+        use futures_util::StreamExt;
+        use livekit::webrtc::video_stream::native::NativeVideoStream;
+        static ABERTAS: AtomicUsize = AtomicUsize::new(0);
+        static ANTIGA: AtomicUsize = AtomicUsize::new(0);
+        static FONTE: Mutex<Option<NativeVideoSource>> = Mutex::new(None);
+        static LIBERA: AtomicBool = AtomicBool::new(false);
+        fn tela(_: u32, stop: &AtomicBool, mut feed: Feed) {
+            if ABERTAS.fetch_add(1, Ordering::SeqCst) == 0 {
+                ANTIGA.fetch_add(1, Ordering::SeqCst);
+                quadro(&mut feed);
+                *FONTE.lock().unwrap() = feed.source.clone();
+                espera_parar(stop);
+                ANTIGA.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            // A da troca fica "no seletor" até o teste liberar, e aí manda 96x54.
+            while !LIBERA.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let argb = vec![200u8; 96 * 54 * 4];
+            while !stop.load(Ordering::SeqCst) {
+                feed.frame(&argb, 96 * 4, 96, 54);
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let (cmd, mut estados, _t) = ator(tela);
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
+        assert_eq!(proximo(&mut estados).await, State::Choosing);
+        ate(|| FONTE.lock().unwrap().is_some()).await;
+        // A faixa como a sala vê: o que entrar na fonte publicada sai aqui.
+        let fonte = FONTE.lock().unwrap().clone().unwrap();
+        let faixa = LocalVideoTrack::create_video_track("t", RtcVideoSource::Native(fonte));
+        let mut sai = NativeVideoStream::new(faixa.rtc_track());
+
+        cmd.send(Cmd::Swap(None)).unwrap();
+        ate(|| ABERTAS.load(Ordering::SeqCst) == 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            ANTIGA.load(Ordering::SeqCst),
+            1,
+            "sem quadro novo, a antiga segue"
+        );
+        LIBERA.store(true, Ordering::SeqCst);
+        let nova = timeout(ESPERA, async {
+            while let Some(f) = sai.next().await {
+                if f.buffer.width() == 96 {
+                    return;
+                }
+            }
+        });
+        nova.await
+            .expect("a faixa publicada não recebeu a captura nova");
+        soltou(&ANTIGA).await;
+        assert!(estados.try_recv().is_err(), "trocar não mexe no estado");
+        cmd.send(Cmd::Stop).unwrap();
+        assert_eq!(proximo(&mut estados).await, State::Off);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelar_ou_falhar_na_troca_mantem_a_antiga_sem_falha() {
+        static ABERTAS: AtomicUsize = AtomicUsize::new(0);
+        static ANTIGA: AtomicUsize = AtomicUsize::new(0);
+        static PRONTA: AtomicBool = AtomicBool::new(false);
+        fn tela(_: u32, stop: &AtomicBool, mut feed: Feed) {
+            match ABERTAS.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    ANTIGA.fetch_add(1, Ordering::SeqCst);
+                    quadro(&mut feed);
+                    PRONTA.store(true, Ordering::SeqCst);
+                    espera_parar(stop);
+                    ANTIGA.fetch_sub(1, Ordering::SeqCst);
+                }
+                // Portal cancelado: a thread acaba sem quadro.
+                1 => {}
+                // A janela fechou entre o seletor e o clique.
+                _ => feed.fail(),
+            }
+        }
+        let (cmd, mut estados, _t) = ator(tela);
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
+        assert_eq!(proximo(&mut estados).await, State::Choosing);
+        ate(|| PRONTA.load(Ordering::SeqCst)).await;
+        for abertas in [2, 3] {
+            cmd.send(Cmd::Swap(None)).unwrap();
+            ate(|| ABERTAS.load(Ordering::SeqCst) == abertas).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ANTIGA.load(Ordering::SeqCst), 1, "a antiga segue no ar");
+        assert!(estados.try_recv().is_err(), "nem falha nem parado");
+        cmd.send(Cmd::Stop).unwrap();
+        assert_eq!(proximo(&mut estados).await, State::Off);
+        soltou(&ANTIGA).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parar_no_meio_da_troca_solta_as_duas_threads() {
+        static ABERTAS: AtomicUsize = AtomicUsize::new(0);
+        static VIVAS: AtomicUsize = AtomicUsize::new(0);
+        static PRONTA: AtomicBool = AtomicBool::new(false);
+        fn tela(_: u32, stop: &AtomicBool, mut feed: Feed) {
+            VIVAS.fetch_add(1, Ordering::SeqCst);
+            // A primeira manda um quadro; a da troca fica no seletor.
+            if ABERTAS.fetch_add(1, Ordering::SeqCst) == 0 {
+                quadro(&mut feed);
+                PRONTA.store(true, Ordering::SeqCst);
+            }
+            espera_parar(stop);
+            VIVAS.fetch_sub(1, Ordering::SeqCst);
+        }
+        let (cmd, mut estados, _t) = ator(tela);
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
+        assert_eq!(proximo(&mut estados).await, State::Choosing);
+        ate(|| PRONTA.load(Ordering::SeqCst)).await;
+        cmd.send(Cmd::Swap(None)).unwrap();
+        ate(|| VIVAS.load(Ordering::SeqCst) == 2).await;
+        cmd.send(Cmd::Stop).unwrap();
+        assert_eq!(proximo(&mut estados).await, State::Off);
+        soltou(&VIVAS).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn previa_pequena_poucas_por_segundo_e_nenhuma_sem_foco() {
+        let (notes, _avisos) = mpsc::unbounded_channel();
+        let preview = Preview::default();
+        let mut feed = Feed {
+            limit: Quality::Alta.limit(),
+            source: None,
+            notes,
+            target: None,
+            started: false,
+            preview: preview.clone(),
+            previewed: None,
+        };
+        // 1080p todo azul, em BGRA.
+        let azul = [255u8, 0, 0, 255].repeat(1920 * 1080);
+        let mut quadro = || feed.frame(&azul, 1920 * 4, 1920, 1080);
+        quadro();
+        let p = preview.take().expect("o primeiro quadro já dá prévia");
+        assert_eq!((p.width, p.height), (PREVIEW_WIDTH, 270));
+        assert_eq!(p.rgba.len(), 480 * 270 * 4);
+        let px = &p.rgba[..4];
+        assert!(
+            px[0] < 40 && px[2] > 200 && px[3] == 255,
+            "azul em RGBA: {px:?}"
+        );
+        quadro();
+        assert!(
+            preview.take().is_none(),
+            "antes de 200 ms não converte de novo"
+        );
+        thread::sleep(PREVIEW_EVERY);
+        preview.pause(true);
+        quadro();
+        assert!(preview.take().is_none(), "sem foco não converte");
+        preview.pause(false);
+        quadro();
+        assert!(
+            preview.take().is_some(),
+            "com foco volta no quadro seguinte"
+        );
     }
 }

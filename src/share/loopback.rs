@@ -35,24 +35,40 @@ impl Loopback {
     /// `None` em `target` é a primeira tela. Volta `None` se o Windows recusar o loopback
     /// (anterior ao 10 20H2) ou a janela já tiver fechado.
     pub fn start(target: Option<&Source>) -> Option<Self> {
-        let (pid, include) = match target {
-            Some(t) if t.window => (window_pid(t.id)?, true),
-            _ => (std::process::id(), false),
-        };
         // Sem AEC, NS nem AGC: são feitos pra voz e mutilam música e jogo.
         let source = NativeAudioSource::new(AudioSourceOptions::default(), RATE, CHANNELS, 0);
-        let stop = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready) = mpsc::channel();
-        let (feed, flag) = (source.clone(), stop.clone());
-        thread::Builder::new()
-            .name("concord-tela-som".into())
-            .spawn(move || capture(pid, include, &flag, &feed, ready_tx))
-            .ok()?;
-        ready.recv().ok()?.then_some(Self { source, stop })
+        let stop = open(target, &source)?;
+        Some(Self { source, stop })
     }
 
     /// No Windows o que vai é o que foi escolhido no seletor: não há troca no ar.
     pub fn choose(&self, _: super::Choice) {}
+
+    /// A transmissão trocou de alvo: o loopback troca junto, na mesma fonte, e a faixa
+    /// publicada segue a mesma. Se o novo não abrir, fica mudo: o som do alvo antigo não
+    /// combina com a imagem nova.
+    pub fn retarget(&mut self, target: Option<&Source>) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(stop) = open(target, &self.source) {
+            self.stop = stop;
+        }
+    }
+}
+
+/// Abre o loopback do alvo numa thread que entrega em `source`. Devolve o pedido de parar.
+fn open(target: Option<&Source>, source: &NativeAudioSource) -> Option<Arc<AtomicBool>> {
+    let (pid, include) = match target {
+        Some(t) if t.window => (window_pid(t.id)?, true),
+        _ => (std::process::id(), false),
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready) = mpsc::channel();
+    let (feed, flag) = (source.clone(), stop.clone());
+    thread::Builder::new()
+        .name("concord-tela-som".into())
+        .spawn(move || capture(pid, include, &flag, &feed, ready_tx))
+        .ok()?;
+    ready.recv().ok()?.then_some(stop)
 }
 
 impl Drop for Loopback {

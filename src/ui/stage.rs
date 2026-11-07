@@ -111,7 +111,7 @@ fn focus<'a>(
     };
     let others = live
         .iter()
-        .filter(|p| p.screen_share && !p.is_local && Some(&p.identity) != call.watching.as_ref())
+        .filter(|p| p.screen_share && Some(&p.identity) != call.watching.as_ref())
         .map(|p| screen_tile(call, p, SIDE))
         .chain(live.iter().map(|p| tile(m, call, p, SIDE)));
     let side = scrollable(Column::with_children(others).spacing(GAP))
@@ -185,11 +185,8 @@ fn grid<'a>(
     live: &'a [Live],
     area: Size,
 ) -> Element<'a, Msg> {
-    // Cada transmissão alheia vira um tile próprio, antes das pessoas, como no site.
-    let screens: Vec<&Live> = live
-        .iter()
-        .filter(|p| p.screen_share && !p.is_local)
-        .collect();
+    // Cada transmissão vira um tile próprio, antes das pessoas, como no site.
+    let screens: Vec<&Live> = live.iter().filter(|p| p.screen_share).collect();
     let cells: Vec<(&Live, bool)> = screens
         .iter()
         .map(|p| (*p, true))
@@ -275,6 +272,9 @@ fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Eleme
 /// Tile da transmissão de alguém. Sem assistir: a prévia borrada e o botão. Assistindo: o
 /// vídeo, com tela cheia e parar no canto.
 fn screen_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
+    if p.is_local {
+        return own_tile(call, p, size);
+    }
     let watching = call.watching.as_ref() == Some(&p.identity);
     let mut body = stack![];
     if watching {
@@ -322,6 +322,52 @@ fn screen_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a,
         area = area.on_press(Msg::FocusScreen);
     }
     area.into()
+}
+
+/// Tile da própria transmissão: a prévia do que sai, com Trocar no canto. Sem foco a
+/// prévia para no último quadro, com o aviso.
+fn own_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
+    let preview: Element<'_, Msg> = match &call.own {
+        Some(a) => image(a.handle().clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .content_fit(ContentFit::Contain)
+            .into(),
+        None => center(text("Carregando a prévia…").size(13).color(FG2)).into(),
+    };
+    let swap = button(text("Trocar").size(12.5).font(theme::SEMIBOLD))
+        .padding([5, 10])
+        .style(theme::outline)
+        .on_press_maybe((call.share == State::Live).then_some(Msg::ShareSwap));
+    let corner = |e: Element<'a, Msg>, right: bool| {
+        let c = container(e).align_top(Length::Fill).padding(10);
+        if right {
+            c.align_right(Length::Fill)
+        } else {
+            c.align_left(Length::Fill)
+        }
+    };
+    let paused = call.preview_paused.then(|| {
+        let note = text("Prévia pausada").size(12).color(FG2);
+        corner(
+            container(note).padding([4, 9]).style(theme::pill).into(),
+            false,
+        )
+    });
+    let body = stack![preview, corner(swap.into(), true)]
+        .push(paused)
+        .push(screen_tag(p, size.width));
+    // Fundo de tile, não de palco: carregando, o tile não some no escuro.
+    container(body)
+        .width(size.width)
+        .height(size.height)
+        .clip(true)
+        .style(|_| container::Style {
+            background: Some(BG2.into()),
+            border: border::rounded(18),
+            ..Default::default()
+        })
+        .into()
 }
 
 /// Transmissão assistida em tela cheia, sem a barra lateral. A barra de controles aparece
@@ -437,6 +483,8 @@ fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element
                 .style(theme::tooltip)
                 .into()
         }
+        // O seletor do Windows aberto pelo Trocar.
+        State::Live if call.share_panel && cfg!(windows) => picker(call, config),
         State::Live => match &call.share_audio {
             Some(view) if call.audio_list => audio_card(view),
             Some(view) => audio_line(view),
@@ -611,11 +659,18 @@ fn picker<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
         .on_toggle(Msg::ShareAudio)
         .size(18)
         .text_size(14);
-    let start = button(text("Transmitir").size(14.5).font(theme::BOLD).center())
+    // Pelo Trocar, a qualidade e o áudio seguem os da transmissão no ar.
+    let swapping = call.share == State::Live;
+    let label = if swapping { "Trocar" } else { "Transmitir" };
+    let start = button(text(label).size(14.5).font(theme::BOLD).center())
         .padding([10, 22])
         .style(theme::primary)
         .on_press_maybe(call.share_source.is_some().then_some(Msg::ShareStart));
-    let foot = row![quality, space().width(Length::Fill), audio, start]
+    let foot = row![]
+        .push((!swapping).then_some(quality))
+        .push(space().width(Length::Fill))
+        .push((!swapping).then_some(audio))
+        .push(start)
         .spacing(14)
         .align_y(Alignment::Center);
 
