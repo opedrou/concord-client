@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use iced::{Point, Size};
 
 use crate::api::{self, Participant};
-use crate::audio::{Engine, MicFrames};
+use crate::audio::{Engine, Meter, MicFrames};
 use crate::call::{Call, End, Live};
 use crate::config::Config;
 
@@ -42,6 +42,15 @@ impl fmt::Debug for Boot {
     }
 }
 
+/// Motor aberto só pra medir o mic na aba Voz, sem call. Nada vai pra sala.
+pub enum Probe {
+    Off,
+    /// Abrindo; o número separa esta abertura de uma anterior que chegou atrasada.
+    Opening(u64),
+    On(Engine, Meter),
+    Failed,
+}
+
 pub struct ActiveCall {
     /// Separa esta call da anterior: eventos atrasados de quem saiu são ignorados.
     pub id: u64,
@@ -50,6 +59,8 @@ pub struct ActiveCall {
     /// `None` enquanto o motor de áudio ainda abre.
     pub call: Option<Call>,
     pub engine: Option<Engine>,
+    /// Medidor do mic da call, pra aba Voz.
+    pub meter: Option<Meter>,
     /// Sem duplicados e em ordem de nome. `None` até a primeira lista da sala.
     pub live: Option<Vec<Live>>,
     /// Nome -> quando parou de falar. Quem passou de [`SPEAKING_HOLD`] sai.
@@ -66,6 +77,7 @@ impl ActiveCall {
             status: Status::Connecting,
             call: None,
             engine: None,
+            meter: None,
             live: None,
             fading: HashMap::new(),
             volume_panel: None,
@@ -74,6 +86,7 @@ impl ActiveCall {
 
     pub fn attach(&mut self, call: Call, engine: Engine) {
         self.call = Some(call);
+        self.meter = Some(engine.meter());
         self.engine = Some(engine);
     }
 

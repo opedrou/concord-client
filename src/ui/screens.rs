@@ -1,15 +1,16 @@
 //! Telas fora da sidebar: endereço, login, offline, home e configurações.
 use iced::widget::{
-    Column, button, center, column, container, mouse_area, opaque, pick_list, row, slider, space,
-    stack, text, text_input,
+    Column, Row, button, center, column, container, mouse_area, opaque, pick_list, row, scrollable,
+    slider, space, stack, text, text_input, toggler,
 };
-use iced::{Alignment, Element, Length, Theme};
+use iced::{Alignment, Color, Element, Length, Theme};
 
 use super::sidebar::{CLOSE, icon, mark};
-use super::theme::{self, BG, DANGER, FG, FG2, IDLE};
+use super::theme::{self, BG, DANGER, FG, FG2, FG3, GREEN, IDLE};
+use super::voice::Probe;
 use super::{ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avatar};
 use crate::api::Secret;
-use crate::audio::NoiseLevel;
+use crate::audio::{MANUAL_MAX_DB, MANUAL_MIN_DB, NoiseLevel, Sensitivity};
 use crate::config::Config;
 
 /// Primeira opção das listas de dispositivo: `None` na config.
@@ -203,7 +204,11 @@ pub fn settings<'a>(m: &'a Main, config: &'a Config, tab: Tab) -> Element<'a, Ms
         .on_press(Msg::CloseSettings);
     let body = column![
         row![space::horizontal(), close],
-        container(panel).padding([0, 14])
+        // Rola quando a janela é pequena demais pro painel.
+        scrollable(container(panel).padding([0, 14]))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::thin_scroll)
     ]
     .padding(8);
 
@@ -215,8 +220,8 @@ pub fn settings<'a>(m: &'a Main, config: &'a Config, tab: Tab) -> Element<'a, Ms
             .style(theme::fill(theme::BORDER)),
         body
     ])
-    .width(640)
-    .height(440)
+    .width(680)
+    .height(520)
     .style(theme::card);
 
     stack![
@@ -346,10 +351,108 @@ fn voice_panel<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
             Msg::Output
         ),
         labeled("Redução de ruído", noise),
+        sensitivity(m, config),
         labeled("Volume geral", master),
     ]
     .spacing(14)
     .into()
+}
+
+/// Altura da faixa do medidor com o slider do limiar por cima.
+const FAIXA: f32 = 22.0;
+const BARRA: f32 = 8.0;
+/// Resolução das fatias do medidor.
+const FATIAS: f32 = 1000.0;
+
+/// Posição de um nível na faixa, de 0 a 1.
+fn fraction(db: f32) -> f32 {
+    ((db - MANUAL_MIN_DB) / (MANUAL_MAX_DB - MANUAL_MIN_DB)).clamp(0.0, 1.0)
+}
+
+/// Barra horizontal: cada trecho em sua cor, o resto no trilho. `parts` em frações da faixa.
+fn meter_bar<'a>(parts: &[(Color, f32)]) -> Element<'a, Msg> {
+    let mut bar = Row::new();
+    let (mut used, mut total) = (0, 0.0);
+    for &(color, share) in parts {
+        total += share;
+        let end = (total * FATIAS).round() as u16;
+        let width = end.saturating_sub(used);
+        used += width;
+        if width > 0 {
+            bar = bar.push(
+                container(space())
+                    .width(Length::FillPortion(width))
+                    .height(Length::Fill)
+                    .style(theme::fill(color)),
+            );
+        }
+    }
+    let rest = FATIAS as u16 - used;
+    if rest > 0 {
+        bar = bar.push(space().width(Length::FillPortion(rest)));
+    }
+    // A folga dos lados alinha a barra com o centro do marcador nas pontas.
+    container(
+        container(bar)
+            .width(Length::Fill)
+            .height(BARRA)
+            .style(theme::meter_track),
+    )
+    .padding([(FAIXA - BARRA) / 2.0, f32::from(theme::MARKER) / 2.0])
+    .into()
+}
+
+fn sensitivity<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
+    let auto = config.sensitivity == Sensitivity::Auto;
+    let toggle = toggler(auto)
+        .label("Determinar automaticamente")
+        .on_toggle(Msg::AutoSensitivity)
+        .size(20)
+        .text_size(14.4);
+    let failed = m.call.is_none() && matches!(m.probe, Probe::Failed);
+    let body: Element<'a, Msg> = if failed {
+        text("Não foi possível abrir o microfone.")
+            .size(13)
+            .color(DANGER)
+            .into()
+    } else {
+        let level = fraction(m.level);
+        match config.sensitivity {
+            Sensitivity::Auto => {
+                let color = if m.open { GREEN } else { FG3 };
+                column![
+                    meter_bar(&[(color, level)]),
+                    text("O Concord detecta quando você está falando.")
+                        .size(13)
+                        .color(FG2),
+                ]
+                .spacing(2)
+                .into()
+            }
+            Sensitivity::Manual(db) => {
+                let limit = fraction(db);
+                let bar = meter_bar(&[(IDLE, level.min(limit)), (GREEN, (level - limit).max(0.0))]);
+                let marker = slider(MANUAL_MIN_DB..=MANUAL_MAX_DB, db, Msg::Threshold)
+                    .step(1.0f32)
+                    .on_release(Msg::VolumeDone)
+                    .height(FAIXA)
+                    .style(theme::threshold);
+                column![
+                    stack![bar, marker],
+                    row![
+                        text("O microfone abre quando o nível passa da marca.")
+                            .size(13)
+                            .color(FG2),
+                        space::horizontal(),
+                        text(format!("{db:.0} dB")).size(13).font(theme::MEDIUM),
+                    ],
+                ]
+                .spacing(2)
+                .into()
+            }
+        }
+    };
+    labeled("Sensibilidade de entrada", column![toggle, body].spacing(8))
 }
 
 fn about_panel<'a>() -> Element<'a, Msg> {

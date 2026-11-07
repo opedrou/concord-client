@@ -5,7 +5,9 @@ use std::{env, fs, io, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::audio::{AudioPrefs, NoiseLevel};
+use crate::audio::{
+    AudioPrefs, MANUAL_DEFAULT_DB, MANUAL_MAX_DB, MANUAL_MIN_DB, NoiseLevel, Sensitivity,
+};
 
 pub const SIDEBAR_MIN: f32 = 200.0;
 pub const SIDEBAR_MAX: f32 = 480.0;
@@ -27,6 +29,9 @@ pub struct Config {
     pub input: Option<String>,
     pub output: Option<String>,
     pub noise: NoiseLevel,
+    pub sensitivity: Sensitivity,
+    /// Último limiar manual, guardado também com o automático ligado.
+    pub manual_db: f32,
     pub master_volume: u8,
     /// Nome da pessoa -> slider. Quem não está aqui fica em [`VOLUME_PADRAO`].
     pub volumes: HashMap<String, u8>,
@@ -44,6 +49,8 @@ impl Default for Config {
             input: None,
             output: None,
             noise: NoiseLevel::default(),
+            sensitivity: Sensitivity::default(),
+            manual_db: MANUAL_DEFAULT_DB,
             master_volume: VOLUME_PADRAO,
             volumes: HashMap::new(),
         }
@@ -63,6 +70,11 @@ impl Config {
         }
         c.sidebar_width = c.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         c.master_volume = c.master_volume.min(100);
+        c.manual_db = clamp_db(c.manual_db);
+        if let Sensitivity::Manual(db) = c.sensitivity {
+            c.manual_db = clamp_db(db);
+            c.sensitivity = Sensitivity::Manual(c.manual_db);
+        }
         c.volumes.values_mut().for_each(|v| *v = (*v).min(100));
         c
     }
@@ -81,9 +93,26 @@ impl Config {
             input: self.input.clone(),
             output: self.output.clone(),
             noise: self.noise,
-            sensitivity: Default::default(),
+            sensitivity: self.sensitivity,
             master: self.master_volume,
             volumes: self.volumes.clone(),
+        }
+    }
+
+    /// Desligar o automático volta ao último limiar manual.
+    pub fn set_auto(&mut self, auto: bool) {
+        self.sensitivity = if auto {
+            Sensitivity::Auto
+        } else {
+            Sensitivity::Manual(self.manual_db)
+        };
+    }
+
+    /// Só vale no modo manual; o slider nem aparece no automático.
+    pub fn set_threshold(&mut self, db: f32) {
+        if let Sensitivity::Manual(_) = self.sensitivity {
+            self.manual_db = clamp_db(db);
+            self.sensitivity = Sensitivity::Manual(self.manual_db);
         }
     }
 
@@ -129,6 +158,15 @@ impl Config {
             self.deafened = true;
             self.mic_muted = true;
         }
+    }
+}
+
+/// Mantém o limiar dentro do slider; NaN do arquivo cai no mínimo.
+pub fn clamp_db(db: f32) -> f32 {
+    if db.is_nan() {
+        MANUAL_MIN_DB
+    } else {
+        db.clamp(MANUAL_MIN_DB, MANUAL_MAX_DB)
     }
 }
 
@@ -202,6 +240,48 @@ mod tests {
             (None, NoiseLevel::Rnnoise, 71)
         );
         assert!(p.volumes.is_empty());
+    }
+
+    #[test]
+    fn config_antiga_vem_em_automatico_com_o_manual_padrao() {
+        let c: Config = serde_json::from_str(r#"{"mic_muted":true}"#).unwrap();
+        assert_eq!(c.sensitivity, Sensitivity::Auto);
+        assert_eq!(c.manual_db, MANUAL_DEFAULT_DB);
+        assert_eq!(c.audio_prefs().sensitivity, Sensitivity::Auto);
+    }
+
+    #[test]
+    fn sensibilidade_vai_e_volta_do_arquivo() {
+        let mut c = Config::default();
+        c.set_auto(false);
+        c.set_threshold(-55.0);
+        let c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c.audio_prefs().sensitivity, Sensitivity::Manual(-55.0));
+    }
+
+    #[test]
+    fn automatico_guarda_o_ultimo_manual() {
+        let mut c = Config::default();
+        c.set_auto(false);
+        assert_eq!(c.sensitivity, Sensitivity::Manual(MANUAL_DEFAULT_DB));
+        c.set_threshold(-62.0);
+        c.set_auto(true);
+        c.set_threshold(-10.0);
+        assert_eq!((c.sensitivity, c.manual_db), (Sensitivity::Auto, -62.0));
+        c.set_auto(false);
+        assert_eq!(c.sensitivity, Sensitivity::Manual(-62.0));
+    }
+
+    #[test]
+    fn limiar_respeita_a_faixa() {
+        let mut c = Config::default();
+        c.set_auto(false);
+        c.set_threshold(-500.0);
+        assert_eq!(c.sensitivity, Sensitivity::Manual(MANUAL_MIN_DB));
+        c.set_threshold(12.0);
+        assert_eq!(c.sensitivity, Sensitivity::Manual(MANUAL_MAX_DB));
+        c.set_threshold(f32::NAN);
+        assert_eq!(c.sensitivity, Sensitivity::Manual(MANUAL_MIN_DB));
     }
 
     #[test]

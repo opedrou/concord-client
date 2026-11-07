@@ -12,12 +12,12 @@ use std::time::{Duration, Instant};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{image, operation, row, stack};
 use iced::{Element, Event, Subscription, Task, Theme, event, mouse, time, window};
-use voice::{ActiveCall, Boot};
+use voice::{ActiveCall, Boot, Probe};
 
 use crate::api::{
     self, AddressError, Channel, ChannelKind, Client, Error, Member, Presence, Secret, User,
 };
-use crate::audio::{self, Devices, Engine, NoiseLevel};
+use crate::audio::{self, Devices, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
 use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::session;
@@ -30,6 +30,14 @@ const FALHAS_ATE_AVISAR: u8 = 3;
 const ESPERA_AO_FECHAR: Duration = Duration::from_secs(2);
 /// Relógio do anel de fala: o hold é de 400 ms, então 100 ms apaga sem atraso visível.
 const QUADRO: Duration = Duration::from_millis(100);
+/// Relógio do medidor de entrada: uns 30 quadros por segundo.
+const MEDIDOR: Duration = Duration::from_millis(33);
+
+// Quantas vezes `persist` rodou nesta thread de teste.
+#[cfg(test)]
+thread_local! {
+    static SAVES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 const ID_SERVIDOR: &str = "campo-servidor";
 const ID_USUARIO: &str = "campo-usuario";
@@ -84,6 +92,12 @@ struct Main {
     notice: Option<String>,
     /// Lista do sistema, lida ao abrir a aba Voz.
     devices: Option<Devices>,
+    /// Motor de teste da aba Voz; só existe sem call.
+    probe: Probe,
+    next_probe: u64,
+    /// Última leitura do mic, em dBFS, e se o limitador está aberto.
+    level: f32,
+    open: bool,
     /// Janela que pediu pra fechar e espera a call terminar.
     closing: Option<window::Id>,
 }
@@ -135,6 +149,13 @@ pub enum Msg {
     Input(Option<String>),
     Output(Option<String>),
     Noise(NoiseLevel),
+    /// Interruptor "Determinar automaticamente".
+    AutoSensitivity(bool),
+    /// Marcador do limiar manual, em dBFS.
+    Threshold(f32),
+    /// Relógio do medidor de entrada.
+    MeterTick,
+    ProbeStarted(u64, Result<Boot, String>),
     Devices(Devices),
     CloseRequested(window::Id),
     CloseNow(window::Id),
@@ -226,6 +247,9 @@ impl App {
             subs.push(time::every(POLL).map(|_| Msg::Tick));
             if m.call.as_ref().is_some_and(ActiveCall::holding) {
                 subs.push(time::every(QUADRO).map(Msg::Frame));
+            }
+            if m.meter_clock() {
+                subs.push(time::every(MEDIDOR).map(|_| Msg::MeterTick));
             }
             if m.resizing {
                 subs.push(event::listen_with(drag));
@@ -426,6 +450,44 @@ impl App {
                 }
                 Task::none()
             }
+            Msg::AutoSensitivity(auto) => {
+                self.config.set_auto(auto);
+                self.persist();
+                self.apply_sensitivity();
+                Task::none()
+            }
+            // Grava na config só ao soltar o slider (`VolumeDone`).
+            Msg::Threshold(db) => {
+                self.config.set_threshold(db);
+                self.apply_sensitivity();
+                Task::none()
+            }
+            Msg::MeterTick => {
+                if let Screen::Main(m) = &mut self.screen {
+                    let reading = m.meter().map(|x| (x.level_db(), x.open()));
+                    if let Some((db, open)) = reading {
+                        m.level = if db.is_nan() { MANUAL_MIN_DB } else { db };
+                        m.open = open;
+                    }
+                }
+                Task::none()
+            }
+            Msg::ProbeStarted(id, result) => {
+                if let Screen::Main(m) = &mut self.screen
+                    && matches!(m.probe, Probe::Opening(open) if open == id)
+                {
+                    // Sem MicFrames, os blocos do mic só são descartados pelo motor.
+                    m.probe = match result.ok().and_then(|boot| boot.take()) {
+                        Some((engine, _frames)) => {
+                            let meter = engine.meter();
+                            Probe::On(engine, meter)
+                        }
+                        None => Probe::Failed,
+                    };
+                }
+                // Resposta de uma abertura já cancelada: o motor cai aqui.
+                Task::none()
+            }
             Msg::Devices(devices) => {
                 if let Screen::Main(m) = &mut self.screen {
                     m.devices = Some(devices);
@@ -455,24 +517,24 @@ impl App {
                 if let Screen::Main(m) = &mut self.screen {
                     m.settings = Some(tab);
                 }
-                if tab == Tab::Voice {
-                    // `devices()` bloqueia: lê fora da thread da interface.
-                    return Task::future(async {
-                        let devices = tokio::task::spawn_blocking(audio::devices).await;
-                        Msg::Devices(devices.unwrap_or_default())
-                    });
+                if tab != Tab::Voice {
+                    self.stop_probe();
+                    return Task::none();
                 }
-                Task::none()
+                // `devices()` bloqueia: lê fora da thread da interface.
+                let devices = Task::future(async {
+                    let devices = tokio::task::spawn_blocking(audio::devices).await;
+                    Msg::Devices(devices.unwrap_or_default())
+                });
+                Task::batch([devices, self.start_probe()])
             }
             Msg::CloseSettings => {
-                if let Screen::Main(m) = &mut self.screen {
-                    m.settings = None;
-                }
+                self.close_settings();
                 Task::none()
             }
             Msg::Escape => {
-                match &mut self.screen {
-                    Screen::Main(m) if m.settings.is_some() => m.settings = None,
+                match &self.screen {
+                    Screen::Main(m) if m.settings.is_some() => self.close_settings(),
                     _ => self.close_volume(),
                 }
                 Task::none()
@@ -490,11 +552,59 @@ impl App {
         }
     }
 
+    /// Motor da call ou, na aba Voz sem call, o de teste: mudar mic ou limiar vale pros dois.
     fn engine(&self) -> Option<&Engine> {
-        match &self.screen {
-            Screen::Main(m) => m.call.as_ref()?.engine.as_ref(),
+        let Screen::Main(m) = &self.screen else {
+            return None;
+        };
+        match (&m.call, &m.probe) {
+            (Some(call), _) => call.engine.as_ref(),
+            (None, Probe::On(engine, _)) => Some(engine),
             _ => None,
         }
+    }
+
+    fn apply_sensitivity(&self) {
+        if let Some(engine) = self.engine() {
+            engine.set_sensitivity(self.config.sensitivity);
+        }
+    }
+
+    fn close_settings(&mut self) {
+        if let Screen::Main(m) = &mut self.screen {
+            m.settings = None;
+        }
+        self.stop_probe();
+    }
+
+    /// Solta o motor de teste. Uma abertura em andamento fica sem dono e é descartada
+    /// quando responder.
+    fn stop_probe(&mut self) {
+        if let Screen::Main(m) = &mut self.screen {
+            m.stop_probe();
+        }
+    }
+
+    /// Abre o motor de teste se a aba Voz está aberta e não há call nem teste.
+    fn start_probe(&mut self) -> Task<Msg> {
+        let Screen::Main(m) = &mut self.screen else {
+            return Task::none();
+        };
+        let idle = matches!(m.probe, Probe::Off | Probe::Failed);
+        if m.settings != Some(Tab::Voice) || m.call.is_some() || !idle {
+            return Task::none();
+        }
+        m.next_probe += 1;
+        let id = m.next_probe;
+        m.probe = Probe::Opening(id);
+        let prefs = self.config.audio_prefs();
+        // `Engine::start` bloqueia: abre o áudio fora da thread da interface.
+        Task::future(async move {
+            let started = tokio::task::spawn_blocking(move || Engine::start(prefs))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            Msg::ProbeStarted(id, started.map(Boot::new))
+        })
     }
 
     fn apply_mute(&self) {
@@ -528,6 +638,8 @@ impl App {
             old.leave();
         }
         m.notice = None;
+        // Dois motores abertos ao mesmo tempo brigam pelo mic.
+        m.stop_probe();
         m.next_call += 1;
         let id = m.next_call;
         m.call = Some(ActiveCall::new(id, slug));
@@ -601,11 +713,16 @@ impl App {
         m.call = None;
         let closing = m.closing.take();
         m.notice = voice::end_notice(end).map(str::to_owned);
-        let expired = match end {
-            End::Unauthorized => self.session_expired(),
-            _ => Task::none(),
+        let (expired, probe) = match end {
+            End::Unauthorized => (self.session_expired(), Task::none()),
+            // Configurações abertas na aba Voz voltam a medir o mic.
+            _ => (Task::none(), self.start_probe()),
         };
-        Task::batch([expired, closing.map_or_else(Task::none, window::close)])
+        Task::batch([
+            expired,
+            probe,
+            closing.map_or_else(Task::none, window::close),
+        ])
     }
 
     /// Sair da call deixa a tela na home na hora; o `Ended(Left)` que vem depois é
@@ -619,6 +736,7 @@ impl App {
     }
 
     fn close_requested(&mut self, id: window::Id) -> Task<Msg> {
+        self.stop_probe();
         if let Screen::Main(m) = &mut self.screen
             && m.closing.is_none()
             && let Some(call) = m.call.as_ref().and_then(|c| c.call.as_ref())
@@ -777,6 +895,10 @@ impl App {
             next_call: 0,
             notice: None,
             devices: None,
+            probe: Probe::Off,
+            next_probe: 0,
+            level: MANUAL_MIN_DB,
+            open: false,
             closing: None,
         };
         let avatars = main.fetch_avatars();
@@ -860,6 +982,8 @@ impl App {
 
     fn persist(&self) {
         if cfg!(test) {
+            #[cfg(test)]
+            SAVES.with(|n| n.set(n.get() + 1));
             return;
         }
         if let Err(e) = self.config.save() {
@@ -881,6 +1005,26 @@ impl LoginForm {
 }
 
 impl Main {
+    fn stop_probe(&mut self) {
+        self.probe = Probe::Off;
+        self.level = MANUAL_MIN_DB;
+        self.open = false;
+    }
+
+    /// Só a aba Voz aberta com medidor pede o relógio; fora disso a janela fica parada.
+    fn meter_clock(&self) -> bool {
+        self.settings == Some(Tab::Voice) && self.meter().is_some()
+    }
+
+    /// Medidor da call ou, sem call, do motor de teste.
+    fn meter(&self) -> Option<&Meter> {
+        match (&self.call, &self.probe) {
+            (Some(call), _) => call.meter.as_ref(),
+            (None, Probe::On(_, meter)) => Some(meter),
+            _ => None,
+        }
+    }
+
     /// Só baixa quem aparece na tela: quem está em canal, e a própria pessoa.
     fn fetch_avatars(&mut self) -> Task<Msg> {
         let mut paths: Vec<String> = self
@@ -1399,6 +1543,156 @@ mod tests {
         }
     }
 
+    fn probe_of(a: &mut App) -> &Probe {
+        &main_of(a).probe
+    }
+
+    fn voice_tab() -> App {
+        let mut a = voice_app();
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        a
+    }
+
+    fn saves() -> u32 {
+        SAVES.with(|n| n.get())
+    }
+
+    #[test]
+    fn automatico_e_manual_guardam_o_valor() {
+        use crate::audio::{MANUAL_DEFAULT_DB, Sensitivity};
+        let mut a = voice_tab();
+        assert_eq!(a.config.sensitivity, Sensitivity::Auto);
+        let _ = a.update(Msg::AutoSensitivity(false));
+        assert_eq!(a.config.sensitivity, Sensitivity::Manual(MANUAL_DEFAULT_DB));
+        let _ = a.update(Msg::Threshold(-55.0));
+        let _ = a.update(Msg::AutoSensitivity(true));
+        assert_eq!(a.config.sensitivity, Sensitivity::Auto);
+        assert_eq!(a.config.audio_prefs().sensitivity, Sensitivity::Auto);
+        let _ = a.update(Msg::Threshold(-10.0));
+        let _ = a.update(Msg::AutoSensitivity(false));
+        assert_eq!(a.config.sensitivity, Sensitivity::Manual(-55.0));
+        assert_eq!(
+            a.config.audio_prefs().sensitivity,
+            Sensitivity::Manual(-55.0)
+        );
+    }
+
+    #[test]
+    fn slider_do_limiar_respeita_a_faixa() {
+        use crate::audio::{MANUAL_MAX_DB, MANUAL_MIN_DB, Sensitivity};
+        let mut a = voice_tab();
+        let _ = a.update(Msg::AutoSensitivity(false));
+        let _ = a.update(Msg::Threshold(-900.0));
+        assert_eq!(a.config.sensitivity, Sensitivity::Manual(MANUAL_MIN_DB));
+        let _ = a.update(Msg::Threshold(15.0));
+        assert_eq!(a.config.sensitivity, Sensitivity::Manual(MANUAL_MAX_DB));
+    }
+
+    #[test]
+    fn config_so_grava_ao_soltar_o_slider() {
+        let mut a = voice_tab();
+        let _ = a.update(Msg::AutoSensitivity(false));
+        let antes = saves();
+        for db in [-50.0, -45.0, -42.0] {
+            let _ = a.update(Msg::Threshold(db));
+        }
+        assert_eq!(saves(), antes, "arrastar não grava");
+        let _ = a.update(Msg::VolumeDone);
+        assert_eq!(saves(), antes + 1);
+        let _ = a.update(Msg::AutoSensitivity(true));
+        assert_eq!(saves(), antes + 2, "o interruptor grava na hora");
+    }
+
+    #[test]
+    fn motor_de_teste_abre_so_na_aba_voz_sem_call() {
+        let mut a = voice_app();
+        let _ = a.update(Msg::OpenSettings(Tab::Account));
+        assert!(matches!(probe_of(&mut a), Probe::Off));
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        assert!(matches!(probe_of(&mut a), Probe::Opening(1)));
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        assert!(
+            matches!(probe_of(&mut a), Probe::Opening(1)),
+            "abrir de novo não abre um segundo motor"
+        );
+        let _ = a.update(Msg::OpenSettings(Tab::About));
+        assert!(
+            matches!(probe_of(&mut a), Probe::Off),
+            "trocar de aba solta"
+        );
+    }
+
+    #[test]
+    fn fechar_as_configuracoes_solta_o_motor_de_teste() {
+        for msg in [Msg::CloseSettings, Msg::Escape] {
+            let mut a = voice_tab();
+            let _ = a.update(msg);
+            assert!(matches!(probe_of(&mut a), Probe::Off));
+            assert!(main_of(&mut a).settings.is_none());
+        }
+    }
+
+    #[test]
+    fn motor_de_teste_que_falha_mostra_erro_e_tenta_de_novo_ao_reabrir() {
+        let mut a = voice_tab();
+        let _ = a.update(Msg::ProbeStarted(1, Err("sem placa".into())));
+        assert!(matches!(probe_of(&mut a), Probe::Failed));
+        assert!(!main_of(&mut a).meter_clock());
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        assert!(matches!(probe_of(&mut a), Probe::Opening(2)));
+    }
+
+    #[test]
+    fn resposta_atrasada_do_motor_de_teste_e_descartada() {
+        let mut a = voice_tab();
+        let _ = a.update(Msg::CloseSettings);
+        let _ = a.update(Msg::ProbeStarted(1, Err("tarde".into())));
+        assert!(matches!(probe_of(&mut a), Probe::Off), "aba já fechada");
+
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        assert!(matches!(probe_of(&mut a), Probe::Opening(2)));
+        let _ = a.update(Msg::ProbeStarted(1, Err("da abertura antiga".into())));
+        assert!(
+            matches!(probe_of(&mut a), Probe::Opening(2)),
+            "outra abertura em andamento não é afetada"
+        );
+    }
+
+    #[test]
+    fn entrar_na_call_solta_o_motor_de_teste_e_nao_abre_outro() {
+        let mut a = voice_tab();
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        assert!(matches!(probe_of(&mut a), Probe::Off));
+        assert!(main_of(&mut a).call.is_some());
+        let _ = a.update(Msg::ProbeStarted(1, Err("tarde".into())));
+        assert!(matches!(probe_of(&mut a), Probe::Off));
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        assert!(
+            matches!(probe_of(&mut a), Probe::Off),
+            "com call, a aba usa o motor da call"
+        );
+    }
+
+    #[test]
+    fn fim_da_call_com_a_aba_voz_aberta_volta_a_medir() {
+        let mut a = in_call(&["Ana"]);
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::RoomClosed)));
+        assert!(matches!(probe_of(&mut a), Probe::Opening(_)));
+    }
+
+    #[test]
+    fn sem_medidor_nao_ha_relogio_nem_leitura() {
+        let mut a = voice_tab();
+        assert!(!main_of(&mut a).meter_clock());
+        let _ = a.update(Msg::MeterTick);
+        assert_eq!(main_of(&mut a).level, MANUAL_MIN_DB);
+        let _ = a.update(Msg::ProbeStarted(1, Err("x".into())));
+        let _ = a.update(Msg::MeterTick);
+        assert!(!main_of(&mut a).open);
+    }
+
     /// Gera `snapshots/*.png` sem abrir janela: `cargo test -- --ignored prints`.
     #[test]
     #[ignore]
@@ -1407,12 +1701,16 @@ mod tests {
         use iced_test::simulator::Simulator;
 
         fn print(a: &App, nome: &str) {
+            print_at(a, nome, Size::new(1200.0, 760.0));
+        }
+
+        fn print_at(a: &App, nome: &str, size: Size) {
             let settings = Settings {
                 fonts: theme::FONTS.map(Into::into).to_vec(),
                 default_font: theme::BODY,
                 ..Settings::default()
             };
-            let mut ui = Simulator::with_size(settings, Size::new(1200.0, 760.0), a.view());
+            let mut ui = Simulator::with_size(settings, size, a.view());
             let print = ui.snapshot(&a.theme()).unwrap();
             assert!(
                 print
@@ -1500,6 +1798,29 @@ mod tests {
             }
             print(&a, nome);
         }
+
+        // Sensibilidade de entrada: automático (com voz e em silêncio), manual (abaixo e
+        // acima do limiar), erro do motor e a janela mínima.
+        main_of(&mut a).settings = Some(Tab::Voice);
+        main_of(&mut a).vault_ok = true;
+        let voz = |a: &mut App, auto: bool, db: f32, level: f32, open: bool| {
+            a.config.set_auto(auto);
+            a.config.set_threshold(db);
+            let m = main_of(a);
+            (m.level, m.open, m.probe) = (level, open, Probe::Off);
+        };
+        voz(&mut a, true, -40.0, -28.0, true);
+        print(&a, "voz-auto-falando");
+        voz(&mut a, true, -40.0, -62.0, false);
+        print(&a, "voz-auto-silencio");
+        voz(&mut a, false, -40.0, -55.0, false);
+        print(&a, "voz-manual-abaixo");
+        voz(&mut a, false, -40.0, -22.0, true);
+        print(&a, "voz-manual-acima");
+        print_at(&a, "voz-manual-janela-minima", Size::new(860.0, 560.0));
+        voz(&mut a, false, -40.0, -22.0, true);
+        main_of(&mut a).probe = Probe::Failed;
+        print(&a, "voz-erro");
 
         // Palco: 1, 4 e 9 pessoas, com quem fala e quem está mudo.
         let nomes = [

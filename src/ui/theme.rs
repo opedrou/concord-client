@@ -1,5 +1,5 @@
 //! Tokens do `styles/globals.css` da web, tema escuro.
-use iced::widget::{button, container, overlay::menu, pick_list, scrollable, text_input};
+use iced::widget::{button, container, overlay::menu, pick_list, scrollable, slider, text_input};
 use iced::{
     Background, Border, Color, Font, Gradient, Radians, Shadow, Theme, Vector, border, font,
     gradient,
@@ -325,3 +325,37 @@ pub fn pick_menu(_: &Theme) -> menu::Style {
         shadow: Shadow::default(),
     }
 }
+
+/// Trilho do medidor de entrada.
+pub fn meter_track(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(BG3.into()),
+        border: border::rounded(3),
+        ..Default::default()
+    }
+}
+
+/// Slider do limiar: trilho transparente, só o marcador aparece sobre o medidor.
+pub fn threshold(_: &Theme, status: slider::Status) -> slider::Style {
+    let clear = Background::Color(Color::TRANSPARENT);
+    let hot = matches!(status, slider::Status::Hovered | slider::Status::Dragged);
+    slider::Style {
+        rail: slider::Rail {
+            backgrounds: (clear, clear),
+            width: 8.0,
+            border: Border::default(),
+        },
+        handle: slider::Handle {
+            shape: slider::HandleShape::Rectangle {
+                width: MARKER,
+                border_radius: 2.0.into(),
+            },
+            background: if hot { ACCENT2 } else { FG }.into(),
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+        },
+    }
+}
+
+/// Largura do marcador do limiar, em px.
+pub const MARKER: u16 = 4;
