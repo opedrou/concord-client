@@ -1,0 +1,2 @@
+# Script de shell com CRLF quebra no bash, inclusive no Git Bash do Windows.
+*.sh text eol=lf
