@@ -35,10 +35,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang pkg-config libasound2-dev libglib2.0-dev libx11-dev \
+          sudo apt-get install -y pkg-config libasound2-dev libglib2.0-dev libx11-dev \
             libxext-dev libxfixes-dev libxdamage-dev libxrandr-dev libxcomposite-dev libxtst-dev \
             libxkbcommon-dev libwayland-dev libudev-dev libdrm-dev libgbm-dev libva-dev \
             libpipewire-0.3-dev libdbus-1-dev
+          # O libc++ que vem com o libwebrtc pede clang 21+; o Ubuntu do Actions traz o 18.
+          wget -q https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 21
+          echo "CC=clang-21" >> "$GITHUB_ENV"
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
       - run: rustup update stable && rustup default stable
       - uses: actions/cache@v4
         with:
@@ -47,10 +53,12 @@ jobs:
             ~/.cargo/git
             target
           key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: LLVM no Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
       - name: Compila
         shell: bash
-        env:
-          LIBCLANG_PATH: ${{ runner.os == 'Windows' && 'C:\Program Files\LLVM\bin' || '' }}
         run: cargo build --release
       - shell: bash
         run: cp "${{ matrix.built }}" "${{ matrix.asset }}"
@@ -59,8 +67,10 @@ jobs:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
+  # Publica o que compilou: um sistema quebrado não segura a atualização do outro.
   publish:
     needs: build
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -70,6 +80,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            concord-client-windows-x86_64.exe concord-client-linux-x86_64 \
+          ls concord-client-* || { echo "nada compilou"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" concord-client-* \
             --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
