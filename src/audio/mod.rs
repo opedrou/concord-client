@@ -284,8 +284,10 @@ mod tests {
             let pcm = effect.pcm();
             assert_eq!(pcm.len() % 2, 0, "{effect:?}: i16 inteiro");
             let samples: Vec<f32> = pcm
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| i16::from_le_bytes(b) as f32 / 32768.0)
                 .collect();
             let secs = samples.len() as f32 / RATE as f32;
             assert!((0.3..3.0).contains(&secs), "{effect:?}: {secs} s");
