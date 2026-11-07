@@ -45,7 +45,6 @@ jobs:
           echo "CC=clang-21" >> "$GITHUB_ENV"
           echo "CXX=clang++-21" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
-      - run: rustup update stable && rustup default stable
       - uses: actions/cache@v4
         with:
           path: |
@@ -53,6 +52,8 @@ jobs:
             ~/.cargo/git
             target
           key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          # Subir a versão muda o Cargo.lock: sem isto, toda release compilava o livekit do zero.
+          restore-keys: release-${{ runner.os }}-
       - name: LLVM no Windows
         if: runner.os == 'Windows'
         shell: bash

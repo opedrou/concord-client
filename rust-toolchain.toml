@@ -1,0 +1,4 @@
+# Mesma versão aqui e no CI: atualizar o Rust sem querer recompila tudo e traz lint novo do clippy.
+[toolchain]
+channel = "1.96.0"
+components = ["clippy", "rustfmt"]
