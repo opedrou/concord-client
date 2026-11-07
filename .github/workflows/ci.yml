@@ -1,9 +1,8 @@
 name: CI
 
+# Manual: o push é frequente, e o runner do Windows conta minuto em dobro.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
