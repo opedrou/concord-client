@@ -26,6 +26,10 @@ const PICKER: f32 = 620.0;
 const PICKER_COLUMNS: usize = 3;
 const PICKER_GRID: f32 = 300.0;
 const THUMB_HEIGHT: f32 = 104.0;
+/// Largura do nome embaixo da miniatura: (620 - 2×14 de margem - 2×8 entre elas) / 3 - 2×6
+/// do botão. A barra de rolagem flutua por cima, não come largura.
+const THUMB_NAME: f32 = 180.0;
+const THUMB_NAME_SIZE: f32 = 12.0;
 /// Barra de controles com a margem dela, pra os avisos abrirem logo acima.
 const ABOVE_BAR: f32 = 94.0;
 /// Faixa do pé do palco onde o mouse faz a barra aparecer.
@@ -540,7 +544,7 @@ fn share_card(config: &Config) -> Element<'_, Msg> {
 
 /// Seletor do Windows: abas de aplicativos e telas, miniatura com o nome embaixo, áudio e
 /// qualidade. No Linux quem escolhe é o portal, e vale o [`share_card`].
-fn picker<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
+pub(super) fn picker<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(28))
         .padding(0)
         .style(theme::ghost)
@@ -644,8 +648,8 @@ fn source_tile<'a>(
             .style(theme::fill(BG))
             .into(),
     };
-    let name = text(source.to_string())
-        .size(12)
+    let name = text(ellipsize(&source.to_string(), THUMB_NAME_SIZE, THUMB_NAME))
+        .size(THUMB_NAME_SIZE)
         .color(if chosen { FG } else { FG2 })
         .wrapping(Wrapping::None);
     button(column![preview, name].spacing(6))
@@ -654,6 +658,39 @@ fn source_tile<'a>(
         .style(theme::nav_item(chosen))
         .on_press(Msg::ShareSource(source.clone()))
         .into()
+}
+
+/// Corta numa linha com reticências pra caber em `width`. O `text` do iced 0.14 não corta
+/// sozinho: sem quebra, vaza pro vizinho.
+fn ellipsize(content: &str, size: f32, width: f32) -> String {
+    let fits = |s: &str| text_width(s, size) <= width;
+    if fits(content) {
+        return content.to_owned();
+    }
+    // Maior prefixo que cabe junto com a reticência.
+    let ends: Vec<usize> = content.char_indices().map(|(i, _)| i).collect();
+    let n = ends.partition_point(|&end| fits(&format!("{}…", &content[..end])));
+    format!("{}…", content[..ends[n.saturating_sub(1)]].trim_end())
+}
+
+/// Largura de uma linha na fonte do corpo, medida como o `text` desenha.
+fn text_width(content: &str, size: f32) -> f32 {
+    use iced::advanced::graphics::text::Paragraph;
+    use iced::advanced::text::{Paragraph as _, Text};
+    use iced::widget::text::{Alignment, LineHeight, Shaping};
+    Paragraph::with_text(Text {
+        content,
+        bounds: Size::INFINITE,
+        size: size.into(),
+        line_height: LineHeight::default(),
+        font: theme::BODY,
+        align_x: Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: Shaping::default(),
+        wrapping: Wrapping::None,
+    })
+    .min_bounds()
+    .width
 }
 
 fn audio_label(choice: &Choice) -> String {
@@ -822,4 +859,23 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
         .padding(12)
         .style(floating(ring))
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nome_comprido_corta_com_reticencias_na_largura() {
+        assert_eq!(ellipsize("Spotify", 12.0, 180.0), "Spotify");
+        let longo = "Concord - chamada de voz self-hosted - Google Chrome ".repeat(3);
+        let curto = ellipsize(&longo, 12.0, 180.0);
+        assert!(curto.ends_with('…'), "{curto}");
+        assert!(text_width(&curto, 12.0) <= 180.0, "{curto}");
+        assert!(longo.starts_with(curto.trim_end_matches('…')), "{curto}");
+        assert!(
+            curto.chars().count() > 10,
+            "corta perto da borda, não no começo: {curto}"
+        );
+    }
 }
