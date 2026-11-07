@@ -21,7 +21,7 @@ use crate::audio::{self, Devices, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
 use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::session;
-use crate::share::{Choice, Quality};
+use crate::share::{Choice, Quality, Source};
 
 const POLL: Duration = Duration::from_secs(4);
 /// Falhas seguidas de presença até o rodapé trocar "Online" por "Sem conexão".
@@ -154,6 +154,9 @@ pub enum Msg {
     ShareAudio(bool),
     ShareStart,
     ShareStop,
+    /// Telas e janelas lidas pro seletor do Windows.
+    ShareSources(Vec<Source>),
+    ShareSource(Source),
     /// Abre e fecha a lista de áudio da transmissão no ar.
     AudioList,
     AudioChoice(Choice),
@@ -439,8 +442,28 @@ impl App {
                 Task::none()
             }
             Msg::ShareButton => {
+                let Some(call) = self.call_mut() else {
+                    return Task::none();
+                };
+                call.share_button();
+                if !(cfg!(windows) && call.share_panel) {
+                    return Task::none();
+                }
+                // Listar janelas bloqueia: lê fora da thread da interface.
+                Task::future(async {
+                    let sources = tokio::task::spawn_blocking(crate::share::sources).await;
+                    Msg::ShareSources(sources.unwrap_or_default())
+                })
+            }
+            Msg::ShareSources(sources) => {
                 if let Some(call) = self.call_mut() {
-                    call.share_button();
+                    call.set_share_sources(sources);
+                }
+                Task::none()
+            }
+            Msg::ShareSource(source) => {
+                if let Some(call) = self.call_mut() {
+                    call.share_source = Some(source);
                 }
                 Task::none()
             }

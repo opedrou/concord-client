@@ -72,6 +72,10 @@ pub struct ActiveCall {
     pub share: share::State,
     /// Painel de qualidade aberto.
     pub share_panel: bool,
+    /// Telas e janelas do seletor do Windows, lidas ao abrir o painel. Vazia no Linux.
+    pub share_sources: Vec<share::Source>,
+    /// Escolhida no seletor; `None` é a primeira tela.
+    pub share_source: Option<share::Source>,
     /// Áudio da transmissão no ar, por `Event::ShareAudio`.
     pub share_audio: Option<share::View>,
     /// Lista de áudio aberta, sobre o palco.
@@ -92,6 +96,8 @@ impl ActiveCall {
             volume_panel: None,
             share: share::State::Off,
             share_panel: false,
+            share_sources: Vec::new(),
+            share_source: None,
             share_audio: None,
             audio_list: false,
         }
@@ -124,8 +130,20 @@ impl ActiveCall {
     pub fn start_share(&mut self, quality: Quality, audio: bool) {
         self.share_panel = false;
         if let Some(call) = &self.call {
-            call.start_share(quality, audio);
+            call.start_share(quality, audio, self.share_source.clone());
         }
+    }
+
+    /// Lista nova do seletor. A escolha anterior fica se ainda existir; senão, a primeira.
+    pub fn set_share_sources(&mut self, sources: Vec<share::Source>) {
+        if !self
+            .share_source
+            .as_ref()
+            .is_some_and(|s| sources.contains(s))
+        {
+            self.share_source = sources.first().cloned();
+        }
+        self.share_sources = sources;
     }
 
     /// O áudio só existe com a transmissão no ar.
@@ -304,6 +322,27 @@ pub fn test_live(name: &str, speaking: bool) -> Live {
 mod tests {
     use super::test_live as live;
     use super::*;
+
+    #[test]
+    fn seletor_mantem_a_escolha_se_ela_ainda_existe() {
+        let fonte = |id, title: &str| share::Source {
+            window: id > 1,
+            id,
+            title: title.into(),
+        };
+        let mut call = ActiveCall::new(1, "call-tete".into());
+        call.set_share_sources(vec![fonte(1, "Tela 1"), fonte(7, "YouTube")]);
+        assert_eq!(
+            call.share_source,
+            Some(fonte(1, "Tela 1")),
+            "começa na tela"
+        );
+        call.share_source = Some(fonte(7, "YouTube"));
+        call.set_share_sources(vec![fonte(1, "Tela 1"), fonte(7, "YouTube")]);
+        assert_eq!(call.share_source, Some(fonte(7, "YouTube")));
+        call.set_share_sources(vec![fonte(1, "Tela 1")]);
+        assert_eq!(call.share_source, Some(fonte(1, "Tela 1")), "janela fechou");
+    }
 
     #[test]
     fn painel_abre_em_cima_do_tile_clicado() {

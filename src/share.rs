@@ -111,9 +111,69 @@ pub enum State {
     Failed,
 }
 
+/// Tela ou janela escolhida no nosso seletor, pelo id do WebRTC. Só o Windows usa: no Linux
+/// quem escolhe é o portal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct Source {
+    pub window: bool,
+    pub id: u64,
+    pub title: String,
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const MAX: usize = 48;
+        if self.title.chars().count() > MAX {
+            let curto: String = self.title.chars().take(MAX - 1).collect();
+            write!(f, "{curto}…")
+        } else {
+            f.write_str(&self.title)
+        }
+    }
+}
+
+/// Telas primeiro, depois as janelas com título. Bloqueia: chamar fora da interface.
+#[cfg(windows)]
+pub fn sources() -> Vec<Source> {
+    let list = |window: bool| {
+        let kind = if window {
+            DesktopCaptureSourceType::Window
+        } else {
+            DesktopCaptureSourceType::Screen
+        };
+        let found = DesktopCapturer::new(DesktopCapturerOptions::new(kind))
+            .map(|c| c.get_source_list())
+            .unwrap_or_default();
+        found
+            .into_iter()
+            .enumerate()
+            .filter(move |(_, s)| !window || !s.title().trim().is_empty())
+            .map(move |(i, s)| Source {
+                window,
+                id: s.id(),
+                title: if window {
+                    s.title()
+                } else {
+                    format!("Tela {}", i + 1)
+                },
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut all = list(false);
+    all.extend(list(true));
+    all
+}
+
+#[cfg(not(windows))]
+pub fn sources() -> Vec<Source> {
+    Vec::new()
+}
+
 pub enum Cmd {
-    /// Qualidade, e se leva o áudio junto.
-    Start(Quality, bool),
+    /// Qualidade, se leva o áudio junto e, no Windows, o que transmitir (`None`: a
+    /// primeira tela).
+    Start(Quality, bool, Option<Source>),
     Stop,
     /// Troca o áudio de uma transmissão no ar.
     Audio(Choice),
@@ -135,14 +195,21 @@ enum Note {
     Failed,
 }
 
-/// Saída da thread de captura: reduz cada quadro e entrega à fonte de vídeo.
+/// Saída da thread de captura: reduz cada quadro e entrega à fonte de vídeo. Leva junto o
+/// alvo escolhido no seletor do Windows.
 pub struct Feed {
     limit: Option<(u32, u32)>,
     source: Option<NativeVideoSource>,
     notes: UnboundedSender<Note>,
+    target: Option<Source>,
 }
 
 impl Feed {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn target(&self) -> Option<&Source> {
+        self.target.as_ref()
+    }
+
     /// Quadro em ARGB. Buffer novo a cada quadro: o encoder lê em outra thread, e a
     /// resolução pode mudar no meio, ao trocar de janela.
     pub fn frame(&mut self, argb: &[u8], stride: u32, width: u32, height: u32) {
@@ -187,10 +254,15 @@ impl Feed {
 /// a transmissão.
 pub type Capturer = fn(u32, &AtomicBool, Feed);
 
-/// Captura de verdade. No Linux, `Generic` sem alvo abre o seletor do portal sozinho.
+/// Captura de verdade. No Linux, `Generic` sem alvo abre o seletor do portal sozinho. No
+/// Windows vai o alvo do nosso seletor, achado pelo id num capturador desta thread.
 pub fn desktop(fps: u32, stop: &AtomicBool, mut feed: Feed) {
     #[cfg(windows)]
-    let kind = DesktopCaptureSourceType::Screen;
+    let kind = if feed.target().is_some_and(|t| t.window) {
+        DesktopCaptureSourceType::Window
+    } else {
+        DesktopCaptureSourceType::Screen
+    };
     #[cfg(not(windows))]
     let kind = DesktopCaptureSourceType::Generic;
     let mut options = DesktopCapturerOptions::new(kind);
@@ -199,9 +271,20 @@ pub fn desktop(fps: u32, stop: &AtomicBool, mut feed: Feed) {
         feed.fail();
         return;
     };
-    // ponytail: no Windows vai a primeira tela; o seletor próprio entra na etapa dele.
     #[cfg(windows)]
-    let target = capturer.get_source_list().into_iter().next();
+    let target = {
+        let list = capturer.get_source_list().into_iter();
+        let found = match feed.target() {
+            Some(t) => list.into_iter().find(|s| s.id() == t.id),
+            None => list.into_iter().next(),
+        };
+        // A janela fechou entre o seletor e o clique.
+        if found.is_none() {
+            feed.fail();
+            return;
+        }
+        found
+    };
     #[cfg(not(windows))]
     let target = None;
 
@@ -251,13 +334,19 @@ struct Running {
 }
 
 impl Running {
-    fn start(quality: Quality, with_audio: bool, capture: Capturer) -> Option<Self> {
+    fn start(
+        quality: Quality,
+        with_audio: bool,
+        target: Option<Source>,
+        capture: Capturer,
+    ) -> Option<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let (notes_tx, notes) = mpsc::unbounded_channel();
         let feed = Feed {
             limit: quality.limit(),
             source: None,
             notes: notes_tx,
+            target,
         };
         let flag = stop.clone();
         let runtime = Handle::current();
@@ -360,8 +449,8 @@ pub async fn run(
     loop {
         tokio::select! {
             cmd = cmds.recv() => match cmd {
-                Some(Cmd::Start(quality, with_audio)) if share.is_none() => {
-                    share = Running::start(quality, with_audio, capture);
+                Some(Cmd::Start(quality, with_audio, target)) if share.is_none() => {
+                    share = Running::start(quality, with_audio, target, capture);
                     notify(if share.is_some() { State::Choosing } else { State::Failed });
                 }
                 Some(Cmd::Start(..)) => {}
@@ -462,6 +551,36 @@ mod tests {
         );
         let q: Quality = serde_json::from_str(r#""maxima""#).unwrap();
         assert_eq!(q, Quality::Maxima);
+    }
+
+    #[test]
+    fn titulo_longo_corta_com_reticencias() {
+        let janela = |title: &str| Source {
+            window: true,
+            id: 1,
+            title: title.into(),
+        };
+        assert_eq!(janela("Tela 1").to_string(), "Tela 1");
+        let longo = "á".repeat(60);
+        let curto = janela(&longo).to_string();
+        assert_eq!(curto.chars().count(), 48);
+        assert!(curto.ends_with('…'));
+    }
+
+    /// Lista as fontes de verdade, sem capturar: `cargo test -- --ignored fontes_do_windows`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn fontes_do_windows() {
+        let fontes = sources();
+        for f in &fontes {
+            println!(
+                "{} {:>10} {f}",
+                if f.window { "JANELA" } else { "TELA  " },
+                f.id
+            );
+        }
+        assert!(fontes.first().is_some_and(|f| !f.window), "falta a tela");
     }
 
     const HD: Option<(u32, u32)> = Some((1280, 720));
@@ -575,7 +694,7 @@ mod tests {
             VIVAS.fetch_sub(1, Ordering::SeqCst);
         }
         let (cmd, mut estados, _t) = ator(seletor);
-        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         cmd.send(Cmd::Stop).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Off);
@@ -586,7 +705,7 @@ mod tests {
     async fn portal_cancelado_volta_a_parado_sem_falha() {
         fn cancela(_: u32, _: &AtomicBool, _: Feed) {}
         let (cmd, mut estados, _t) = ator(cancela);
-        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         assert_eq!(proximo(&mut estados).await, State::Off);
     }
@@ -597,7 +716,7 @@ mod tests {
             feed.fail();
         }
         let (cmd, mut estados, _t) = ator(sem);
-        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         assert_eq!(proximo(&mut estados).await, State::Failed);
     }
@@ -610,8 +729,8 @@ mod tests {
             espera_parar(stop);
         }
         let (cmd, mut estados, _t) = ator(uma);
-        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
-        cmd.send(Cmd::Start(Quality::Media, false)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
+        cmd.send(Cmd::Start(Quality::Media, false, None)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         while ABERTAS.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -631,7 +750,7 @@ mod tests {
         }
         // Tarefa da call abortada: é o que acontece em qualquer fim da call.
         let (cmd, mut estados, tarefa) = ator(viva);
-        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         while VIVAS.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -641,7 +760,7 @@ mod tests {
 
         // Todos os `Call` soltos, sem ninguém pedir pra parar.
         let (cmd, mut estados, _t) = ator(viva);
-        cmd.send(Cmd::Start(Quality::Alta, false)).unwrap();
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         drop(cmd);
         soltou(&VIVAS).await;
@@ -656,7 +775,7 @@ mod tests {
             }
         }
         let (cmd, mut estados, _t) = ator(muda);
-        cmd.send(Cmd::Start(Quality::Media, false)).unwrap();
+        cmd.send(Cmd::Start(Quality::Media, false, None)).unwrap();
         assert_eq!(proximo(&mut estados).await, State::Choosing);
         assert_eq!(proximo(&mut estados).await, State::Off);
     }

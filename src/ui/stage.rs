@@ -1,8 +1,8 @@
 //! Palco da call: grade de tiles, barra de controles e painel de volume.
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, center, column, container, mouse_area, opaque, pin, responsive, row,
-    slider, space, stack, text, toggler,
+    Column, Row, button, center, column, container, mouse_area, opaque, pick_list, pin, responsive,
+    row, slider, space, stack, text, toggler,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Size, Theme, border};
 
@@ -228,7 +228,7 @@ fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element
             Some(view) => audio_line(view),
             None => return None,
         },
-        _ if call.share_panel => share_card(config),
+        _ if call.share_panel => share_card(call, config),
         _ => return None,
     };
     Some(
@@ -245,14 +245,15 @@ fn choosing<'a>() -> Element<'a, Msg> {
         .padding([5, 12])
         .style(theme::outline)
         .on_press(Msg::ShareStop);
-    let line = row![
-        text("Escolha a tela na janela do sistema…")
-            .size(13.5)
-            .font(theme::SEMIBOLD),
-        cancel,
-    ]
-    .spacing(14)
-    .align_y(Alignment::Center);
+    // No Windows o alvo já veio do nosso seletor: só falta o primeiro quadro.
+    let label = if cfg!(windows) {
+        "Abrindo a captura…"
+    } else {
+        "Escolha a tela na janela do sistema…"
+    };
+    let line = row![text(label).size(13.5).font(theme::SEMIBOLD), cancel,]
+        .spacing(14)
+        .align_y(Alignment::Center);
     container(line)
         .padding([7, 14])
         .style(theme::tooltip)
@@ -260,7 +261,7 @@ fn choosing<'a>() -> Element<'a, Msg> {
 }
 
 /// Qualidade da próxima transmissão. Sem fundo clicável, como o painel de volume.
-fn share_card(config: &Config) -> Element<'_, Msg> {
+fn share_card<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(28))
         .padding(0)
         .style(theme::ghost)
@@ -311,7 +312,22 @@ fn share_card(config: &Config) -> Element<'_, Msg> {
             .into()
     });
 
-    let body = column![head, Column::with_children(options).spacing(2)]
+    // Seletor do Windows: no Linux a lista fica vazia e quem escolhe é o portal.
+    let source: Option<Element<'_, Msg>> = (!call.share_sources.is_empty()).then(|| {
+        pick_list(
+            call.share_sources.as_slice(),
+            call.share_source.as_ref(),
+            Msg::ShareSource,
+        )
+        .width(Length::Fill)
+        .padding([9, 12])
+        .style(theme::pick)
+        .into()
+    });
+
+    let body = column![head]
+        .push(source)
+        .push(Column::with_children(options).spacing(2))
         .push(audio)
         .push(start)
         .spacing(10);

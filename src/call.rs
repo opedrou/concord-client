@@ -193,8 +193,8 @@ impl Call {
 
     /// Abre a captura; o andamento vem em [`Event::Share`] e o do áudio, se `audio`, em
     /// [`Event::ShareAudio`].
-    pub fn start_share(&self, quality: Quality, audio: bool) {
-        let _ = self.share.send(share::Cmd::Start(quality, audio));
+    pub fn start_share(&self, quality: Quality, audio: bool, target: Option<share::Source>) {
+        let _ = self.share.send(share::Cmd::Start(quality, audio, target));
     }
 
     pub fn choose_share_audio(&self, choice: Choice) {

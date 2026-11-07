@@ -133,7 +133,7 @@ impl Banca {
     }
 
     async fn ao_vivo(&mut self, me: &LocalParticipant, quality: Quality) {
-        self.cmd.send(Cmd::Start(quality, false)).unwrap();
+        self.cmd.send(Cmd::Start(quality, false, None)).unwrap();
         assert_eq!(self.estado().await, State::Choosing);
         sleep(SELETOR / 2).await;
         assert!(tela(me).is_none(), "publicou antes do primeiro quadro");
@@ -379,7 +379,7 @@ async fn bancada_tela_call() {
             break;
         }
     }
-    call.start_share(Quality::Economica, false);
+    call.start_share(Quality::Economica, false, None);
     let local_no_ar = |e: &Event| match e {
         Event::Participants(list) => list.iter().any(|p| p.is_local && p.screen_share),
         _ => false,
@@ -426,7 +426,10 @@ async fn bancada_tela_audio() {
     let room = entrar(&client).await;
     let me = room.local_participant();
     let mut banca = Banca::new(me.clone());
-    banca.cmd.send(Cmd::Start(Quality::Media, true)).unwrap();
+    banca
+        .cmd
+        .send(Cmd::Start(Quality::Media, true, None))
+        .unwrap();
     assert_eq!(banca.estado().await, State::Choosing);
     assert_eq!(banca.estado().await, State::Live);
     som_no_ar(&me).await;
