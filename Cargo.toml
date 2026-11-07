@@ -37,5 +37,9 @@ livekit = { version = "0.10", features = ["glib-main-loop"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
 
+[build-dependencies]
+# Ícone embutido no .exe do Windows (`build.rs`).
+winresource = "0.1"
+
 [dev-dependencies]
 iced_test = "0.14"

@@ -12,7 +12,7 @@ permissions:
 jobs:
   build:
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -35,9 +35,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libglib2.0-dev libx11-dev libxext-dev libxfixes-dev \
-            libxdamage-dev libxrandr-dev libxcomposite-dev libxtst-dev libdrm-dev libgbm-dev \
-            libva-dev libpipewire-0.3-dev libdbus-1-dev
+          sudo apt-get install -y clang pkg-config libasound2-dev libglib2.0-dev libx11-dev \
+            libxext-dev libxfixes-dev libxdamage-dev libxrandr-dev libxcomposite-dev libxtst-dev \
+            libxkbcommon-dev libwayland-dev libudev-dev libdrm-dev libgbm-dev libva-dev \
+            libpipewire-0.3-dev libdbus-1-dev
       - run: rustup update stable && rustup default stable
       - uses: actions/cache@v4
         with:

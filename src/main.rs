@@ -4,6 +4,7 @@ mod api;
 mod audio;
 mod call;
 mod config;
+mod icon;
 mod session;
 mod share;
 mod ui;
@@ -17,6 +18,7 @@ fn main() -> iced::Result {
     let window = window::Settings {
         size: Size::new(1200.0, 760.0),
         min_size: Some(Size::new(860.0, 560.0)),
+        icon: icon::window(),
         // Com call ativa, a saída espera o `Ended` antes de fechar.
         exit_on_close_request: false,
         ..window::Settings::default()
