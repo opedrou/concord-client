@@ -22,7 +22,7 @@ use crate::audio::{self, Devices, Effect, Engine, MANUAL_MIN_DB, Meter, NoiseLev
 use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::session;
-use crate::share::{Choice, Quality, Source, Thumb};
+use crate::share::{Quality, Source, Thumb};
 
 const POLL: Duration = Duration::from_secs(4);
 /// De quanto em quanto tempo confere se saiu versão nova, com o app aberto.
@@ -197,9 +197,10 @@ pub enum Msg {
     RestartForUpdate,
     /// Hora de conferir de novo se saiu versão nova.
     CheckUpdate,
-    /// Abre e fecha a lista de áudio da transmissão no ar.
-    AudioList,
-    AudioChoice(Choice),
+    /// Seta do botão de transmitir: abre e fecha o menu.
+    ShareMenu,
+    /// Liga ou desliga o áudio da transmissão no ar.
+    ShareSound,
     Input(Option<String>),
     Output(Option<String>),
     Noise(NoiseLevel),
@@ -365,6 +366,9 @@ impl App {
     /// A janela sai da tela cheia por qualquer caminho que pare de assistir: botão, Esc,
     /// a pessoa parar de transmitir ou a call acabar.
     fn sync_window(&mut self) -> Task<Msg> {
+        let watching = matches!(&self.screen, Screen::Main(m)
+            if m.call.as_ref().is_some_and(|c| c.watching.is_some()));
+        crate::awake::keep(watching);
         let Screen::Main(m) = &mut self.screen else {
             return Task::none();
         };
@@ -497,6 +501,7 @@ impl App {
                     call.volume_panel = Some(name);
                     call.volume_at = call.cursor;
                     call.share_panel = false;
+                    call.share_menu = false;
                 }
                 Task::none()
             }
@@ -547,6 +552,7 @@ impl App {
                     return Task::none();
                 }
                 call.share_panel = true;
+                call.share_menu = false;
                 call.volume_panel = None;
                 read_sources(call)
             }
@@ -586,15 +592,15 @@ impl App {
                 }
                 Task::none()
             }
-            Msg::AudioList => {
+            Msg::ShareMenu => {
                 if let Some(call) = self.call_mut() {
-                    call.audio_list = !call.audio_list;
+                    call.share_menu = !call.share_menu;
                 }
                 Task::none()
             }
-            Msg::AudioChoice(choice) => {
+            Msg::ShareSound => {
                 if let Some(call) = self.call_mut() {
-                    call.choose_share_audio(choice);
+                    call.toggle_share_sound();
                 }
                 Task::none()
             }
@@ -882,7 +888,7 @@ impl App {
         if let Some(call) = self.call_mut() {
             call.volume_panel = None;
             call.share_panel = false;
-            call.audio_list = false;
+            call.share_menu = false;
         }
     }
 
@@ -1373,7 +1379,7 @@ fn focus(event: Event, _: event::Status, _: window::Id) -> Option<Msg> {
 mod tests {
     use super::*;
     use crate::api::{ChannelKind, Participant};
-    use crate::share::State as ShareState;
+    use crate::share::{Choice, State as ShareState};
 
     fn app(screen: Screen) -> App {
         App {
@@ -1920,7 +1926,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_da_tela_abre_a_lista_so_quando_pede_e_some_com_a_transmissao() {
+    fn menu_da_seta_liga_e_desliga_o_audio_e_some_com_a_transmissao() {
         let mut a = in_call(&["Ana"]);
         let antes = saves();
         let _ = a.update(Msg::ShareAudio(false));
@@ -1929,28 +1935,46 @@ mod tests {
 
         share(&mut a, ShareState::Live);
         audio(&mut a, Choice::All, &["Jogo"], false);
-        assert!(!call_of(&mut a).audio_list, "tela inteira não pergunta");
+        assert!(call_of(&mut a).share_sound, "tela inteira leva o som");
         audio(&mut a, Choice::Silent, &["A", "B"], true);
         assert!(
-            call_of(&mut a).audio_list,
-            "janela sem app óbvio abre a lista"
+            !call_of(&mut a).share_sound,
+            "janela sem app óbvio começa muda"
         );
-        audio(&mut a, Choice::Silent, &["A"], false);
-        assert!(call_of(&mut a).audio_list, "atualizar não fecha");
+        assert!(!call_of(&mut a).menu_open(), "nada abre sozinho");
 
-        let _ = a.update(Msg::AudioChoice(Choice::App("A".into())));
-        assert!(!call_of(&mut a).audio_list, "escolher fecha");
-        let _ = a.update(Msg::AudioList);
-        assert!(call_of(&mut a).audio_list, "dá pra reabrir pra trocar");
+        let _ = a.update(Msg::ShareMenu);
+        assert!(call_of(&mut a).share_menu);
+        assert!(call_of(&mut a).menu_open());
+        let _ = a.update(Msg::ShareSound);
+        assert!(call_of(&mut a).share_sound, "ligar");
+        assert!(!call_of(&mut a).share_menu, "escolher fecha o menu");
+        let _ = a.update(Msg::ShareSound);
+        assert!(!call_of(&mut a).share_sound, "desligar");
+
+        let _ = a.update(Msg::ShareMenu);
         let _ = a.update(Msg::Escape);
-        assert!(!call_of(&mut a).audio_list);
+        assert!(!call_of(&mut a).share_menu);
 
-        let _ = a.update(Msg::AudioList);
+        let _ = a.update(Msg::ShareMenu);
         share(&mut a, ShareState::Live);
         assert!(call_of(&mut a).share_audio.is_some(), "sala nova mantém");
         share(&mut a, ShareState::Off);
         assert!(call_of(&mut a).share_audio.is_none());
-        assert!(!call_of(&mut a).audio_list);
+        assert!(!call_of(&mut a).share_menu);
+    }
+
+    #[test]
+    fn clicar_fora_fecha_qualquer_painel() {
+        let mut a = in_call(&["Ana"]);
+        let _ = a.update(Msg::OpenVolume("Ana".into()));
+        assert!(call_of(&mut a).menu_open());
+        let _ = a.update(Msg::CloseVolume);
+        assert!(!call_of(&mut a).menu_open());
+        share(&mut a, ShareState::Live);
+        let _ = a.update(Msg::ShareMenu);
+        let _ = a.update(Msg::CloseVolume);
+        assert!(!call_of(&mut a).menu_open());
     }
 
     #[test]
@@ -2458,7 +2482,8 @@ mod tests {
         ui.click("Sair").unwrap();
         let cliques: Vec<Msg> = ui.into_messages().collect();
         assert!(
-            matches!(cliques[..], [Msg::ShareStart, Msg::Leave]),
+            // Com o painel aberto, clicar na barra só fecha o painel: o Sair não chega.
+            matches!(cliques[..], [Msg::ShareStart, Msg::CloseVolume]),
             "{cliques:?}"
         );
         let _ = a.update(Msg::ShareStart);
@@ -2482,18 +2507,11 @@ mod tests {
         let _ = a.update(Msg::Focus(false));
         print(&a, "tela-propria-pausada");
         let _ = a.update(Msg::Focus(true));
-        audio(&mut a, Choice::Silent, &["Google Chrome", "Spotify"], true);
-        print(&a, "tela-audio-lista");
+        audio(&mut a, Choice::All, &["Google Chrome", "Spotify"], false);
+        let _ = a.update(Msg::ShareMenu);
+        print(&a, "tela-menu-audio-ligado");
         audio(&mut a, Choice::Silent, &[], false);
-        print(&a, "tela-audio-lista-vazia");
-        let _ = a.update(Msg::AudioChoice(Choice::App("Google Chrome".into())));
-        audio(
-            &mut a,
-            Choice::App("Google Chrome".into()),
-            &["Google Chrome"],
-            false,
-        );
-        print(&a, "tela-audio-escolhido");
+        print(&a, "tela-menu-audio-mudo");
         let (mut a, _) = palco(4);
         share(&mut a, ShareState::Failed);
         print(&a, "tela-falha");

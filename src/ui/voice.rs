@@ -85,8 +85,10 @@ pub struct ActiveCall {
     pub share_windows: bool,
     /// Áudio da transmissão no ar, por `Event::ShareAudio`.
     pub share_audio: Option<share::View>,
-    /// Lista de áudio aberta, sobre o palco.
-    pub audio_list: bool,
+    /// Menu da seta do botão de transmitir aberto (áudio e trocar).
+    pub share_menu: bool,
+    /// O áudio da transmissão no ar está ligado.
+    pub share_sound: bool,
     /// Identity de quem está sendo assistido.
     pub watching: Option<String>,
     /// Último quadro da transmissão assistida, já na GPU: trocar não pisca.
@@ -140,7 +142,8 @@ impl ActiveCall {
             share_source: None,
             share_windows: false,
             share_audio: None,
-            audio_list: false,
+            share_menu: false,
+            share_sound: false,
             watching: None,
             screen: None,
             screen_pending: false,
@@ -163,8 +166,13 @@ impl ActiveCall {
     pub fn bar_visible(&self) -> bool {
         self.bar_near
             || self.share_panel
-            || self.audio_list
+            || self.share_menu
             || matches!(self.share, share::State::Choosing | share::State::Failed)
+    }
+
+    /// Algum painel solto sobre o palco aberto: o fundo pega o clique de fora.
+    pub fn menu_open(&self) -> bool {
+        self.volume_panel.is_some() || self.share_panel || self.share_menu
     }
 
     pub fn attach(&mut self, call: Call, engine: Engine) {
@@ -200,6 +208,7 @@ impl ActiveCall {
             return self.swap_share();
         }
         self.share_panel = false;
+        self.share_sound = audio;
         if let Some(call) = &self.call {
             call.start_share(quality, audio, self.share_source.clone());
         }
@@ -254,7 +263,8 @@ impl ActiveCall {
         self.share = state;
         if state != share::State::Live {
             self.share_audio = None;
-            self.audio_list = false;
+            self.share_menu = false;
+            self.share_sound = false;
             self.own = None;
         }
     }
@@ -291,12 +301,23 @@ impl ActiveCall {
     }
 
     pub fn set_share_audio(&mut self, view: share::View) {
-        self.audio_list |= view.ask;
+        self.share_sound = view.choice != share::Choice::Silent;
         self.share_audio = Some(view);
     }
 
-    pub fn choose_share_audio(&mut self, choice: share::Choice) {
-        self.audio_list = false;
+    /// Liga ou desliga o áudio da transmissão no ar. Ao ligar, vai o único app tocando
+    /// ou, sem isso, o computador todo.
+    pub fn toggle_share_sound(&mut self) {
+        self.share_menu = false;
+        self.share_sound = !self.share_sound;
+        let choice = if !self.share_sound {
+            share::Choice::Silent
+        } else {
+            match self.share_audio.as_ref().map(|v| v.apps.as_slice()) {
+                Some([one]) => share::Choice::App(one.clone()),
+                _ => share::Choice::All,
+            }
+        };
         if let Some(call) = &self.call {
             call.choose_share_audio(choice);
         }

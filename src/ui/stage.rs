@@ -7,20 +7,21 @@ use iced::widget::{
 use iced::{Alignment, Color, ContentFit, Element, Length, Padding, Size, Theme, border};
 
 use super::sidebar::{
-    CLOSE, HEADPHONES, HEADPHONES_OFF, MIC, MIC_OFF, SCREEN, VOLUME, VOLUME_X, icon, live_badge,
-    tipped,
+    CHEVRON_UP, CLOSE, HEADPHONES, HEADPHONES_OFF, MIC, MIC_OFF, SCREEN, VOLUME, VOLUME_X, icon,
+    live_badge, tipped,
 };
 use super::theme::{self, ACCENT, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, FG, FG2, GREEN, IDLE};
 use super::voice::{self, ActiveCall, GAP, Status};
 use super::{Main, Msg, avatar};
 use crate::call::{Live, MAX_ATTEMPTS};
 use crate::config::{Config, SCREEN as SCREEN_KEY};
-use crate::share::{Choice, Quality, Source, State, View};
+use crate::share::{Quality, Source, State};
 
 /// Largura fixa e altura aproximada do painel de volume, pra centrar no tile.
 const PANEL: Size = Size::new(280.0, 104.0);
 /// Largura do painel de qualidade.
 const SHARE_PANEL: f32 = 340.0;
+const SHARE_MENU: f32 = 230.0;
 /// Seletor do Windows: três miniaturas por linha, com rolagem a partir da terceira.
 const PICKER: f32 = 620.0;
 const PICKER_COLUMNS: usize = 3;
@@ -41,9 +42,9 @@ pub fn view<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Elemen
     let base = with_bar(call, config, move |area| match &call.live {
         Some(live) if !live.is_empty() => {
             if call.watching.is_some() && call.view == voice::View::Focus {
-                focus(m, call, config, live, area)
+                focus(m, call, live, area)
             } else {
-                grid(m, call, config, live, area)
+                grid(m, call, live, area)
             }
         }
         _ => center(text("Conectando…").size(15).color(FG2)).into(),
@@ -53,8 +54,33 @@ pub fn view<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Elemen
     if let Status::Reconnecting(n) = call.status {
         layers.push(banner(n));
     }
-    layers.extend(share_overlay(call, config));
+    overlays(call, config, &mut layers);
     stack(layers).into()
+}
+
+/// Painéis soltos sobre o palco e a barra. Com algum aberto, um fundo pega o clique de fora,
+/// de qualquer botão: fecha o painel e não chega em mais nada.
+fn overlays<'a>(call: &'a ActiveCall, config: &'a Config, layers: &mut Vec<Element<'a, Msg>>) {
+    if call.menu_open() {
+        let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
+            .on_press(Msg::CloseVolume)
+            .on_right_press(Msg::CloseVolume)
+            .on_middle_press(Msg::CloseVolume);
+        layers.push(opaque(backdrop));
+    }
+    if let Some(name) = call.volume_panel.as_deref() {
+        layers.push(
+            responsive(move |area| {
+                let at = voice::panel_origin(area, call.volume_at, panel_size(name));
+                pin(opaque(volume_card(call, config, name)))
+                    .x(at.x)
+                    .y(at.y)
+                    .into()
+            })
+            .into(),
+        );
+    }
+    layers.extend(share_overlay(call, config));
 }
 
 /// Palco com a barra de controles por cima, só com o mouse perto do pé.
@@ -87,13 +113,7 @@ fn with_bar<'a>(
 }
 
 /// Transmissão assistida grande, com a outra transmissão e as pessoas numa coluna do lado.
-fn focus<'a>(
-    m: &'a Main,
-    call: &'a ActiveCall,
-    config: &'a Config,
-    live: &'a [Live],
-    area: Size,
-) -> Element<'a, Msg> {
+fn focus<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) -> Element<'a, Msg> {
     let watched = live
         .iter()
         .find(|p| Some(&p.identity) == call.watching.as_ref());
@@ -121,15 +141,7 @@ fn focus<'a>(
     let side = scrollable(Column::with_children(others).spacing(GAP))
         .width(SIDE.width)
         .style(theme::thin_scroll);
-    let layout = container(row![big, side].spacing(GAP)).padding(GAP);
-    let panel = call.volume_panel.as_deref().map(|name| {
-        let at = voice::panel_origin(area, call.volume_at, panel_size(name));
-        pin(volume_card(call, config, name)).x(at.x).y(at.y)
-    });
-    match panel {
-        Some(panel) => stack![layout, panel].into(),
-        None => layout.into(),
-    }
+    container(row![big, side].spacing(GAP)).padding(GAP).into()
 }
 
 /// Tamanho do painel de volume: o da transmissão tem a linha de botões a mais.
@@ -182,13 +194,7 @@ fn screen_tag(p: &Live, width: f32) -> Element<'_, Msg> {
         .into()
 }
 
-fn grid<'a>(
-    m: &'a Main,
-    call: &'a ActiveCall,
-    config: &'a Config,
-    live: &'a [Live],
-    area: Size,
-) -> Element<'a, Msg> {
+fn grid<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) -> Element<'a, Msg> {
     // Cada transmissão vira um tile próprio, antes das pessoas, como no site.
     let screens: Vec<&Live> = live.iter().filter(|p| p.screen_share).collect();
     let cells: Vec<(&Live, bool)> = screens
@@ -210,15 +216,7 @@ fn grid<'a>(
         .spacing(GAP)
         .into()
     });
-    let tiles = center(Column::with_children(rows).spacing(GAP));
-    let panel = call.volume_panel.as_deref().map(|name| {
-        let at = voice::panel_origin(area, call.volume_at, panel_size(name));
-        pin(volume_card(call, config, name)).x(at.x).y(at.y)
-    });
-    match panel {
-        Some(panel) => stack![tiles, panel].into(),
-        None => tiles.into(),
-    }
+    center(Column::with_children(rows).spacing(GAP)).into()
 }
 
 fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
@@ -378,7 +376,9 @@ fn own_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Ms
 /// com o mouse perto do pé, com "Fechar transmissão" no lugar de sair; Esc volta.
 pub fn full<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     let base = with_bar(call, config, move |_| screen_image(call, 15.0));
-    container(base).style(theme::fill(theme::STAGE)).into()
+    let mut layers = vec![container(base).style(theme::fill(theme::STAGE)).into()];
+    overlays(call, config, &mut layers);
+    stack(layers).into()
 }
 
 fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
@@ -428,6 +428,22 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
             _ => "Transmitir a tela",
         },
     );
+    // No ar, a seta ao lado abre o menu: áudio e trocar o que sai.
+    let arrow = (call.share == State::Live).then(|| {
+        let b = button(
+            container(icon(CHEVRON_UP, 18.0, ACCENT2))
+                .center_x(26)
+                .center_y(46),
+        )
+        .padding(0)
+        .style(theme::bar_toggle(true))
+        .on_press(Msg::ShareMenu);
+        tipped(b.into(), "Opções da transmissão")
+    });
+    let screen = row![screen]
+        .push(arrow)
+        .spacing(2)
+        .align_y(Alignment::Center);
     let separator = container(space())
         .width(1)
         .height(28)
@@ -489,11 +505,8 @@ fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element
         }
         // O seletor do Windows aberto pelo Trocar.
         State::Live if call.share_panel && cfg!(windows) => picker(call, config),
-        State::Live => match &call.share_audio {
-            Some(view) if call.audio_list => audio_card(view),
-            Some(view) => audio_line(view),
-            None => return None,
-        },
+        State::Live if call.share_menu => share_menu(call),
+        State::Live => return None,
         _ if call.share_panel && cfg!(windows) => picker(call, config),
         _ if call.share_panel => share_card(config),
         _ => return None,
@@ -748,86 +761,32 @@ fn text_width(content: &str, size: f32) -> f32 {
     .width
 }
 
-fn audio_label(choice: &Choice) -> String {
-    match choice {
-        Choice::App(app) => format!("Áudio: {app}"),
-        Choice::All => "Áudio: computador todo".into(),
-        Choice::Silent => "Sem áudio".into(),
-    }
-}
-
-/// O que vai de áudio com a transmissão no ar, com o botão de trocar.
-fn audio_line(view: &View) -> Element<'_, Msg> {
-    let silent = view.choice == Choice::Silent;
-    let change = button(text("Trocar").size(13).font(theme::SEMIBOLD))
-        .padding([5, 12])
-        .style(theme::outline)
-        .on_press(Msg::AudioList);
-    let line = row![
-        icon(if silent { VOLUME_X } else { VOLUME }, 16.0, FG2),
-        text(audio_label(&view.choice))
-            .size(13.5)
-            .font(theme::SEMIBOLD),
-        change,
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
-    container(line)
-        .padding([7, 14])
-        .style(theme::tooltip)
+/// Menu da seta do botão de transmitir: liga ou desliga o áudio e troca o que sai.
+fn share_menu(call: &ActiveCall) -> Element<'_, Msg> {
+    let item = |glyph, label: &'static str, msg| -> Element<'_, Msg> {
+        button(
+            row![
+                icon(glyph, 16.0, FG2),
+                text(label).size(14).font(theme::MEDIUM)
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([8, 12])
+        .width(Length::Fill)
+        .style(theme::nav_item(false))
+        .on_press(msg)
         .into()
-}
-
-/// Lista de áudio: os apps tocando agora, o computador todo ou nada. Atualiza sozinha.
-fn audio_card(view: &View) -> Element<'_, Msg> {
-    let close = button(container(icon(CLOSE, 16.0, FG2)).center(28))
-        .padding(0)
-        .style(theme::ghost)
-        .on_press(Msg::AudioList);
-    let head = row![
-        text("Áudio da transmissão")
-            .size(14.4)
-            .font(theme::SEMIBOLD)
-            .width(Length::Fill),
-        close
-    ]
-    .align_y(Alignment::Center);
-
-    let option = |label: String, choice: Choice| -> Element<'_, Msg> {
-        button(text(label).size(14).font(theme::MEDIUM))
-            .padding([8, 12])
-            .width(Length::Fill)
-            .style(theme::nav_item(choice == view.choice))
-            .on_press(Msg::AudioChoice(choice))
-            .into()
     };
-    let mut list: Vec<_> = view
-        .apps
-        .iter()
-        .map(|app| option(app.clone(), Choice::App(app.clone())))
-        .collect();
-    if view.apps.is_empty() {
-        list.push(
-            container(text("Nenhum app tocando agora.").size(13).color(FG2))
-                .padding([6, 12])
-                .into(),
-        );
-    }
-    // O escolhido continua na lista quando para de tocar, senão some a marcação.
-    if let Choice::App(app) = &view.choice
-        && !view.apps.contains(app)
-    {
-        list.push(option(
-            format!("{app} (sem som agora)"),
-            view.choice.clone(),
-        ));
-    }
-    list.push(option("Computador todo".into(), Choice::All));
-    list.push(option("Sem áudio".into(), Choice::Silent));
-
-    container(column![head, Column::with_children(list).spacing(2)].spacing(10))
-        .width(SHARE_PANEL)
-        .padding(12)
+    let sound = if call.share_sound {
+        item(VOLUME_X, "Desativar áudio", Msg::ShareSound)
+    } else {
+        item(VOLUME, "Ativar áudio", Msg::ShareSound)
+    };
+    let swap = item(SCREEN, "Trocar transmissão", Msg::ShareSwap);
+    container(column![sound, swap].spacing(2))
+        .width(SHARE_MENU)
+        .padding(6)
         .style(floating(BORDER))
         .into()
 }
@@ -847,7 +806,7 @@ fn floating(ring: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// Volume de uma pessoa. Sem fundo clicável: fecha no X ou no Escape, e a call segue.
+/// Volume de uma pessoa. Fecha no X, no Escape ou com um clique fora (`overlays`).
 fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> Element<'a, Msg> {
     let volume = config.volume_of(name);
     let screen = name.ends_with(SCREEN_KEY);

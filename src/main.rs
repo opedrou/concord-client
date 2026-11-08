@@ -2,6 +2,7 @@
 
 mod api;
 mod audio;
+mod awake;
 mod call;
 mod config;
 mod icon;

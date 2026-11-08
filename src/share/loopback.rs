@@ -29,6 +29,8 @@ const WAIT_MS: u32 = 100;
 pub struct Loopback {
     pub source: NativeAudioSource,
     stop: Arc<AtomicBool>,
+    /// Mudo: a captura segue, mas nada vai pra faixa. Vale também depois de trocar de alvo.
+    muted: Arc<AtomicBool>,
 }
 
 impl Loopback {
@@ -37,36 +39,48 @@ impl Loopback {
     pub fn start(target: Option<&Source>) -> Option<Self> {
         // Sem AEC, NS nem AGC: são feitos pra voz e mutilam música e jogo.
         let source = NativeAudioSource::new(AudioSourceOptions::default(), RATE, CHANNELS, 0);
-        let stop = open(target, &source)?;
-        Some(Self { source, stop })
+        let muted = Arc::new(AtomicBool::new(false));
+        let stop = open(target, &source, &muted)?;
+        Some(Self {
+            source,
+            stop,
+            muted,
+        })
     }
 
-    /// No Windows o que vai é o que foi escolhido no seletor: não há troca no ar.
-    pub fn choose(&self, _: super::Choice) {}
+    /// No Windows o que vai é o que foi escolhido no seletor: só dá pra ligar e desligar.
+    pub fn choose(&self, choice: super::Choice) {
+        self.muted
+            .store(choice == super::Choice::Silent, Ordering::Relaxed);
+    }
 
     /// A transmissão trocou de alvo: o loopback troca junto, na mesma fonte, e a faixa
     /// publicada segue a mesma. Se o novo não abrir, fica mudo: o som do alvo antigo não
     /// combina com a imagem nova.
     pub fn retarget(&mut self, target: Option<&Source>) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(stop) = open(target, &self.source) {
+        if let Some(stop) = open(target, &self.source, &self.muted) {
             self.stop = stop;
         }
     }
 }
 
 /// Abre o loopback do alvo numa thread que entrega em `source`. Devolve o pedido de parar.
-fn open(target: Option<&Source>, source: &NativeAudioSource) -> Option<Arc<AtomicBool>> {
+fn open(
+    target: Option<&Source>,
+    source: &NativeAudioSource,
+    muted: &Arc<AtomicBool>,
+) -> Option<Arc<AtomicBool>> {
     let (pid, include) = match target {
         Some(t) if t.window => (window_pid(t.id)?, true),
         _ => (std::process::id(), false),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready) = mpsc::channel();
-    let (feed, flag) = (source.clone(), stop.clone());
+    let (feed, flag, muted) = (source.clone(), stop.clone(), muted.clone());
     thread::Builder::new()
         .name("concord-tela-som".into())
-        .spawn(move || capture(pid, include, &flag, &feed, ready_tx))
+        .spawn(move || capture(pid, include, &flag, &muted, &feed, ready_tx))
         .ok()?;
     ready.recv().ok()?.then_some(stop)
 }
@@ -82,6 +96,7 @@ fn capture(
     pid: u32,
     include: bool,
     stop: &AtomicBool,
+    muted: &AtomicBool,
     source: &NativeAudioSource,
     ready: mpsc::Sender<bool>,
 ) {
@@ -125,6 +140,9 @@ fn capture(
             .map(|b| f32::from_le_bytes(*b))
             .collect();
         blocks.push(&floats, |samples| {
+            if muted.load(Ordering::Relaxed) {
+                return;
+            }
             let frame = AudioFrame {
                 data: samples.into(),
                 sample_rate: RATE,

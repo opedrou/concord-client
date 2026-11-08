@@ -29,6 +29,7 @@ const SETTINGS: &[u8] = icon!("settings");
 const VIDEO: &[u8] = icon!("video");
 pub const SCREEN: &[u8] = icon!("screen-share");
 pub const CLOSE: &[u8] = icon!("close");
+pub const CHEVRON_UP: &[u8] = icon!("chevron-up");
 pub const MARK: &[u8] = icon!("mark");
 pub const DOWNLOAD: &[u8] = icon!("download");
 

@@ -595,6 +595,20 @@ async fn publish(me: &LocalParticipant, source: NativeVideoSource, quality: Qual
         .is_ok()
 }
 
+/// Abre a captura de áudio da transmissão. No Windows a escolha já veio do seletor: não há
+/// lista pra mostrar.
+fn start_audio(r: &Running, audio: &(impl Fn(View) + Clone + Send + 'static)) -> Option<Audio> {
+    #[cfg(not(windows))]
+    {
+        Audio::start(r.frame, audio.clone())
+    }
+    #[cfg(windows)]
+    {
+        let _ = audio;
+        Audio::start(r.capture.target.as_ref())
+    }
+}
+
 /// `Unknown` e com nome fixo, como o site: ele só toca pra quem clicou em Assistir.
 async fn publish_audio(me: &LocalParticipant, source: NativeAudioSource) {
     let track =
@@ -688,8 +702,19 @@ pub async fn run(
                     }
                 }
                 Some(Cmd::Audio(choice)) => {
-                    if let Some(a) = share.as_ref().and_then(|r| r.audio.as_ref()) {
-                        a.choose(choice);
+                    let me = room.borrow().clone();
+                    if let Some(r) = share.as_mut().filter(|r| r.published) {
+                        // Saiu sem áudio e a pessoa ligou agora: nasce e publica aqui.
+                        if r.audio.is_none() && choice != Choice::Silent {
+                            r.with_audio = true;
+                            r.audio = start_audio(r, &audio);
+                            if let (Some(me), Some(a)) = (&me, &r.audio) {
+                                publish_audio(me, a.source.clone()).await;
+                            }
+                        }
+                        if let Some(a) = &r.audio {
+                            a.choose(choice);
+                        }
                     }
                 }
                 Some(Cmd::Stop) => {
@@ -724,16 +749,7 @@ pub async fn run(
             if let Some(r) = &mut share {
                 r.published = true;
                 if r.with_audio && r.audio.is_none() {
-                    #[cfg(not(windows))]
-                    {
-                        r.audio = Audio::start(r.frame, audio.clone());
-                    }
-                    // No Windows a escolha já veio do seletor: não há lista pra mostrar.
-                    #[cfg(windows)]
-                    {
-                        let _ = &audio;
-                        r.audio = Audio::start(r.capture.target.as_ref());
-                    }
+                    r.audio = start_audio(r, &audio);
                 }
                 if let Some(a) = &r.audio {
                     publish_audio(&me, a.source.clone()).await;
