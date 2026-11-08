@@ -232,7 +232,7 @@ impl Drop for Capture {
     }
 }
 
-struct Killed(Child);
+pub(crate) struct Killed(pub(crate) Child);
 
 impl Drop for Killed {
     fn drop(&mut self) {
@@ -355,7 +355,7 @@ fn bancada_eco() {
 }
 
 /// O que chega numa fonte em pouco mais de 1 s.
-fn level(source: &str) -> f64 {
+pub(crate) fn level(source: &str) -> f64 {
     let capture = Capture::start(source);
     thread::sleep(Duration::from_millis(1200));
     capture.rms()

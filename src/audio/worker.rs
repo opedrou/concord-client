@@ -131,14 +131,26 @@ impl Drop for Stopped {
     }
 }
 
-fn opened<R>(what: &str, result: Result<Opened<R>, String>) -> Result<Opened<R>, String> {
+/// A mesma falha repetida a cada [`RETRY`] entra no log uma vez só.
+fn opened<R>(
+    what: &str,
+    last_error: &mut Option<String>,
+    result: Result<Opened<R>, String>,
+) -> Result<Opened<R>, String> {
     match &result {
-        Ok(s) => log!(
-            "áudio: {what} aberta em {} ({})",
-            s.name,
-            s.id.as_deref().unwrap_or("?")
-        ),
-        Err(e) => log!("áudio: {what} não abriu: {e}"),
+        Ok(s) => {
+            *last_error = None;
+            log!(
+                "áudio: {what} aberta em {} ({})",
+                s.name,
+                s.id.as_deref().unwrap_or("?")
+            );
+        }
+        Err(e) if last_error.as_ref() != Some(e) => {
+            log!("áudio: {what} não abriu: {e}");
+            *last_error = Some(e.clone());
+        }
+        Err(_) => {}
     }
     result
 }
@@ -175,17 +187,18 @@ pub fn run(
     log!("áudio: motor começou");
     let _stopped = Stopped;
 
-    let keep_open = |output: &mut Side<_>, input: &mut Side<_>| {
+    let mut errors: [Option<String>; 2] = Default::default();
+    let mut keep_open = |output: &mut Side<_>, input: &mut Side<_>| {
         let now = Instant::now();
         output.keep_open(
             now,
             |s| lost("saída", s),
-            |n| opened("saída", device::open_output(n)),
+            |n| opened("saída", &mut errors[0], device::open_output(n)),
         );
         input.keep_open(
             now,
             |s| lost("entrada", s),
-            |n| opened("entrada", device::open_input(n)),
+            |n| opened("entrada", &mut errors[1], device::open_input(n)),
         );
     };
     keep_open(&mut output, &mut input);

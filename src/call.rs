@@ -97,6 +97,9 @@ enum Cmd {
     /// Identity de quem assistir; `None` para de assistir.
     Watch(Option<String>),
     Leave,
+    /// Queda simulada pelo SDK, pra bancada.
+    #[cfg(test)]
+    Simulate(livekit::SimulateScenario),
 }
 
 /// Quadro de transmissão em RGBA: o assistido, inteiro, ou a prévia, pequena.
@@ -319,6 +322,11 @@ impl Call {
         self.stop_share();
         let _ = self.cmd.send(Cmd::Leave);
     }
+
+    #[cfg(test)]
+    pub(crate) fn simulate(&self, scenario: livekit::SimulateScenario) {
+        let _ = self.cmd.send(Cmd::Simulate(scenario));
+    }
 }
 
 // --- Regras puras ------------------------------------------------------------
@@ -515,6 +523,8 @@ impl Ctl {
                     }
                     Some(Cmd::MutedPeople(p)) => self.people = p,
                     Some(Cmd::Watch(w)) => self.watching = w,
+                    #[cfg(test)]
+                    Some(Cmd::Simulate(_)) => {}
                 }
             }
         }
@@ -760,6 +770,10 @@ impl Task {
                         debounce = Some(Instant::now() + MUTED_DEBOUNCE);
                     }
                     Some(Cmd::Watch(w)) => s.watch(ctl, w),
+                    #[cfg(test)]
+                    Some(Cmd::Simulate(scenario)) => {
+                        let _ = s.room.simulate_scenario(scenario).await;
+                    }
                     None | Some(Cmd::Leave) => return Outcome::End(s.close().await),
                 },
                 Some(sid) = ctl.peek_rx.recv() => s.end_peek(ctl, &sid),
