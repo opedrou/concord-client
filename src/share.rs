@@ -580,7 +580,13 @@ async fn publish(me: &LocalParticipant, source: NativeVideoSource, quality: Qual
     let track = LocalVideoTrack::create_video_track("screen_share", RtcVideoSource::Native(source));
     let options = TrackPublishOptions {
         source: TrackSource::Screenshare,
-        video_codec: VideoCodec::H264,
+        // Windows sem NVENC cai no OpenH264 em software, que estoura o bitrate (lag) e depois o
+        // WebRTC corta. VP8 mediu menos CPU e controla melhor a taxa. Linux segue em H.264 com VA-API.
+        video_codec: if cfg!(windows) {
+            VideoCodec::VP8
+        } else {
+            VideoCodec::H264
+        },
         video_encoder: VideoEncoderBackend::Auto,
         simulcast: false,
         video_encoding: Some(VideoEncoding {
