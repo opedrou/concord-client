@@ -587,7 +587,9 @@ async fn publish(me: &LocalParticipant, source: NativeVideoSource, quality: Qual
             max_bitrate: quality.bitrate(),
             max_framerate: f64::from(quality.fps()),
         }),
-        degradation_preference: Some(DegradationPreference::MaintainFramerate),
+        // Igual ao site (livekit-client) e ao default do SDK pra tela: sob congestão cai fps,
+        // não resolução. Com MaintainFramerate o texto virava pixel.
+        degradation_preference: Some(DegradationPreference::MaintainResolution),
         ..Default::default()
     };
     me.publish_track(LocalTrack::Video(track), options)
