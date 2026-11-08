@@ -2,7 +2,10 @@
 //! pessoa não dividem fila.
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use super::{FRAME, RATE, gain};
@@ -16,9 +19,9 @@ const EFFECT_GAIN: f32 = 0.6;
 
 /// A fila fica fora do `rtrb` porque só a sala e a thread de áudio tocam nela, nunca
 /// o callback, e descartar o mais antigo exige o lado do produtor mexer na ponta do
-/// consumidor.
+/// consumidor. O segundo campo conta as amostras descartadas, pro log.
 #[derive(Default)]
-pub struct VoiceQueue(Mutex<VecDeque<i16>>);
+pub struct VoiceQueue(Mutex<VecDeque<i16>>, AtomicUsize);
 
 impl VoiceQueue {
     pub fn push(&self, pcm: &[i16]) {
@@ -26,6 +29,7 @@ impl VoiceQueue {
         queue.extend(pcm);
         let excess = queue.len().saturating_sub(MAX_QUEUED);
         queue.drain(..excess);
+        self.1.fetch_add(excess, Ordering::Relaxed);
     }
 }
 
@@ -72,6 +76,17 @@ impl Mixer {
 
     pub fn set_person(&mut self, name: String, slider: u8) {
         self.volumes.insert(name, slider);
+    }
+
+    /// Quanto cada faixa descartou por fila cheia desde a última chamada, em ms.
+    pub fn dropped(&self) -> Vec<(&str, usize)> {
+        self.tracks
+            .values()
+            .filter_map(|t| {
+                let samples = t.queue.1.swap(0, Ordering::Relaxed);
+                (samples > 0).then(|| (t.name.as_str(), samples * 1000 / RATE as usize))
+            })
+            .collect()
     }
 
     fn track_gain(&self, name: &str) -> f32 {
@@ -244,6 +259,16 @@ mod tests {
         assert_eq!(queue.len(), 9600, "200 ms em 48 kHz");
         assert_eq!(queue.front(), Some(&500));
         assert_eq!(queue.back(), pcm.last());
+    }
+
+    #[test]
+    fn descarte_conta_uma_vez_por_faixa() {
+        let mut m = mixer(71);
+        let q = voice(&mut m, "a", "ana");
+        voice(&mut m, "b", "bia").push(&[0; FRAME]);
+        q.push(&vec![0; MAX_QUEUED + RATE as usize / 10]);
+        assert_eq!(m.dropped(), [("ana", 100)]);
+        assert!(m.dropped().is_empty(), "zera depois de ler");
     }
 
     #[test]

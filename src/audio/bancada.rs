@@ -493,6 +493,136 @@ fn bancada_queda() {
     println!("BANCADA fim: {}", streams());
 }
 
+/// Som de saída tocando quando o motor cai, como ao sair da call: a call seguinte ouve, e
+/// saída que morre no meio do som não prende a thread.
+#[test]
+#[ignore = "precisa do PipeWire próprio: src/audio/bancada.sh"]
+fn bancada_som_de_saida() {
+    let raiz = std::env::var("BANCADA_RAIZ").expect("rode por src/audio/bancada.sh");
+    let mut rig = Rig::new();
+    for volta in 0..5 {
+        let (engine, _mic) = Engine::start(prefs(NoiseLevel::Off)).expect("start");
+        let _far = Far::play(
+            engine.add_voice("far".into(), "ana".into()),
+            wav("fala.wav"),
+        );
+        let rms = level("bancada_fone.monitor");
+        println!(
+            "BANCADA volta {volta}: rms={rms:.4} threads={}",
+            audio_threads()
+        );
+        assert!(rms > 0.05, "volta {volta} sem voz");
+        engine.play(Effect::Leave);
+        drop(engine);
+    }
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(audio_threads(), 0, "o som acabou e as threads também");
+
+    let (engine, _mic) = Engine::start(prefs(NoiseLevel::Off)).expect("start");
+    thread::sleep(Duration::from_millis(300));
+    engine.play(Effect::Leave);
+    drop(engine);
+    let pid = fs::read_to_string(format!("{raiz}/pulse/pid")).unwrap();
+    assert!(
+        Command::new("kill")
+            .arg(pid.trim())
+            .status()
+            .unwrap()
+            .success()
+    );
+    rig.0.clear();
+    thread::sleep(LINGER_TEST);
+    println!("BANCADA saída morreu no som: threads={}", audio_threads());
+    assert_eq!(audio_threads(), 0, "saída morta segurou a thread");
+}
+
+/// Prazo do `LINGER` do motor com folga.
+const LINGER_TEST: Duration = Duration::from_secs(4);
+
+/// Fone Bluetooth que some e volta, e padrão do sistema que muda: a voz vai junto. Sem
+/// isso, o stream ficava no dispositivo pra onde o servidor o empurrou, sem erro nenhum.
+#[test]
+#[ignore = "precisa do PipeWire próprio: src/audio/bancada.sh"]
+fn bancada_bluetooth() {
+    std::env::var("BANCADA_RAIZ").expect("rode por src/audio/bancada.sh");
+    let wait = Duration::from_secs(3);
+    let bt = "module-null-sink sink_name=bancada_bt channels=2 rate=48000 \
+              sink_properties=device.description=BancadaBT";
+    let mut rig = Rig::new();
+    rig.load(
+        "module-null-sink sink_name=bancada_reserva channels=2 rate=48000 \
+         sink_properties=device.description=BancadaReserva",
+    );
+    pactl(&["set-default-sink", "bancada_reserva"]);
+    let mut falhas = vec![];
+    let mut ouve = |sink: &str, what: &str| {
+        let rms = level(&format!("{sink}.monitor"));
+        println!("BANCADA {what}: {sink} rms={rms:.4} | {}", streams());
+        if rms < 0.05 {
+            falhas.push(what.to_owned());
+        }
+    };
+
+    let escolhido = AudioPrefs {
+        output: Some("BancadaBT".into()),
+        ..prefs(NoiseLevel::Off)
+    };
+    let (engine, _mic) = Engine::start(escolhido).expect("start");
+    let _far = Far::play(
+        engine.add_voice("far".into(), "ana".into()),
+        wav("fala.wav"),
+    );
+    ouve("bancada_reserva", "fone desligado ao entrar");
+    let modulo = rig.load(bt);
+    thread::sleep(wait);
+    ouve("bancada_bt", "fone ligou depois");
+    rig.unload(&modulo);
+    thread::sleep(wait);
+    ouve("bancada_reserva", "fone caiu");
+    rig.load(bt);
+    thread::sleep(wait);
+    ouve("bancada_bt", "fone voltou");
+    drop((_far, engine));
+
+    // Fone que é também o padrão do sistema, como um fone Bluetooth: cai e volta como padrão.
+    pactl(&["set-default-sink", "bancada_bt"]);
+    let escolhido = AudioPrefs {
+        output: Some("BancadaBT".into()),
+        ..prefs(NoiseLevel::Off)
+    };
+    let (engine, _mic) = Engine::start(escolhido).expect("start");
+    let _far = Far::play(
+        engine.add_voice("far".into(), "ana".into()),
+        wav("fala.wav"),
+    );
+    ouve("bancada_bt", "fone padrão");
+    let modulo = rig.0.last().unwrap().clone();
+    rig.unload(&modulo);
+    thread::sleep(wait);
+    ouve("bancada_reserva", "fone padrão caiu");
+    rig.load(bt);
+    pactl(&["set-default-sink", "bancada_bt"]);
+    thread::sleep(wait);
+    ouve("bancada_bt", "fone padrão voltou");
+    drop((_far, engine));
+    pactl(&["set-default-sink", "bancada_reserva"]);
+
+    let padrao = AudioPrefs {
+        output: None,
+        ..prefs(NoiseLevel::Off)
+    };
+    let (engine, _mic) = Engine::start(padrao).expect("start");
+    let _far = Far::play(
+        engine.add_voice("far".into(), "ana".into()),
+        wav("fala.wav"),
+    );
+    ouve("bancada_reserva", "padrão");
+    pactl(&["set-default-sink", "bancada_bt"]);
+    thread::sleep(wait);
+    ouve("bancada_bt", "padrão mudou");
+    assert!(falhas.is_empty(), "sem voz em: {falhas:?}");
+}
+
 // --- Calibração do limitador -------------------------------------------------
 
 /// Nível da fala normal, e o gabarito: bloco com fala é o que passa de 20 dB abaixo dela.

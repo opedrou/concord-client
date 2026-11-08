@@ -1,10 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// Uma linha no `concord.log`; ver `log::line`. Definido antes dos módulos pra valer em
+/// todos eles.
+macro_rules! log {
+    ($($arg:tt)*) => {
+        $crate::log::line(format_args!($($arg)*))
+    };
+}
+
 mod api;
 mod audio;
 mod call;
 mod config;
 mod icon;
+mod log;
 mod session;
 mod share;
 mod ui;
@@ -14,6 +23,13 @@ use iced::{Size, window};
 use ui::{App, theme};
 
 fn main() -> iced::Result {
+    // Pânico numa tarefa da sala some calado: ao menos fica no log.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log!("pânico: {info}");
+        default_hook(info);
+    }));
+    log!("Concord {} começou", env!("CARGO_PKG_VERSION"));
     #[cfg(windows)]
     if update::setup() {
         return Ok(());
