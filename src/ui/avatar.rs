@@ -87,7 +87,7 @@ pub fn ringed<'a>(inner: Element<'a, Msg>, size: f32, on: bool) -> Element<'a, M
 
 /// Corta no centro e reduz, como o `object-fit: cover` da web. Os limites barram
 /// imagem pequena em bytes e gigante na memória.
-fn decode(bytes: &[u8]) -> Option<image::Handle> {
+fn decode(bytes: &[u8]) -> Option<(image::Handle, Color)> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -102,10 +102,36 @@ fn decode(bytes: &[u8]) -> Option<image::Handle> {
         .resize_to_fill(LADO, LADO, FilterType::Triangle)
         .into_rgba8();
     let (w, h) = rgba.dimensions();
-    Some(image::Handle::from_rgba(w, h, rgba.into_raw()))
+    let tint = dominant(&rgba);
+    Some((image::Handle::from_rgba(w, h, rgba.into_raw()), tint))
 }
 
-pub async fn decode_off_thread(bytes: Vec<u8>) -> Option<image::Handle> {
+/// Cor que domina a foto, pro fundo do tile. Agrupa em 4 bits por canal e pesa pela saturação
+/// ao quadrado: fundo branco ou cinza não ganha do tema colorido (o pato amarelo vira amarelo).
+fn dominant(img: &::image::RgbaImage) -> Color {
+    let mut bins = vec![(0f32, [0u32; 4]); 4096];
+    for px in img.pixels().filter(|p| p[3] > 128) {
+        let [r, g, b, _] = px.0;
+        let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+        let sat = f32::from(hi - lo) / 255.0;
+        let bin =
+            &mut bins[usize::from(r >> 4) << 8 | usize::from(g >> 4) << 4 | usize::from(b >> 4)];
+        bin.0 += sat * sat + 0.01;
+        for (acc, c) in bin.1.iter_mut().zip([r, g, b]) {
+            *acc += u32::from(c);
+        }
+        bin.1[3] += 1;
+    }
+    let Some((_, [r, g, b, n])) = bins.into_iter().max_by(|a, b| a.0.total_cmp(&b.0)) else {
+        return theme::BG2;
+    };
+    if n == 0 {
+        return theme::BG2;
+    }
+    Color::from_rgb8((r / n) as u8, (g / n) as u8, (b / n) as u8)
+}
+
+pub async fn decode_off_thread(bytes: Vec<u8>) -> Option<(image::Handle, Color)> {
     tokio::task::spawn_blocking(move || decode(&bytes))
         .await
         .ok()
@@ -143,7 +169,7 @@ mod tests {
 
     #[test]
     fn avatar_vira_quadrado_pequeno() {
-        let handle = decode(&png(300, 100)).unwrap();
+        let (handle, _) = decode(&png(300, 100)).unwrap();
         assert!(matches!(
             handle,
             image::Handle::Rgba {
@@ -152,6 +178,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cor_dominante_ignora_fundo_branco() {
+        // Metade branca, um quarto amarelo, um quarto cinza: tem que sair o amarelo.
+        let img = RgbaImage::from_fn(4, 4, |x, y| match (x < 2, y < 2) {
+            (true, _) => ::image::Rgba([255, 255, 255, 255]),
+            (false, true) => ::image::Rgba([255, 216, 69, 255]),
+            _ => ::image::Rgba([128, 128, 128, 255]),
+        });
+        assert_eq!(dominant(&img), Color::from_rgb8(255, 216, 69));
     }
 
     #[test]

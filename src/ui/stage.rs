@@ -253,12 +253,13 @@ fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Eleme
     } else {
         iced::Color::TRANSPARENT
     };
+    let bg = m.tint(name).unwrap_or(BG2);
     let tile = container(body)
         .width(size.width)
         .height(size.height)
         .clip(true)
         .style(move |_| container::Style {
-            background: Some(BG2.into()),
+            background: Some(bg.into()),
             border: border::rounded(18).color(ring).width(2),
             ..Default::default()
         });

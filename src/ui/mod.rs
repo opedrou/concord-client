@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{image, operation, row, stack};
-use iced::{Element, Event, Subscription, Task, Theme, event, mouse, time, window};
+use iced::{Color, Element, Event, Subscription, Task, Theme, event, mouse, time, window};
 use voice::{ActiveCall, Boot, Probe};
 
 use crate::api::{
@@ -89,7 +89,7 @@ struct Main {
     avatar_paths: HashMap<String, String>,
     /// Caminho -> imagem. O caminho muda quando a foto muda, então nunca envelhece.
     // ponytail: cache só na memória, baixa de novo a cada abertura; disco se pesar.
-    avatars: HashMap<String, image::Handle>,
+    avatars: HashMap<String, (image::Handle, Color)>,
     requested: HashSet<String>,
     settings: Option<Tab>,
     resizing: bool,
@@ -143,7 +143,7 @@ pub enum Msg {
     Tick,
     PollIf(Option<bool>),
     Presence(Result<Presence, Error>),
-    Avatar(String, Option<image::Handle>),
+    Avatar(String, Option<(image::Handle, Color)>),
     ToggleMic,
     ToggleDeafen,
     JoinChannel(String),
@@ -1343,7 +1343,12 @@ impl Main {
     }
 
     fn avatar(&self, name: &str) -> Option<&image::Handle> {
-        self.avatars.get(self.avatar_paths.get(name)?)
+        Some(&self.avatars.get(self.avatar_paths.get(name)?)?.0)
+    }
+
+    /// Cor dominante da foto, pro fundo do tile.
+    fn tint(&self, name: &str) -> Option<Color> {
+        Some(self.avatars.get(self.avatar_paths.get(name)?)?.1)
     }
 }
 
@@ -2429,6 +2434,24 @@ mod tests {
         ] {
             print(&palco(n).0, nome);
         }
+        // Fotos sintéticas: o fundo do tile toma a cor dominante de cada uma.
+        let (mut a, _) = palco(4);
+        for (nome, cor) in
+            nomes
+                .iter()
+                .zip([[82, 38, 15], [121, 82, 88], [255, 216, 69], [110, 75, 45]])
+        {
+            let foto =
+                ::image::RgbaImage::from_pixel(8, 8, ::image::Rgba([cor[0], cor[1], cor[2], 255]));
+            let tom = Color::from_rgb8(cor[0], cor[1], cor[2]);
+            let m = main_of(&mut a);
+            m.avatar_paths.insert((*nome).into(), format!("/{nome}"));
+            m.avatars.insert(
+                format!("/{nome}"),
+                (image::Handle::from_rgba(8, 8, foto.into_raw()), tom),
+            );
+        }
+        print(&a, "palco-cores");
         let (mut a, id) = palco(4);
         let _ = a.update(Msg::CallEvent(id, call::Event::Reconnecting { attempt: 3 }));
         let _ = a.update(Msg::OpenVolume("Ana".into()));
