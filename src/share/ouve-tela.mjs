@@ -12,6 +12,17 @@ const browser = await puppeteer.launch({
   args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', '--autoplay-policy=no-user-gesture-required', '--no-first-run', '--mute-audio'],
 });
 const page = await browser.newPage();
+// Guarda as conexões do site, pra ler no fim o codec que o Chrome negociou pra receber.
+await page.evaluateOnNewDocument(() => {
+  window.conexoes = [];
+  const Original = window.RTCPeerConnection;
+  window.RTCPeerConnection = class extends Original {
+    constructor(...args) {
+      super(...args);
+      window.conexoes.push(this);
+    }
+  };
+});
 await page.goto(`${base}/login`, { waitUntil: 'domcontentloaded' });
 await page.evaluate(async (u, p) => { await fetch('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) }); }, user, pass);
 await page.goto(`${base}/rooms/${room}`, { waitUntil: 'domcontentloaded' });
@@ -54,5 +65,19 @@ const clicou = await page.evaluate(() => {
 console.log('CLICOU', clicou);
 await new Promise((r) => setTimeout(r, 6000));
 console.log('DEPOIS', JSON.stringify(await medir()));
+// O `stereo=1` aqui é o que faz o Chrome decodificar em dois canais.
+const codecs = await page.evaluate(async () => {
+  const out = [];
+  for (const pc of window.conexoes) {
+    const stats = await pc.getStats();
+    stats.forEach((r) => {
+      if (r.type !== 'inbound-rtp' || r.kind !== 'audio') return;
+      const c = stats.get(r.codecId);
+      out.push(`${c?.mimeType}/${c?.channels} fmtp=${c?.sdpFmtpLine} bytes=${r.bytesReceived}`);
+    });
+  }
+  return out;
+});
+console.log('RECEBIDO', JSON.stringify(codecs));
 await page.screenshot({ path: `${OUT}/ouve-tela.png` });
 await browser.close();
