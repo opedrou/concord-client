@@ -1,6 +1,10 @@
 //! Canal de texto aberto, no lugar do palco: a call continua tocando por trás. A lógica
 //! fica em `crate::chat`.
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::time::Duration;
+
+use futures_util::{Stream, StreamExt};
 
 use iced::keyboard::{Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
@@ -8,17 +12,22 @@ use iced::widget::text_editor::{Action, Binding, KeyPress, Motion};
 use iced::widget::{
     Column, button, column, container, mouse_area, row, scrollable, space, text, text_editor,
 };
-use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Task, Theme, border};
+use iced::{
+    Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task, Theme,
+    border,
+};
 
 use super::sidebar::{CLOSE, HASH, icon};
-use super::theme::{self, BG, BG2, BORDER, BORDER2, DANGER, FG, FG2, FG3, HOVER};
+use super::theme::{self, BG, BG2, BORDER, BORDER2, DANGER, FG, FG2, FG3, HOVER, IDLE};
 use super::{Main, Msg as App, avatar};
 use crate::api::{Attachment, Channel, Client, Error, Kind, Message, Page};
-use crate::chat::{self as logic, Timeline, Window};
+use crate::chat::{self as logic, Live, Timeline, Window};
 
 const LISTA: &str = "chat-lista";
 const COMPOSER: &str = "chat-composer";
 const ROSTO: f32 = 40.0;
+/// Busca do que perdeu que falhou com o tempo real de pé: tenta de novo depois disso.
+const DE_NOVO: Duration = Duration::from_secs(3);
 const TEXTO: f32 = 14.8;
 /// Seleção bem visível no fundo escuro: o `SOFT` do tema some aqui.
 const SELECAO: Color = Color::from_rgba8(157, 78, 221, 0.45);
@@ -38,6 +47,10 @@ pub enum Msg {
     Sent(Result<Message, Error>),
     /// Mouse entrou (`true`) ou saiu de uma mensagem.
     Hover(i64, bool),
+    /// Evento do SSE do canal.
+    Live(Live),
+    /// Tenta de novo a busca do que perdeu.
+    Recover,
     /// Sessão vencida no meio: volta pro login.
     Expired,
 }
@@ -54,6 +67,9 @@ pub struct Chat {
     sending: bool,
     error: Option<String>,
     hover: Option<i64>,
+    /// O tempo real caiu e está tentando voltar.
+    lost: bool,
+    live: bool,
 }
 
 impl Chat {
@@ -69,9 +85,16 @@ impl Chat {
             sending: false,
             error: None,
             hover: None,
+            lost: false,
+            live: false,
         };
         let task = Task::batch([chat.recover(client), operation::focus(COMPOSER)]);
         (chat, task)
+    }
+
+    /// SSE do canal enquanto o chat está aberto: fechou, a conexão cai junto.
+    pub fn subscription(&self, client: &Client) -> Subscription<App> {
+        Subscription::run_with(Feed(client.clone(), self.channel), feed)
     }
 
     /// Quem aparece na tela, pra baixar as fotos.
@@ -103,8 +126,29 @@ impl Chat {
                 self.sync();
             }
             Msg::Loaded(Err(e)) => {
-                return self.failed(e, "Não foi possível carregar as mensagens.");
+                let task = self.failed(e, "Não foi possível carregar as mensagens.");
+                if !self.live || e == Error::Unauthorized {
+                    return task;
+                }
+                // Sem a busca, o que chegou com a conexão fora ficaria faltando até a próxima queda.
+                return Task::future(async move {
+                    tokio::time::sleep(DE_NOVO).await;
+                    App::Chat(channel, Msg::Recover)
+                });
             }
+            Msg::Recover => return self.recover(client),
+            // A cada volta, busca o que perdeu. A primeira cobre o que chegou entre a carga
+            // inicial e o servidor começar a mandar os eventos.
+            Msg::Live(Live::Connected) => {
+                (self.live, self.lost) = (true, false);
+                return self.recover(client);
+            }
+            Msg::Live(Live::Event(event)) => {
+                self.timeline.apply(event);
+                self.sync();
+            }
+            Msg::Live(Live::Lost) => (self.live, self.lost) = (false, true),
+            Msg::Live(Live::Unauthorized) => return self.failed(Error::Unauthorized, ""),
             Msg::More => {
                 if self.loading_more || !self.timeline.has_more {
                     return Task::none();
@@ -217,6 +261,20 @@ impl Chat {
     }
 }
 
+/// Chave da assinatura: o canal. O cliente vai junto, mas não muda enquanto o chat existe.
+struct Feed(Client, i64);
+
+impl Hash for Feed {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.1.hash(state);
+    }
+}
+
+fn feed(Feed(client, channel): &Feed) -> impl Stream<Item = App> + use<> {
+    let channel = *channel;
+    logic::live(client.clone(), channel).map(move |live| App::Chat(channel, Msg::Live(live)))
+}
+
 /// Com a lista presa no pé, deslocamento zero é a mensagem mais nova.
 fn to_bottom() -> Task<App> {
     operation::scroll_to(
@@ -234,13 +292,17 @@ pub fn view<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
         .padding(0)
         .style(theme::ghost)
         .on_press(App::Chat(channel, Msg::Close));
+    let lost = chat
+        .lost
+        .then(|| text("Reconectando…").size(12.5).color(IDLE));
     let header = container(
         row![
             icon(HASH, 18.0, FG3),
             text(&chat.name).size(16.5).font(theme::SEMIBOLD),
             space().width(Length::Fill),
-            close,
         ]
+        .push(lost)
+        .push(close)
         .spacing(8)
         .align_y(Alignment::Center),
     )
@@ -647,6 +709,31 @@ mod tests {
     }
 
     #[test]
+    fn tempo_real_entra_sai_e_avisa_a_queda() {
+        use crate::api::ChatEvent;
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let live = |l| App::Chat(1, Msg::Live(l));
+        let _ = a.update(live(Live::Connected));
+        assert!(chat(&mut a).live);
+        let _ = a.update(live(Live::Event(ChatEvent::Created {
+            message: msg(7, "ana", 0, "nova"),
+        })));
+        let _ = a.update(live(Live::Event(ChatEvent::Created {
+            message: msg(7, "ana", 0, "nova"),
+        })));
+        assert_eq!(chat(&mut a).timeline.messages.len(), 1);
+        assert!(chat(&mut a).texts.contains_key(&7));
+        let _ = a.update(live(Live::Event(ChatEvent::Deleted { message_id: 7 })));
+        assert!(chat(&mut a).timeline.messages.is_empty());
+        assert!(chat(&mut a).texts.is_empty());
+        let _ = a.update(live(Live::Lost));
+        assert!(chat(&mut a).lost && !chat(&mut a).live);
+        let _ = a.update(live(Live::Connected));
+        assert!(!chat(&mut a).lost);
+    }
+
+    #[test]
     fn campo_corta_no_limite_e_texto_da_mensagem_nao_edita() {
         let mut a = app();
         let _ = a.update(App::Chat(1, Msg::Open));
@@ -742,6 +829,7 @@ mod tests {
         print(&a, "enviando");
         let c = chat(&mut a);
         let _ = c.update(Msg::Sent(Err(Error::Offline)), &cliente);
+        c.lost = true;
         print(&a, "erro");
     }
 }

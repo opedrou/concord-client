@@ -363,6 +363,9 @@ impl App {
             if m.resizing {
                 subs.push(event::listen_with(drag));
             }
+            if let Some(open) = &m.chat {
+                subs.push(open.subscription(&m.client));
+            }
         }
         Subscription::batch(subs)
     }

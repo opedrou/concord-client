@@ -143,6 +143,22 @@ pub struct Page {
     pub has_more: bool,
 }
 
+/// Evento do SSE do canal.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ChatEvent {
+    Created {
+        message: Message,
+    },
+    #[serde(rename_all = "camelCase")]
+    Deleted {
+        message_id: i64,
+    },
+}
+
+/// O SSE fica aberto: quem vê se morreu é o leitor, pelo ping de 25 s.
+const ABERTO: Duration = Duration::from_secs(24 * 3600);
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionDetails {
@@ -361,6 +377,19 @@ impl Client {
             .authed(self.http.post(url))
             .json(&json!({ "content": content }));
         parse(req.send().await.map_err(|_| Error::Offline)?).await
+    }
+
+    /// SSE do canal, já com a resposta 200: a partir daqui o servidor entrega os eventos.
+    pub async fn message_stream(&self, channel: i64) -> Result<Response, Error> {
+        let req = self
+            .get(&format!("/api/channels/{channel}/messages/stream"))
+            .header(header::ACCEPT, "text/event-stream")
+            .timeout(ABERTO);
+        let resp = tokio::time::timeout(Duration::from_secs(15), req.send()).await;
+        check(
+            resp.map_err(|_| Error::Offline)?
+                .map_err(|_| Error::Offline)?,
+        )
     }
 }
 

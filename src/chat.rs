@@ -1,7 +1,14 @@
-//! Chat dos canais de texto, sem interface: a linha do tempo. A tela fica em `ui::chat`.
+//! Chat dos canais de texto, sem interface: a linha do tempo e o tempo real pelo SSE. A tela
+//! fica em `ui::chat`.
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
-use crate::api::{Client, Error, Message, Page};
+use futures_util::{SinkExt, Stream};
+
+use crate::api::{ChatEvent, Client, Error, Message, Page};
+
+#[cfg(test)]
+mod bancada;
 
 /// Mensagens por página, como na web.
 pub const PAGINA: u32 = 50;
@@ -12,6 +19,12 @@ const MAX_PAGINAS: usize = 20;
 pub const MAX_TEXTO: usize = 4000;
 /// Mesmo autor dentro disso fica no mesmo bloco, como na web.
 const JUNTA_MS: i64 = 5 * 60 * 1000;
+const PRIMEIRA_ESPERA: Duration = Duration::from_secs(1);
+const MAX_ESPERA: Duration = Duration::from_secs(30);
+/// O servidor manda ping a cada 25 s: sem nada nesse tempo, a conexão morreu calada.
+const SILENCIO: Duration = Duration::from_secs(60);
+/// Evento maior que isso não é do Concord.
+const MAX_EVENTO: usize = 1024 * 1024;
 
 /// O que está na tela, em ordem de id, que é a ordem de chegada no servidor.
 #[derive(Debug, Default)]
@@ -55,6 +68,20 @@ impl Timeline {
                 self.messages.insert(at, message);
                 true
             }
+        }
+    }
+
+    pub fn remove(&mut self, id: i64) {
+        self.deleted.insert(id);
+        self.messages.retain(|m| m.id != id);
+    }
+
+    pub fn apply(&mut self, event: ChatEvent) {
+        match event {
+            ChatEvent::Created { message } => {
+                self.insert(message);
+            }
+            ChatEvent::Deleted { message_id } => self.remove(message_id),
         }
     }
 
@@ -135,6 +162,93 @@ pub async fn recover(client: &Client, channel: i64, asked: Option<i64>) -> Resul
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum Live {
+    /// Conectou ou voltou: hora de buscar o que perdeu.
+    Connected,
+    Event(ChatEvent),
+    /// Caiu. Tenta de novo sozinho, esperando cada vez mais.
+    Lost,
+    Unauthorized,
+}
+
+/// SSE do canal enquanto o stream existir. Reconecta sozinho, com espera de 1 s dobrando até
+/// 30 s, e volta pra 1 s depois de uma conexão que durou.
+pub fn live(client: Client, channel: i64) -> impl Stream<Item = Live> {
+    iced::stream::channel(64, async move |mut out| {
+        let mut wait = PRIMEIRA_ESPERA;
+        loop {
+            match client.message_stream(channel).await {
+                Ok(mut resp) => {
+                    let since = Instant::now();
+                    if out.send(Live::Connected).await.is_err() {
+                        return;
+                    }
+                    let mut sse = Sse::default();
+                    while let Ok(Ok(Some(chunk))) =
+                        tokio::time::timeout(SILENCIO, resp.chunk()).await
+                    {
+                        let Some(events) = sse.push(&chunk) else {
+                            break;
+                        };
+                        for event in events.iter().filter_map(|d| serde_json::from_str(d).ok()) {
+                            if out.send(Live::Event(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    if since.elapsed() > MAX_ESPERA {
+                        wait = PRIMEIRA_ESPERA;
+                    }
+                    log!("chat: o tempo real caiu, volta em {} s", wait.as_secs());
+                    if out.send(Live::Lost).await.is_err() {
+                        return;
+                    }
+                }
+                Err(Error::Unauthorized) => {
+                    let _ = out.send(Live::Unauthorized).await;
+                    return;
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(MAX_ESPERA);
+        }
+    })
+}
+
+/// Leitor de `text/event-stream`, só o que o Concord usa: `event` e `data`.
+#[derive(Default)]
+struct Sse {
+    buf: Vec<u8>,
+}
+
+impl Sse {
+    /// O `data` de cada evento `message` completo. `None`: evento grande demais.
+    fn push(&mut self, chunk: &[u8]) -> Option<Vec<String>> {
+        self.buf.extend(chunk.iter().filter(|&&b| b != b'\r'));
+        let mut out = Vec::new();
+        while let Some(end) = self.buf.windows(2).position(|w| w == b"\n\n") {
+            let block: Vec<u8> = self.buf.drain(..end + 2).collect();
+            let block = String::from_utf8_lossy(&block);
+            let (mut event, mut data) = ("message", Vec::new());
+            for line in block.lines() {
+                let (field, value) = line.split_once(':').unwrap_or((line, ""));
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                match field {
+                    "event" => event = value,
+                    "data" => data.push(value),
+                    _ => {}
+                }
+            }
+            if event == "message" && !data.is_empty() {
+                out.push(data.join("\n"));
+            }
+        }
+        (self.buf.len() <= MAX_EVENTO).then_some(out)
+    }
+}
+
 /// Texto que o servidor aceita: sem espaço nas pontas e até 4000 em UTF-16.
 pub fn fits(text: &str) -> bool {
     text.trim().encode_utf16().count() <= MAX_TEXTO
@@ -194,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn contrato_das_mensagens() {
+    fn contrato_das_mensagens_e_do_sse() {
         let page: Page = serde_json::from_str(
             r#"{"messages":[
                 {"id":7,"channelId":2,"authorId":null,"authorName":"Usuário removido","content":"oi","createdAt":1700000000000,"attachment":null},
@@ -211,6 +325,24 @@ mod tests {
         assert_eq!((foto.kind, foto.size()), (crate::api::Kind::Image, 0));
         let outro = page.messages[2].attachment.as_ref().unwrap();
         assert_eq!(outro.kind, crate::api::Kind::File);
+
+        let mut sse = Sse::default();
+        let corpo = ": connected\n\nevent: message\ndata: {\"type\":\"deleted\",\"messageId\":7,\"channelId\":2}\n\n: ping\n\nevent: message\r\ndata: {\"type\":\"created\",\"message\":{\"id\":10,\"channelId\":2,\"authorId\":3,\"authorName\":\"ana\",\"content\":\"a\\nb\",\"createdAt\":1,\"attachment\":null}}\r\n\r\nevent: mess";
+        // Em pedaços que cortam no meio da linha.
+        let (a, b) = corpo.split_at(70);
+        let mut dados = sse.push(a.as_bytes()).unwrap();
+        dados.extend(sse.push(b.as_bytes()).unwrap());
+        let eventos: Vec<ChatEvent> = dados
+            .iter()
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect();
+        assert_eq!(eventos[0], ChatEvent::Deleted { message_id: 7 });
+        let ChatEvent::Created { message } = &eventos[1] else {
+            panic!("{eventos:?}");
+        };
+        assert_eq!((message.id, message.content.as_str()), (10, "a\nb"));
+        assert_eq!(sse.buf, b"event: mess");
+        assert!(sse.push(&vec![b'x'; MAX_EVENTO]).is_none());
     }
 
     #[test]
@@ -246,13 +378,25 @@ mod tests {
     fn volta_da_conexao_traz_o_que_perdeu_sem_repetir_e_tira_o_apagado() {
         let mut t = Timeline::default();
         t.recovered(window(&[1, 2, 3, 4, 5], false, None, true));
-        // Fora do ar: 4 apagada, 6 e 7 novas. No meio da busca chega a 8, a resposta do envio.
-        t.insert(msg(8, "ana", 8));
+        // Fora do ar: 4 apagada, 6 e 7 novas. No meio da busca chega a 8 pelo SSE.
+        t.apply(ChatEvent::Created {
+            message: msg(8, "ana", 8),
+        });
         t.recovered(window(&[1, 2, 3, 5, 6, 7], false, Some(5), true));
         assert_eq!(ids(&t), [1, 2, 3, 5, 6, 7, 8]);
         // A mesma resposta duas vezes não muda nada.
         t.recovered(window(&[1, 2, 3, 5, 6, 7], false, Some(5), true));
         assert_eq!(ids(&t), [1, 2, 3, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn resposta_atrasada_nao_ressuscita_apagada() {
+        let mut t = Timeline::default();
+        t.recovered(window(&[10, 11], true, None, true));
+        t.apply(ChatEvent::Deleted { message_id: 11 });
+        t.recovered(window(&[10, 11, 12], true, Some(11), true));
+        assert_eq!(ids(&t), [10, 12]);
+        assert!(!t.insert(msg(11, "ana", 11)));
     }
 
     #[test]
