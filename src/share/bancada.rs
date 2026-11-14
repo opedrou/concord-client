@@ -985,6 +985,7 @@ async fn bancada_avisos() {
         output: None,
         noise: NoiseLevel::Off,
         sensitivity: Sensitivity::Auto,
+        mic_gain: MicGain::Auto,
         master: 71,
         volumes: HashMap::new(),
     };
