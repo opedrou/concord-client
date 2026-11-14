@@ -373,22 +373,22 @@ mod tests {
         std::fs::create_dir_all(data.join("concord")).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
         let outro = data.join("applications/outro.desktop");
-        let vivos = [&exe, &old_of(&exe), &exe.with_extension("new")];
-        let mortos = [
+        let binarios = [&exe, &old_of(&exe), &exe.with_extension("new")];
+        let dados = [
             data.join("applications/concord.desktop"),
             data.join("concord/icon.png"),
             outro.clone(),
         ];
-        for f in vivos
+        for f in binarios
             .iter()
             .map(|p| p.as_path())
-            .chain(mortos.iter().map(|p| p.as_path()))
+            .chain(dados.iter().map(|p| p.as_path()))
         {
             std::fs::write(f, b"x").unwrap();
         }
         uninstall(&exe, &data);
-        assert!(vivos.iter().all(|f| !f.exists()));
-        assert!(!mortos[0].exists() && !mortos[1].exists());
+        assert!(binarios.iter().all(|f| !f.exists()));
+        assert!(!dados[0].exists() && !dados[1].exists());
         assert!(!data.join("concord").exists(), "pasta vazia some");
         assert!(outro.exists(), "outros apps não são tocados");
         // Com algo de fora na pasta, ela fica.
