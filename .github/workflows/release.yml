@@ -1,10 +1,11 @@
 name: Release
 
-# Tag `v1.2.3` no main: compila Windows e Linux e publica a release com os nomes que o
-# autoupdater procura (`src/update.rs`). O GitHub calcula o SHA-256 de cada arquivo.
+# Reserva do `release/release.sh`, que compila os dois sistemas no Linux e publica. Só serve
+# se a tag já foi pro GitHub sem release: `gh workflow run release.yml --ref v1.2.3`.
+# Compila Windows e Linux e publica com os nomes que o autoupdater procura (`src/update.rs`).
+# O GitHub calcula o SHA-256 de cada arquivo.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
