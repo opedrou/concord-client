@@ -1,5 +1,5 @@
 //! Bancada do chat contra o site local, sem janela: o cliente pela API, com a mesma linha do
-//! tempo e o mesmo SSE da tela, e o Chrome pelo site, nos dois sentidos. No meio, um proxy
+//! tempo, o mesmo SSE e os mesmos anexos da tela, e o Chrome pelo site, nos dois sentidos. No meio, um proxy
 //! entre o cliente e o site derruba as conexões sem derrubar o site. Roda por
 //! `src/chat/bancada.sh`.
 use std::{pin::Pin, process::Command, time::Instant};
@@ -18,6 +18,15 @@ use crate::api::{ChannelKind, Secret};
 const ESPERA: Duration = Duration::from_secs(90);
 /// Mensagens mandadas com o cliente fora do ar.
 const DURANTE: usize = 5;
+
+/// PNG de uma cor só.
+fn png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut out = Vec::new();
+    image::RgbImage::from_pixel(w, h, image::Rgb(rgb))
+        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+        .unwrap();
+    out
+}
 
 fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("faltou {name}"))
@@ -144,6 +153,8 @@ async fn bancada_chat() {
     let run = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
     let out = std::env::var("OUT").unwrap_or_else(|_| std::env::temp_dir().display().to_string());
 
+    let foto_web = format!("{out}/foto-web.png");
+    std::fs::write(&foto_web, png(120, 80, [40, 90, 200])).unwrap();
     let mut web = Command::new("node")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -152,6 +163,7 @@ async fn bancada_chat() {
         .env("CONCORD_CANAL", &slug)
         .env("RUN", &run)
         .env("OUT", &out)
+        .env("FOTO", &foto_web)
         .spawn()
         .expect("node");
 
@@ -172,7 +184,7 @@ async fn bancada_chat() {
         .await;
     let enviada = lado
         .client
-        .send_message(channel, &format!("cliente-1 {run}"))
+        .send_message(channel, &format!("cliente-1 {run}"), None)
         .await
         .expect("envio");
     lado.tela.insert(enviada);
@@ -183,7 +195,7 @@ async fn bancada_chat() {
     let antes = Instant::now();
     for k in 1..=DURANTE {
         direto
-            .send_message(channel, &format!("durante-{k} {run}"))
+            .send_message(channel, &format!("durante-{k} {run}"), None)
             .await
             .expect("envio durante a queda");
     }
@@ -216,6 +228,70 @@ async fn bancada_chat() {
         tela[tela.len().saturating_sub(servidor.len())..],
         servidor[..]
     );
+
+    // Anexos do cliente: uma imagem e um arquivo qualquer.
+    let foto = png(64, 48, [200, 40, 40]);
+    let subiu = lado
+        .client
+        .upload(&format!("cliente-{run}.png"), foto.clone(), |_, _| {})
+        .await
+        .expect("upload da imagem");
+    assert_eq!(subiu.kind, "image");
+    let legenda = format!("cliente-anexo {run}");
+    let enviada = lado
+        .client
+        .send_message(channel, &legenda, Some(&subiu))
+        .await
+        .unwrap();
+    lado.tela.insert(enviada.clone());
+    // O que a tela baixa pra mostrar.
+    let anexo = enviada.attachment.expect("anexo");
+    let bytes = lado.client.attachment(&anexo.url, 1 << 20).await.unwrap();
+    assert_eq!(bytes, foto);
+    assert_eq!(thumbnail(&bytes).map(|t| (t.0, t.1)), Some((64, 48)));
+
+    let notas = b"notas da call\n".repeat(100);
+    let subiu = lado
+        .client
+        .upload(&format!("notas-{run}.txt"), notas.clone(), |_, _| {})
+        .await
+        .expect("upload do arquivo");
+    assert_eq!(subiu.kind, "file");
+    let enviada = lado
+        .client
+        .send_message(channel, &format!("cliente-arquivo {run}"), Some(&subiu))
+        .await
+        .unwrap();
+    lado.tela.insert(enviada.clone());
+    // O que o clique baixa pra abrir: o nome perde a extensão de quem mandou.
+    let anexo = enviada.attachment.expect("anexo");
+    let local = download(&lado.client, enviada.id, &anexo.name, &anexo.url)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&local).unwrap(), notas);
+    let nome = local.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(nome, format!("{}-notas-{run}.bin", enviada.id));
+    std::fs::remove_file(local).unwrap();
+
+    // Foto do Chrome: chega pelo SSE e a tela consegue mostrar.
+    let web_anexo = format!("web-anexo {run}");
+    lado.ate("viu a foto do Chrome", |l| l.tem(&web_anexo) == 1)
+        .await;
+    let recebida = lado
+        .tela
+        .messages
+        .iter()
+        .find(|m| m.content == web_anexo)
+        .and_then(|m| m.attachment.clone())
+        .expect("foto do Chrome");
+    assert_eq!(recebida.kind, crate::api::Kind::Image);
+    let bytes = lado
+        .client
+        .attachment(&recebida.url, 1 << 22)
+        .await
+        .unwrap();
+    let (w, h, _) = thumbnail(&bytes).expect("foto do Chrome decodifica");
+    println!("CLIENTE: foto do Chrome {w}x{h}, {} bytes", bytes.len());
 
     let status = tokio::task::spawn_blocking(move || web.wait())
         .await

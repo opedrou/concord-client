@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(process.env.CONCORD_BANCADA + '/');
 const puppeteer = require('puppeteer-core');
 
-const { CONCORD_URL: base, CONCORD_CANAL: canal, CONCORD_USER: user, CONCORD_PASS: pass, RUN: run, OUT } = process.env;
+const { CONCORD_URL: base, CONCORD_CANAL: canal, CONCORD_USER: user, CONCORD_PASS: pass, RUN: run, OUT, FOTO } = process.env;
 const espera = (ms) => new Promise((r) => setTimeout(r, ms));
 const browser = await puppeteer.launch({
   executablePath: '/opt/google/chrome/chrome',
@@ -38,6 +38,21 @@ await mandar(`web-1 ${run}`);
 await ver(`cliente-1 ${run}`);
 // O SSE do Chrome não cai: as mensagens da queda do cliente chegam aqui na hora.
 await ver(`durante-5 ${run}`, 90000);
+
+// Foto pelo botão de anexar: sobe na hora, e o Enter manda com a legenda.
+const arquivo = await page.$('input[type=file]');
+await arquivo.uploadFile(FOTO);
+await ver('foto-web.png');
+await mandar(`web-anexo ${run}`);
+
+// Imagem do cliente aparece carregada, e o arquivo dele como cartão.
+await page.waitForFunction(
+  (alt) => [...document.images].some((i) => i.alt === alt && i.complete && i.naturalWidth === 64),
+  { timeout: 60000 },
+  `cliente-${run}.png`,
+);
+console.log('WEB VIU a imagem do cliente');
+await ver(`notas-${run}.txt`);
 await page.screenshot({ path: `${OUT}/chat-web.png` });
 await browser.close();
 console.log('WEB OK');

@@ -1,7 +1,11 @@
-//! Chat dos canais de texto, sem interface: a linha do tempo e o tempo real pelo SSE. A tela
-//! fica em `ui::chat`.
+//! Chat dos canais de texto, sem interface: a linha do tempo, o tempo real pelo SSE e os
+//! anexos no disco. A tela fica em `ui::chat`.
 use std::collections::HashSet;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use image::{ImageReader, Limits, imageops::FilterType};
 
 use futures_util::{SinkExt, Stream};
 
@@ -25,6 +29,10 @@ const MAX_ESPERA: Duration = Duration::from_secs(30);
 const SILENCIO: Duration = Duration::from_secs(60);
 /// Evento maior que isso não é do Concord.
 const MAX_EVENTO: usize = 1024 * 1024;
+/// Imagem guardada pra mostrar na mensagem: o dobro do tamanho na tela, pra telas HiDPI.
+const MINIATURA: (u32, u32) = (800, 600);
+const MAX_LADO_ORIGINAL: u32 = 8192;
+const MAX_DECODIFICADO: u64 = 256 * 1024 * 1024;
 
 /// O que está na tela, em ordem de id, que é a ordem de chegada no servidor.
 #[derive(Debug, Default)]
@@ -278,6 +286,241 @@ impl Window {
     }
 }
 
+/// Imagem do anexo reduzida pra caber na mensagem, em RGBA. Os limites barram imagem pequena
+/// em bytes e gigante na memória, como no avatar.
+pub fn thumbnail(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_LADO_ORIGINAL);
+    limits.max_image_height = Some(MAX_LADO_ORIGINAL);
+    limits.max_alloc = Some(MAX_DECODIFICADO);
+    reader.limits(limits);
+    let mut picture = reader.decode().ok()?;
+    let (w, h) = MINIATURA;
+    if picture.width() > w || picture.height() > h {
+        picture = picture.resize(w, h, FilterType::Triangle);
+    }
+    let rgba = picture.into_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((w, h, rgba.into_raw()))
+}
+
+/// Extensões que o servidor grava pelos bytes do arquivo (`lib/uploads.ts`). Fora delas vira
+/// `bin`, pra um anexo nunca chegar no sistema como `.exe`, `.bat` ou `.desktop`.
+const EXTENSOES: [&str; 14] = [
+    "jpg", "png", "gif", "webp", "mp4", "mov", "webm", "m4a", "mp3", "ogg", "wav", "flac", "pdf",
+    "zip",
+];
+
+/// Nome local do anexo: `<id>-<nome>.<extensão>`. O nome vem de quem mandou: perde a
+/// extensão e fica só com letra, número, espaço e `-_()`, sem ponto e sem barra. A extensão
+/// sai da `url`, que o servidor monta com o nome que ele mesmo deu ao arquivo.
+pub fn local_name(id: i64, name: &str, url: &str) -> String {
+    let ext = url
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| EXTENSOES.contains(&ext.as_str()))
+        .unwrap_or_else(|| "bin".to_owned());
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name,
+    };
+    let clean: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || " -_()".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect();
+    let clean = clean.trim_matches([' ', '_']);
+    let clean = if clean.is_empty() { "arquivo" } else { clean };
+    format!("{id}-{clean}.{ext}")
+}
+
+/// Baixa o anexo pra pasta temporária, se ainda não estiver lá, e abre no app do sistema.
+pub async fn open_attachment(
+    client: &Client,
+    id: i64,
+    name: &str,
+    url: &str,
+) -> Result<(), String> {
+    let path = download(client, id, name, url).await?;
+    tokio::task::spawn_blocking(move || open_with_system(&path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|_| "Nenhum app abriu o anexo.".to_owned())
+}
+
+/// Anexo na pasta temporária, baixado uma vez.
+pub async fn download(client: &Client, id: i64, name: &str, url: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("concord-anexos");
+    let path = dir.join(local_name(id, name, url));
+    if !path.is_file() {
+        let max = crate::api::MAX_ANEXO as usize + 1024 * 1024;
+        let bytes = client
+            .attachment(url, max)
+            .await
+            .map_err(|_| "Não foi possível baixar o anexo.".to_owned())?;
+        let target = path.clone();
+        tokio::task::spawn_blocking(move || save(&dir, &target, &bytes))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|_| "Não foi possível salvar o anexo.".to_owned())?;
+    }
+    Ok(path)
+}
+
+/// Grava por um `.part` ao lado: queda no meio não deixa arquivo pela metade com o nome final.
+fn save(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let part = path.with_extension("part");
+    std::fs::write(&part, bytes)?;
+    std::fs::rename(part, path)
+}
+
+fn open_with_system(path: &Path) -> std::io::Result<()> {
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(path)
+        .status()
+        .map(drop)
+}
+
+/// Lê o arquivo escolhido pra anexar: nome e bytes, até 95 MiB.
+pub fn read_attachment(path: &Path) -> Result<(String, Vec<u8>), String> {
+    let size = std::fs::metadata(path)
+        .map_err(|_| "Não foi possível ler o arquivo.".to_owned())?
+        .len();
+    if size > crate::api::MAX_ANEXO {
+        return Err("O arquivo passa de 95 MB.".to_owned());
+    }
+    if size == 0 {
+        return Err("O arquivo está vazio.".to_owned());
+    }
+    let bytes = std::fs::read(path).map_err(|_| "Não foi possível ler o arquivo.".to_owned())?;
+    let name = path
+        .file_name()
+        .map_or_else(|| "arquivo".into(), |n| n.to_string_lossy().into_owned());
+    Ok((name, bytes))
+}
+
+/// Seletor de arquivo do sistema. `None`: cancelou, ou não tem seletor.
+pub async fn pick_file() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(pick).await.ok().flatten()
+}
+
+/// Pelo portal, que abre o seletor do GNOME ou do KDE sem puxar GTK pra dentro do processo.
+#[cfg(target_os = "linux")]
+fn pick() -> Option<PathBuf> {
+    use std::collections::HashMap;
+    use zbus::zvariant::{OwnedValue, Value};
+    const PORTAL: &str = "org.freedesktop.portal.Desktop";
+    const OBJETO: &str = "/org/freedesktop/portal/desktop";
+
+    let conn = zbus::blocking::Connection::session().ok()?;
+    // Escuta a resposta antes de pedir: o caminho dela sai do nome da conexão e do token.
+    let token = format!("concord{}", uuid::Uuid::new_v4().simple());
+    let sender = conn
+        .unique_name()?
+        .trim_start_matches(':')
+        .replace('.', "_");
+    let request = format!("{OBJETO}/request/{sender}/{token}");
+    let request = zbus::blocking::Proxy::new(
+        &conn,
+        PORTAL,
+        request.as_str(),
+        "org.freedesktop.portal.Request",
+    )
+    .ok()?;
+    let mut answers = request.receive_signal("Response").ok()?;
+    let options = HashMap::from([
+        ("handle_token", Value::from(token.as_str())),
+        ("modal", Value::from(true)),
+    ]);
+    conn.call_method(
+        Some(PORTAL),
+        OBJETO,
+        Some("org.freedesktop.portal.FileChooser"),
+        "OpenFile",
+        &("", "Anexar arquivo", options),
+    )
+    .ok()?;
+    let answer = answers.next()?;
+    let (code, mut results): (u32, HashMap<String, OwnedValue>) =
+        answer.body().deserialize().ok()?;
+    if code != 0 {
+        return None;
+    }
+    let uris = Vec::<String>::try_from(results.remove("uris")?).ok()?;
+    file_path(uris.first()?)
+}
+
+/// `file:///pasta/Nome%20bom.png` -> `/pasta/Nome bom.png`.
+#[cfg(target_os = "linux")]
+fn file_path(uri: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let rest = uri.strip_prefix("file://").filter(|r| r.starts_with('/'))?;
+    let mut bytes = Vec::with_capacity(rest.len());
+    let mut it = rest.bytes();
+    while let Some(b) = it.next() {
+        if b == b'%' {
+            let hex = [it.next()?, it.next()?];
+            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            bytes.push(b);
+        }
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(windows)]
+fn pick() -> Option<PathBuf> {
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    // SAFETY: COM aberto e fechado nesta thread, que é só do seletor; as interfaces de
+    // `ask_file` são soltas antes do `CoUninitialize`.
+    unsafe {
+        let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let path = ask_file();
+        if init.is_ok() {
+            CoUninitialize();
+        }
+        path.ok()
+    }
+}
+
+#[cfg(windows)]
+unsafe fn ask_file() -> windows::core::Result<PathBuf> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
+    // SAFETY: chamadas COM numa thread com COM aberto; o texto do caminho é do COM e volta
+    // pra ele depois de copiado.
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        dialog.Show(None)?;
+        let name = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let path: std::ffi::OsString =
+            std::os::windows::ffi::OsStringExt::from_wide(name.as_wide());
+        CoTaskMemFree(Some(name.0 as *const _));
+        Ok(PathBuf::from(path))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn pick() -> Option<PathBuf> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +689,82 @@ mod tests {
                 .count(),
             3999
         );
+    }
+
+    #[test]
+    fn nome_de_arquivo_do_servidor_nao_vira_caminho_perigoso() {
+        let url = "/api/attachments/9?v=0b7e.png";
+        for (nome, url, esperado) in [
+            ("foto.png", url, "9-foto.png"),
+            ("Férias 2026 (1).jpeg", url, "9-Férias 2026 (1).png"),
+            ("../../.bashrc", url, "9-arquivo.png"),
+            ("..\\..\\Windows\\x.dll", url, "9-Windows_x.png"),
+            (
+                "relatorio.pdf.exe",
+                "/api/attachments/9?v=a.bin",
+                "9-relatorio_pdf.bin",
+            ),
+            ("gpj\u{202e}.exe", "/api/attachments/9?v=a.exe", "9-gpj.bin"),
+            ("CON", "/api/attachments/9?v=a.PDF", "9-CON.pdf"),
+            ("", "/api/attachments/9", "9-arquivo.bin"),
+            ("a:b*c?d\"e<f>g|h\n", url, "9-a_b_c_d_e_f_g_h.png"),
+        ] {
+            assert_eq!(local_name(9, nome, url), esperado, "{nome:?}");
+        }
+        let longo = local_name(9, &"x".repeat(500), url);
+        assert_eq!(longo.chars().count(), "9-".len() + 80 + ".png".len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uri_do_portal_vira_caminho() {
+        assert_eq!(
+            file_path("file:///home/a/Nome%20bom%C3%A9.png"),
+            Some(PathBuf::from("/home/a/Nome bomé.png"))
+        );
+        assert_eq!(file_path("https://x/y"), None);
+        assert_eq!(file_path("file://host/y"), None);
+        assert_eq!(file_path("file:///y%2"), None);
+    }
+
+    #[test]
+    fn anexo_grande_ou_vazio_nem_sobe() {
+        let dir = std::env::temp_dir().join(format!("concord-teste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vazio = dir.join("vazio.txt");
+        std::fs::write(&vazio, b"").unwrap();
+        assert!(read_attachment(&vazio).is_err());
+        let grande = dir.join("grande.bin");
+        let f = std::fs::File::create(&grande).unwrap();
+        f.set_len(crate::api::MAX_ANEXO + 1).unwrap();
+        assert_eq!(
+            read_attachment(&grande).unwrap_err(),
+            "O arquivo passa de 95 MB."
+        );
+        let ok = dir.join("nota.txt");
+        std::fs::write(&ok, b"oi").unwrap();
+        assert_eq!(
+            read_attachment(&ok).unwrap(),
+            ("nota.txt".into(), b"oi".to_vec())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn miniatura_cabe_e_imagem_gigante_nem_abre() {
+        use image::{ImageFormat, RgbaImage};
+        let png = |w, h| {
+            let mut out = Vec::new();
+            RgbaImage::new(w, h)
+                .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+                .unwrap();
+            out
+        };
+        assert_eq!(
+            thumbnail(&png(1600, 300)).map(|t| (t.0, t.1)),
+            Some((800, 150))
+        );
+        assert_eq!(thumbnail(&png(40, 30)).map(|t| (t.0, t.1)), Some((40, 30)));
+        assert!(thumbnail(&png(9000, 2)).is_none());
+        assert!(thumbnail(b"nada de imagem").is_none());
     }
 }
