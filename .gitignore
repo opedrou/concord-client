@@ -1,3 +1,6 @@
 /target
 /snapshots
 /instalado
+# Documentação interna fica fora do repo público. Só o README sobe.
+*.md
+!README.md
