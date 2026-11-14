@@ -132,6 +132,36 @@ impl Drop for Stopped {
     }
 }
 
+/// Thread de áudio em MTA no Windows, antes do cpal, que senão pede STA. Em STA, reabrir o
+/// fone Bluetooth que voltou falhou sempre com `RPC_E_CHANGED_MODE` ("não é possível
+/// alterar o modo de thread"): algo na ativação do cliente de áudio pede MTA. O cpal aceita
+/// a thread já em MTA.
+#[cfg(windows)]
+struct Mta(bool);
+
+#[cfg(windows)]
+impl Mta {
+    fn enter() -> Self {
+        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+        // SAFETY: inicializa o COM só desta thread; o `Drop` desfaz se deu certo.
+        let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if result.is_err() {
+            log!("áudio: thread sem MTA: {result:?}");
+        }
+        Mta(result.is_ok())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Mta {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: par do `CoInitializeEx` que deu certo, depois dos streams soltos.
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
 /// A mesma falha repetida a cada [`RETRY`] entra no log uma vez só.
 fn opened<R>(
     what: &str,
@@ -171,6 +201,9 @@ pub fn run(
     frames: Sender<Vec<i16>>,
     ready: mpsc::Sender<Result<(), String>>,
 ) {
+    // Antes de tudo: os streams, declarados depois, saem antes do `CoUninitialize`.
+    #[cfg(windows)]
+    let _mta = Mta::enter();
     let mut mixer = Mixer::new(prefs.master, prefs.volumes);
     let mut chain = MicChain::new(prefs.noise, prefs.sensitivity, prefs.mic_gain, meter);
     let mut input = Side::new(prefs.input);
