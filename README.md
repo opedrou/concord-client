@@ -4,21 +4,24 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.8.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.9.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
 - **Voz:** microfone com cancelamento de eco, limitador de voz automático ou manual e
   sensibilidade de entrada. Volume por pessoa e troca de dispositivo no meio da call, e o fone
   que cai volta sozinho quando reconecta.
-- **Transmitir a tela:** tela inteira ou janela, com o som do que está tocando. Dá pra trocar a
-  tela e ligar ou desligar o áudio sem parar a transmissão, com prévia do que está saindo.
-- **Assistir** a transmissão dos outros, como no site.
+- **Transmitir a tela:** tela inteira ou janela, com o som do que está tocando, em estéreo. Dá
+  pra trocar a tela e ligar ou desligar o áudio sem parar a transmissão, com prévia do que está
+  saindo.
+- **Assistir** a transmissão dos outros, como no site, vendo quem mais está assistindo.
+- **Câmera dos outros** no tile de voz, no lugar da foto.
 - **Sons** de entrar, sair e começar a transmitir.
 - **Atualiza sozinho:** confere versão nova a cada 15 min, e a seta verde reinicia na nova. O
-  arquivo baixado é conferido pelo SHA-256 da release.
+  arquivo baixado é conferido pelo SHA-256 da release, e se a versão nova não abrir o app volta
+  pra anterior. Em Configurações › Sobre dá pra procurar atualização na hora.
 
-Ainda só no site: soundboard e chat de texto.
+Ainda só no site: soundboard, chat de texto e enviar a própria câmera.
 
 ## Instalar
 
@@ -54,29 +57,35 @@ o seletor de tela do sistema (xdg-desktop-portal).
 
 ## Limites conhecidos
 
-- O som da transmissão chega mono.
 - No Linux, o monitor não é mantido aceso enquanto você assiste uma transmissão.
 - No Windows, o vídeo da transmissão é codificado na CPU (VP8).
 
-## Novidades da v0.1.8
+## Novidades da v0.1.9
 
 ### Novo
-- **Log em arquivo** pra investigar problema de áudio: `~/.config/concord/concord.log` no Linux,
-  `%APPDATA%\Concord\concord.log` no Windows. Guarda sala, faixas, dispositivos, mudo e surdo, e
-  recomeça ao passar de 1 MB.
+- **Câmera dos outros** aparece no tile de voz, no lugar da foto, como no site. Câmera desligada
+  volta pra foto.
+- **Quem está assistindo:** cada transmissão mostra até 3 avatares de quem assiste, e "+N" pro
+  resto. O site também passa a mostrar quem assiste pelo app.
+- **Versão nova que não abre volta pra anterior.** O app testa se a versão baixada abre neste
+  computador antes de trocar. Se ela cair em duas aberturas seguidas, a terceira volta pra
+  anterior, e aquela versão não é baixada de novo.
+- **Procurar atualização** em Configurações › Sobre.
+- **Linux:** instalação de uma linha e `concord-client --uninstall` (veja "Instalar").
 
 ### Corrigido
-- **Fone que cai ou que liga depois de entrar na call:** a voz ia pro dispositivo padrão do
-  sistema e ficava lá até o fim. Agora o app confere a cada segundo e volta pro fone escolhido
-  assim que ele reaparece, na saída e no microfone.
-- **Áudio travado quando a saída some** com um som tocando: o app espera no máximo 3 s e segue.
+- **Som da transmissão chega estéreo** pra quem assiste. Antes chegava mono.
 
 ### Interno
-- Bancada que confere se a call ouve o Chrome em 22 medidas: entrar e sair, assistir, prévia e
-  quedas de rede.
+- Cópia do SDK livekit 0.10.1 em `vendor/livekit`, com o patch que publica o áudio estéreo.
+- Bancadas contra o Chrome pra câmera, pra quem assiste e pro estéreo (esquerda e direita
+  medidas separadas).
 
 ### Limites conhecidos
-- No Windows, a volta pro fone que reconecta ainda não foi testada com um fone de verdade.
+- Nada desta versão foi testado num Windows de verdade, só compilado.
+- A câmera vem numa resolução só, 640x360, qualquer que seja o tamanho do tile.
+- Quem atualiza da v0.1.8 troca pra esta sem o teste da versão baixada, que só existe a partir
+  desta.
 
 ## Compilar
 
