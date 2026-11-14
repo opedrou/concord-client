@@ -54,6 +54,21 @@ pub const MANUAL_MIN_DB: f32 = -80.0;
 pub const MANUAL_MAX_DB: f32 = 0.0;
 pub const MANUAL_DEFAULT_DB: f32 = -40.0;
 
+/// Ganho do mic, no lugar em que o AGC age: depois do APM, antes do RNNoise e do gate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum MicGain {
+    /// O AGC do APM nivela a voz sozinho.
+    #[default]
+    Auto,
+    /// AGC desligado e este ganho fixo, em dB.
+    Manual(f32),
+}
+
+/// Faixa do ganho manual, em dB. O AGC começa em +15 dB e mic a 25% sem ele sai baixo
+/// demais: o +20 cobre isso. O -20 desfaz o reforço de mic que o sistema aplica.
+pub const GAIN_MIN_DB: f32 = -20.0;
+pub const GAIN_MAX_DB: f32 = 20.0;
+
 /// Quanto o medidor cai por bloco de 10 ms: do topo ao fundo em 600 ms.
 const METER_DECAY_DB: f32 = (MANUAL_MAX_DB - MANUAL_MIN_DB) / 60.0;
 
@@ -99,6 +114,7 @@ pub struct AudioPrefs {
     pub output: Option<String>,
     pub noise: NoiseLevel,
     pub sensitivity: Sensitivity,
+    pub mic_gain: MicGain,
     /// Slider de 0 a 100; ver [`gain`].
     pub master: u8,
     /// Nome da pessoa -> slider.
@@ -212,6 +228,12 @@ impl Engine {
     }
 
     /// Mede também com o mic mudo.
+    /// Mexer no ganho manual vale na hora. Trocar entre automático e manual recria o APM,
+    /// como a redução de ruído do navegador.
+    pub fn set_mic_gain(&self, gain: MicGain) {
+        self.send(Command::Gain(gain));
+    }
+
     pub fn meter(&self) -> Meter {
         self.meter.clone()
     }

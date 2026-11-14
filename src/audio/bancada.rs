@@ -106,6 +106,7 @@ fn prefs(noise: NoiseLevel) -> AudioPrefs {
         output: Some(FONE.into()),
         noise,
         sensitivity: Sensitivity::Auto,
+        mic_gain: MicGain::Auto,
         master: 71,
         volumes: HashMap::new(),
     }
@@ -686,8 +687,12 @@ impl Dado {
 
 /// As vozes em sequência, com 1 s entre elas, em [`FALA_DB`].
 fn voz() -> Vec<f32> {
+    voz_de(&VOZES)
+}
+
+fn voz_de(nomes: &[&str]) -> Vec<f32> {
     let mut pcm = vec![];
-    for nome in VOZES {
+    for nome in nomes {
         let bytes = fs::read(format!("{VOZ_DIR}/{nome}.wav")).expect("wav de voz");
         let base: Vec<f32> = bytes[44..]
             .as_chunks::<2>()
@@ -751,7 +756,7 @@ struct Sinal {
 }
 
 /// Toca o sinal e sobe o motor com a sala já soando, como numa call de verdade.
-fn escuta(sinal: &Sinal, noise: NoiseLevel, sensitivity: Sensitivity) -> Vec<mic::Traced> {
+fn escuta(sinal: &Sinal, prefs: AudioPrefs) -> Vec<mic::Traced> {
     let raiz = std::env::var("BANCADA_RAIZ").expect("rode por src/audio/bancada.sh");
     let path = format!("{raiz}/sinal.wav");
     write_wav(&path, &sinal.pcm);
@@ -764,11 +769,7 @@ fn escuta(sinal: &Sinal, noise: NoiseLevel, sensitivity: Sensitivity) -> Vec<mic
     let inicio = Instant::now();
     thread::sleep(Duration::from_millis(500));
     mic::TRACE.lock().unwrap().clear();
-    let (engine, mut mic) = Engine::start(AudioPrefs {
-        sensitivity,
-        ..prefs(noise)
-    })
-    .expect("start");
+    let (engine, mut mic) = Engine::start(prefs).expect("start");
     engine.set_mic_muted(false);
     // Para antes do fim: o som cortando seco engana o RNNoise e não existe na sala.
     let fim = Duration::from_secs_f32(sinal.pcm.len() as f32 / RATE as f32 - 0.5);
@@ -886,7 +887,13 @@ fn block_db_i16(block: &[i16]) -> f32 {
 
 /// Uma linha da tabela. Devolve quantas vezes abriu e a porcentagem de fala que passou.
 fn mede(sinal: &Sinal, noise: NoiseLevel, sensitivity: Sensitivity) -> (usize, f32) {
-    let trace = escuta(sinal, noise, sensitivity);
+    let trace = escuta(
+        sinal,
+        AudioPrefs {
+            sensitivity,
+            ..prefs(noise)
+        },
+    );
     let minutos = trace.len() as f32 / 6000.0;
     let aberturas = trace
         .windows(2)
@@ -1048,6 +1055,145 @@ fn bancada_gate_eco() {
             "GATE | eco de voz | {sensitivity:?} | mic_rms={:.4} | abriu nos segundos {abriu:?} | \
              aberto {aberto:.1}%",
             raw.rms(),
+        );
+    }
+}
+
+// --- Ganho de entrada --------------------------------------------------------
+
+/// Nível médio dos blocos com fala no gabarito, como entraram no gate, em dBFS.
+fn nivel_fala(gabarito: &[f32], trace: &[mic::Traced], atraso: isize) -> f32 {
+    let desvio = atraso / FRAME as isize;
+    let potencias: Vec<f32> = gabarito
+        .as_chunks::<FRAME>()
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| block_db(*b) >= COM_FALA_DB)
+        .filter_map(|(i, _)| trace.get(usize::try_from(i as isize + desvio).ok()?))
+        .map(|t| 10f32.powf(block_db_i16(&t.entered) / 10.0))
+        .collect();
+    10.0 * (potencias.iter().sum::<f32>() / potencias.len().max(1) as f32).log10()
+}
+
+/// A fala direto na cadeia, sem servidor de áudio. Sai igual bit a bit entre rodadas: é
+/// assim que o automático se compara antes e depois de mexer na cadeia.
+fn sem_servidor(pcm: &[f32], prefs: &AudioPrefs) -> (f32, u64) {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut chain =
+        mic::MicChain::new(prefs.noise, prefs.sensitivity, prefs.mic_gain, Meter::new());
+    chain.muted = false;
+    let (mut soma, mut n, mut hash) = (0f64, 0usize, DefaultHasher::new());
+    for bloco in pcm.as_chunks::<FRAME>().0 {
+        chain.reverse(&mut [0; FRAME]);
+        let mut b = bloco.map(|s| (s * 32767.0) as i16);
+        let saiu = chain.process(&mut b).expect("sem mudo");
+        saiu.hash(&mut hash);
+        soma += saiu
+            .iter()
+            .map(|s| (*s as f64 / 32768.0).powi(2))
+            .sum::<f64>();
+        n += FRAME;
+    }
+    mic::TRACE.lock().unwrap().clear();
+    ((10.0 * (soma / n as f64).log10()) as f32, hash.finish())
+}
+
+/// Ganho de entrada: a razão entre os ganhos manuais, o automático igual ao de antes e o
+/// limitador abrindo com voz e fechado no ruído nos extremos.
+#[test]
+#[ignore = "precisa do PipeWire próprio: src/audio/bancada.sh"]
+fn bancada_ganho() {
+    let _rig = Rig::new();
+    let mut dado = Dado(0x1234_5678);
+    let silencio = vec![0.0; RATE as usize * SOBRA as usize];
+    let limpa: Vec<f32> = silencio
+        .iter()
+        .copied()
+        .chain(voz_de(&["Portuguese_stable"]))
+        .collect();
+    let segundos = limpa.len() as f32 / RATE as f32;
+    // A fala tem pico 8 dB acima do nível: a -10 ainda não corta na entrada.
+    let mut falando = |nome, db: f32| Sinal {
+        nome,
+        pcm: soma(&limpa, amp(db - FALA_DB), &dado.ruido(segundos, PISO_DB)),
+        gabarito: Some(limpa.clone()),
+    };
+    let fala = falando("fala -24", FALA_DB);
+    let alta = falando("fala alta -10", -10.0);
+    let baixa = falando("fala baixa -44", -44.0);
+    let ruido = Sinal {
+        nome: "ruído branco -60",
+        pcm: dado.ruido(20.0, -60.0),
+        gabarito: None,
+    };
+    let com = |gain, sensitivity| AudioPrefs {
+        sensitivity,
+        mic_gain: gain,
+        ..prefs(NoiseLevel::Rnnoise)
+    };
+    let (auto, man) = (Sensitivity::Auto, MANUAL);
+    let m = MicGain::Manual;
+    let rodadas: Vec<(&Sinal, AudioPrefs)> = vec![
+        (&fala, com(MicGain::Auto, auto)),
+        (&fala, com(MicGain::Auto, man)),
+        (&ruido, com(MicGain::Auto, auto)),
+        (&ruido, com(MicGain::Auto, man)),
+        (&fala, com(m(0.0), auto)),
+        (&fala, com(m(6.0), auto)),
+        (&fala, com(m(-6.0), auto)),
+        (&baixa, com(m(20.0), auto)),
+        (&baixa, com(m(20.0), man)),
+        (&fala, com(m(20.0), auto)),
+        (&fala, com(m(20.0), man)),
+        (&ruido, com(m(20.0), auto)),
+        (&ruido, com(m(20.0), man)),
+        (&alta, com(m(-20.0), auto)),
+        (&alta, com(m(-20.0), man)),
+        (&fala, com(m(-20.0), auto)),
+        (&fala, com(m(-20.0), man)),
+        (&ruido, com(m(-20.0), auto)),
+        (&ruido, com(m(-20.0), man)),
+    ];
+
+    for p in [com(MicGain::Auto, auto), com(MicGain::Auto, man)] {
+        let (nivel, hash) = sem_servidor(&fala.pcm, &p);
+        println!(
+            "GANHO | sem servidor | {:?} {:?} | saída {nivel:6.2} dBFS | hash {hash:016x}",
+            p.mic_gain, p.sensitivity
+        );
+    }
+    for (sinal, p) in rodadas {
+        // O que cortaria seco sem o limite suave, direto do sinal que entra.
+        let ganho = match p.mic_gain {
+            MicGain::Manual(db) => amp(db),
+            MicGain::Auto => 1.0,
+        };
+        let seco = sinal
+            .pcm
+            .iter()
+            .filter(|s| (*s * ganho).abs() >= 1.0)
+            .count();
+        let nome = format!("{:?} {:?}", p.mic_gain, p.sensitivity);
+        let trace = escuta(sinal, p);
+        let aberturas = trace
+            .windows(2)
+            .filter(|w| !w[0].passing && w[1].passing)
+            .count();
+        let saiu: Vec<i16> = trace.iter().flat_map(|t| t.left).collect();
+        let pico = saiu.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        let cortadas = saiu.iter().filter(|s| s.unsigned_abs() >= 32767).count();
+        let (nivel, passou) = match &sinal.gabarito {
+            Some(g) => {
+                let a = atraso(g, &trace);
+                (nivel_fala(g, &trace, a), cortes(g, &trace, a).passou)
+            }
+            None => (block_db_i16(&saiu), 0.0),
+        };
+        println!(
+            "GANHO | {:<16} | {nome:<28} | nível {nivel:7.2} dBFS | fala {passou:5.1}% | \
+             aberturas {aberturas} | pico {pico} | cortadas {cortadas} (sem limite {seco})",
+            sinal.nome,
         );
     }
 }

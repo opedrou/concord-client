@@ -8,7 +8,7 @@ use std::{
 use tokio::sync::mpsc::Sender;
 
 use super::{
-    AudioPrefs, FRAME, Meter, NoiseLevel, Sensitivity,
+    AudioPrefs, FRAME, Meter, MicGain, NoiseLevel, Sensitivity,
     device::{self, Opened, Seen},
     mic::MicChain,
     mixer::{Mixer, VoiceQueue},
@@ -31,6 +31,7 @@ pub enum Command {
     Person(String, u8),
     Noise(NoiseLevel),
     Sensitivity(Sensitivity),
+    Gain(MicGain),
     Input(Option<String>),
     Output(Option<String>),
     Effect(&'static [u8]),
@@ -171,7 +172,7 @@ pub fn run(
     ready: mpsc::Sender<Result<(), String>>,
 ) {
     let mut mixer = Mixer::new(prefs.master, prefs.volumes);
-    let mut chain = MicChain::new(prefs.noise, prefs.sensitivity, meter);
+    let mut chain = MicChain::new(prefs.noise, prefs.sensitivity, prefs.mic_gain, meter);
     let mut input = Side::new(prefs.input);
     let mut output = Side::new(prefs.output);
     let mut mix = [0f32; FRAME];
@@ -243,6 +244,7 @@ pub fn run(
                 Command::Person(name, slider) => mixer.set_person(name, slider),
                 Command::Noise(level) => chain.set_noise(level),
                 Command::Sensitivity(sensitivity) => chain.gate.set_sensitivity(sensitivity),
+                Command::Gain(gain) => chain.set_gain(gain),
                 Command::Input(name) => {
                     log!(
                         "áudio: entrada escolhida: {}",

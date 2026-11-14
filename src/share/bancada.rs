@@ -13,7 +13,7 @@ use tokio::{
 
 use super::*;
 use crate::api::{Client, Secret};
-use crate::audio::{AudioPrefs, Engine, NoiseLevel, Sensitivity};
+use crate::audio::{AudioPrefs, Engine, MicGain, NoiseLevel, Sensitivity};
 use crate::call::{Call, End, Event};
 
 /// Sufixo fixo da identity da bancada.
@@ -429,6 +429,7 @@ async fn bancada_tela_call() {
         output: None,
         noise: NoiseLevel::Off,
         sensitivity: Sensitivity::Auto,
+        mic_gain: MicGain::Auto,
         master: 71,
         volumes: HashMap::new(),
     };
@@ -613,6 +614,7 @@ async fn bancada_ouve() {
         output: None,
         noise: NoiseLevel::Off,
         sensitivity: Sensitivity::Auto,
+        mic_gain: MicGain::Auto,
         master: 71,
         volumes: HashMap::new(),
     };
@@ -731,6 +733,7 @@ async fn bancada_assistindo() {
         output: None,
         noise: NoiseLevel::Off,
         sensitivity: Sensitivity::Auto,
+        mic_gain: MicGain::Auto,
         master: 71,
         volumes: HashMap::new(),
     };
@@ -849,6 +852,7 @@ async fn bancada_camera() {
         output: None,
         noise: NoiseLevel::Off,
         sensitivity: Sensitivity::Auto,
+        mic_gain: MicGain::Auto,
         master: 71,
         volumes: HashMap::new(),
     };

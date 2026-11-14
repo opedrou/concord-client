@@ -221,6 +221,10 @@ pub enum Msg {
     AutoSensitivity(bool),
     /// Marcador do limiar manual, em dBFS.
     Threshold(f32),
+    /// Interruptor do ganho de entrada automático.
+    AutoGain(bool),
+    /// Ganho de entrada manual, em dB.
+    Gain(f32),
     /// Relógio do medidor de entrada.
     MeterTick,
     ProbeStarted(u64, Result<Boot, String>),
@@ -677,6 +681,18 @@ impl App {
                 self.apply_sensitivity();
                 Task::none()
             }
+            Msg::AutoGain(auto) => {
+                self.config.set_auto_gain(auto);
+                self.persist();
+                self.apply_gain();
+                Task::none()
+            }
+            // Como o limiar: grava ao soltar o slider.
+            Msg::Gain(db) => {
+                self.config.set_gain(db);
+                self.apply_gain();
+                Task::none()
+            }
             Msg::MeterTick => {
                 if let Screen::Main(m) = &mut self.screen {
                     let reading = m.meter().map(|x| (x.level_db(), x.open()));
@@ -893,6 +909,12 @@ impl App {
     fn apply_sensitivity(&self) {
         if let Some(engine) = self.engine() {
             engine.set_sensitivity(self.config.sensitivity);
+        }
+    }
+
+    fn apply_gain(&self) {
+        if let Some(engine) = self.engine() {
+            engine.set_mic_gain(self.config.mic_gain);
         }
     }
 
@@ -2263,6 +2285,24 @@ mod tests {
     }
 
     #[test]
+    fn ganho_automatico_e_manual_guardam_o_valor() {
+        use crate::audio::MicGain;
+        let mut a = voice_tab();
+        assert_eq!(a.config.mic_gain, MicGain::Auto);
+        let antes = saves();
+        let _ = a.update(Msg::AutoGain(false));
+        assert_eq!(a.config.mic_gain, MicGain::Manual(0.0));
+        assert_eq!(saves(), antes + 1);
+        let _ = a.update(Msg::Gain(6.0));
+        assert_eq!(saves(), antes + 1, "grava só ao soltar");
+        let _ = a.update(Msg::VolumeDone);
+        let _ = a.update(Msg::AutoGain(true));
+        assert_eq!(a.config.audio_prefs().mic_gain, MicGain::Auto);
+        let _ = a.update(Msg::AutoGain(false));
+        assert_eq!(a.config.audio_prefs().mic_gain, MicGain::Manual(6.0));
+    }
+
+    #[test]
     fn slider_do_limiar_respeita_a_faixa() {
         use crate::audio::{MANUAL_MAX_DB, MANUAL_MIN_DB, Sensitivity};
         let mut a = voice_tab();
@@ -2545,6 +2585,11 @@ mod tests {
         voz(&mut a, false, -40.0, -22.0, true);
         print(&a, "voz-manual-acima");
         print_at(&a, "voz-manual-janela-minima", Size::new(860.0, 560.0));
+        // Ganho de entrada manual, com a sensibilidade manual acima mostrando o nível.
+        a.config.set_auto_gain(false);
+        a.config.set_gain(6.0);
+        print(&a, "voz-ganho-manual");
+        a.config.set_auto_gain(true);
         voz(&mut a, false, -40.0, -22.0, true);
         main_of(&mut a).probe = Probe::Failed;
         print(&a, "voz-erro");
