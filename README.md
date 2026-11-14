@@ -30,6 +30,16 @@ clique em "Mais informações" e depois em "Executar assim mesmo".
 **Linux (Ubuntu 24.04 ou mais novo, Debian 13 ou mais novo, x86_64):**
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/opedrou/concord-client/main/release/install.sh | sh
+```
+
+O script baixa a última release, confere o SHA-256 contra o do GitHub, instala em
+`~/.local/bin/concord-client` e põe o Concord no menu de aplicativos. Precisa de `curl` e
+`sha256sum`.
+
+À mão, se preferir:
+
+```bash
 mkdir -p ~/.local/bin
 mv ~/Downloads/concord-client-linux-x86_64 ~/.local/bin/concord-client
 chmod +x ~/.local/bin/concord-client
@@ -38,6 +48,9 @@ chmod +x ~/.local/bin/concord-client
 
 Na primeira abertura ele entra no menu de aplicativos. Precisa de PipeWire, e a transmissão usa
 o seletor de tela do sistema (xdg-desktop-portal).
+
+**Desinstalar no Linux:** `concord-client --uninstall`. Tira o binário, a entrada do menu e o
+ícone. A config e o log em `~/.config/concord` ficam; apague a pasta à mão pra limpar tudo.
 
 ## Limites conhecidos
 
