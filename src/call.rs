@@ -13,7 +13,9 @@ use livekit::{
     options::TrackPublishOptions,
     participant::LocalParticipant,
     publication::{LocalTrackPublication, RemoteTrackPublication},
-    track::{LocalAudioTrack, LocalTrack, RemoteTrack, RemoteVideoTrack, TrackSource},
+    track::{
+        LocalAudioTrack, LocalTrack, RemoteTrack, RemoteVideoTrack, TrackSource, VideoQuality,
+    },
     webrtc::{
         audio_source::native::NativeAudioSource,
         audio_stream::native::NativeAudioStream,
@@ -172,12 +174,34 @@ impl Screen {
     }
 }
 
+/// Último quadro da câmera de cada pessoa, pela identity. Como na [`Screen`], quadro que a
+/// interface não pegou é trocado pelo novo.
+#[derive(Clone, Default)]
+pub struct Cameras(Arc<Mutex<HashMap<String, Picture>>>);
+
+impl Cameras {
+    pub fn take(&self, identity: &str) -> Option<Picture> {
+        self.0.lock().unwrap().remove(identity)
+    }
+
+    fn put(&self, identity: &str, picture: Picture) {
+        self.0.lock().unwrap().insert(identity.to_owned(), picture);
+    }
+}
+
+/// Camada pedida da câmera dos outros. Do site vem VP9 em 720p: a média é 640x360, o
+/// tamanho de um tile numa janela comum.
+// ponytail: camada fixa. Sozinho em janela grande fica meio borrado, e com 9 tiles vem mais
+// que o tile mostra. Pra seguir o tile, `update_video_dimensions` com o tamanho dele.
+const CAMERA_QUALITY: VideoQuality = VideoQuality::Medium;
+
 #[derive(Clone)]
 pub struct Call {
     cmd: UnboundedSender<Cmd>,
     share: UnboundedSender<share::Cmd>,
     engine: Engine,
     screen: Screen,
+    cameras: Cameras,
     preview: share::Preview,
 }
 
@@ -251,6 +275,7 @@ impl Call {
         let (speech_tx, speech_rx) = mpsc::unbounded_channel();
         let (peek_tx, peek_rx) = mpsc::unbounded_channel();
         let screen = Screen::default();
+        let cameras = Cameras::default();
         let ctl = Ctl {
             rx,
             engine: engine.clone(),
@@ -258,6 +283,7 @@ impl Call {
             people: Vec::new(),
             watching: None,
             screen: screen.clone(),
+            cameras: cameras.clone(),
             peek_tx,
             peek_rx,
             speech_tx,
@@ -269,6 +295,7 @@ impl Call {
             share,
             engine,
             screen,
+            cameras,
             preview,
         };
         (call, events)
@@ -282,6 +309,11 @@ impl Call {
 
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// Câmera de quem está com ela ligada, assinada ao entrar.
+    pub fn cameras(&self) -> &Cameras {
+        &self.cameras
     }
 
     /// Prévia da própria transmissão, pro tile local.
@@ -457,6 +489,7 @@ struct Ctl {
     /// Quem está sendo assistido: vale entre reconexões.
     watching: Option<String>,
     screen: Screen,
+    cameras: Cameras,
     /// Sid da tela cuja prévia já saiu: a assinatura pode ser solta.
     peek_tx: UnboundedSender<String>,
     peek_rx: UnboundedReceiver<String>,
@@ -549,6 +582,8 @@ struct Session {
     watched: HashMap<String, AbortOnDrop>,
     /// Telas assinadas só pra tirar a prévia, por sid.
     peeks: HashMap<String, AbortOnDrop>,
+    /// Câmeras, por sid: o mesmo par de dono e tarefa da voz.
+    cameras: HashMap<String, Voice>,
 }
 
 impl Ctl {
@@ -584,6 +619,24 @@ fn stream_screen(video: RemoteVideoTrack, screen: Screen) -> AbortOnDrop {
     }))
 }
 
+/// Câmera de alguém, quadro a quadro, até a tarefa cair. Ao cair, leva junto o quadro que
+/// sobrou: o `abort` não para um quadro no meio, então limpar por fora ainda deixaria um.
+fn stream_camera(video: RemoteVideoTrack, identity: String, cameras: Cameras) -> AbortOnDrop {
+    struct Clear(Cameras, String);
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            self.0.take(&self.1);
+        }
+    }
+    let mut stream = NativeVideoStream::new(video.rtc_track());
+    AbortOnDrop(tokio::spawn(async move {
+        let camera = Clear(cameras, identity);
+        while let Some(frame) = stream.next().await {
+            camera.0.put(&camera.1, Picture::of(&frame));
+        }
+    }))
+}
+
 /// Um quadro só, reduzido pra prévia, e avisa pela `done` que a assinatura pode cair.
 fn peek(
     video: RemoteVideoTrack,
@@ -601,6 +654,11 @@ fn peek(
         }
         let _ = done.send(sid);
     }))
+}
+
+/// Faixas que todo mundo assina ao entrar: a voz e a câmera.
+fn always_subscribed(source: TrackSource) -> bool {
+    matches!(source, TrackSource::Microphone | TrackSource::Camera)
 }
 
 /// Faixas que só são assinadas por quem clicou em Assistir: a tela e o áudio de app,
@@ -778,6 +836,7 @@ impl Task {
             speaking: HashSet::new(),
             watched: HashMap::new(),
             peeks: HashMap::new(),
+            cameras: HashMap::new(),
         })
     }
 
@@ -847,7 +906,7 @@ impl Task {
                 });
             }
             RoomEvent::TrackPublished { publication, .. }
-                if publication.source() == TrackSource::Microphone =>
+                if always_subscribed(publication.source()) =>
             {
                 publication.set_subscribed(true);
             }
@@ -879,6 +938,25 @@ impl Task {
                     let task = peek(video.clone(), identity, sid.clone(), &self.tx, &ctl.peek_tx);
                     s.peeks.insert(sid, task);
                 }
+            }
+            RoomEvent::TrackSubscribed {
+                track: RemoteTrack::Video(video),
+                publication,
+                participant,
+            } if publication.source() == TrackSource::Camera => {
+                // Sem simulcast o SDK só reclama no log: vem a única camada que tem.
+                if publication.simulcasted() {
+                    publication.set_video_quality(CAMERA_QUALITY);
+                }
+                let identity = participant.identity().to_string();
+                let task = stream_camera(video.clone(), identity.clone(), ctl.cameras.clone());
+                s.cameras.insert(
+                    publication.sid().to_string(),
+                    Voice {
+                        identity,
+                        _task: task,
+                    },
+                );
             }
             RoomEvent::TrackSubscribed {
                 track: RemoteTrack::Audio(audio),
@@ -943,11 +1021,19 @@ impl Task {
                     },
                 );
             }
+            // O último quadro de antes de mutar não pisca no tile quando a câmera volta.
+            RoomEvent::TrackUnmuted {
+                participant,
+                publication,
+            } if publication.source() == TrackSource::Camera => {
+                ctl.cameras.take(participant.identity().as_str());
+            }
             RoomEvent::TrackUnsubscribed { publication, .. } => {
                 let sid = publication.sid().to_string();
                 if let Some(voice) = s.voices.remove(&sid) {
                     s.speaking.remove(&voice.identity);
                 }
+                s.cameras.remove(&sid);
                 s.peeks.remove(&sid);
                 if s.watched.remove(&sid).is_some()
                     && publication.source() == TrackSource::Screenshare
@@ -958,6 +1044,7 @@ impl Task {
             RoomEvent::ParticipantDisconnected(p) => {
                 let identity = p.identity().to_string();
                 s.voices.retain(|_, v| v.identity != identity);
+                s.cameras.retain(|_, c| c.identity != identity);
                 s.speaking.remove(&identity);
                 if ctl.watching.as_deref() == Some(identity.as_str()) {
                     s.watched.clear();
@@ -1081,13 +1168,14 @@ fn hold_remotes(list: Vec<Live>, last: &[Live]) -> Vec<Live> {
 }
 
 impl Session {
-    /// A voz de todo mundo. Tela e `concord-app-audio` só de quem está sendo assistido.
+    /// A voz e a câmera de todo mundo. Tela e `concord-app-audio` só de quem está sendo
+    /// assistido.
     fn subscribe_all(&self, watching: Option<&str>) {
         for p in self.room.remote_participants().values() {
             let watched = watching == Some(p.identity().as_str());
             for publication in p.track_publications().values() {
                 let watch = is_watch_track(publication.source(), &publication.name());
-                if publication.source() == TrackSource::Microphone || (watched && watch) {
+                if always_subscribed(publication.source()) || (watched && watch) {
                     publication.set_subscribed(true);
                 }
             }
@@ -1337,6 +1425,37 @@ mod tests {
         assert!(is_watch_track(TrackSource::Unknown, share::TRACK));
         assert!(!is_watch_track(TrackSource::Microphone, "microphone"));
         assert!(!is_watch_track(TrackSource::Unknown, "outra"));
+    }
+
+    #[test]
+    fn voz_e_camera_assinam_ao_entrar_e_o_resto_espera() {
+        assert!(always_subscribed(TrackSource::Microphone));
+        assert!(always_subscribed(TrackSource::Camera));
+        for source in [
+            TrackSource::Screenshare,
+            TrackSource::ScreenshareAudio,
+            TrackSource::Unknown,
+        ] {
+            assert!(!always_subscribed(source), "{source:?}");
+        }
+        // A câmera não é faixa de assistir: parar de assistir não solta ela.
+        assert!(!is_watch_track(TrackSource::Camera, "camera"));
+    }
+
+    #[test]
+    fn camera_guarda_o_ultimo_quadro_de_cada_pessoa() {
+        let cameras = Cameras::default();
+        let quadro = |w| Picture {
+            width: w,
+            height: 1,
+            rgba: vec![0; w as usize * 4],
+        };
+        cameras.put("ana__1", quadro(1));
+        cameras.put("ana__1", quadro(2));
+        cameras.put("bia__1", quadro(3));
+        assert_eq!(cameras.take("ana__1").map(|p| p.width), Some(2));
+        assert!(cameras.take("ana__1").is_none(), "sem quadro novo, nada");
+        assert_eq!(cameras.take("bia__1").map(|p| p.width), Some(3));
     }
 
     #[test]
