@@ -53,6 +53,19 @@ await page.waitForFunction(
 );
 console.log('WEB VIU a imagem do cliente');
 await ver(`notas-${run}.txt`);
+
+// O cliente apaga o arquivo: some daqui pelo SSE.
+await page.waitForFunction((t) => !document.body.innerText.includes(t), { timeout: 60000 }, `notas-${run}.txt`);
+console.log('WEB VIU o arquivo sumir');
+
+// Apaga a própria primeira pelo botão, com a confirmação.
+const linha = await page.evaluateHandle((t) => [...document.querySelectorAll('li')].find((li) => li.innerText.includes(t)), `web-1 ${run}`);
+await linha.hover();
+await (await linha.$('button[aria-label="Apagar mensagem"]')).click();
+const confirmar = await page.waitForFunction(() => [...document.querySelectorAll('button')].find((b) => b.innerText === 'Confirmar'));
+await confirmar.click();
+await page.waitForFunction((t) => !document.body.innerText.includes(t), { timeout: 30000 }, `web-1 ${run}`);
+console.log('WEB APAGOU', `web-1 ${run}`);
 await page.screenshot({ path: `${OUT}/chat-web.png` });
 await browser.close();
 console.log('WEB OK');

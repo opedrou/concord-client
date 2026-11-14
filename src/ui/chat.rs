@@ -20,9 +20,11 @@ use iced::{
 };
 
 use super::sidebar::{CLOSE, HASH, icon};
-use super::theme::{self, BG, BG2, BORDER, BORDER2, DANGER, FG, FG2, FG3, HOVER, IDLE};
+use super::theme::{
+    self, BG, BG2, BORDER, BORDER2, DANGER, DANGER_SOFT, FG, FG2, FG3, HOVER, IDLE,
+};
 use super::{Main, Msg as App, avatar};
-use crate::api::{Attachment, Channel, Client, Error, Kind, Message, Page, Uploaded};
+use crate::api::{Attachment, Channel, Client, Error, Kind, Message, Page, Uploaded, User};
 use crate::chat::{self as logic, Live, Timeline, Window};
 
 const LISTA: &str = "chat-lista";
@@ -70,6 +72,11 @@ pub enum Msg {
     /// Clique no anexo: baixa e abre no app do sistema.
     OpenFile(i64),
     Opened(i64, Result<(), String>),
+    /// "Apagar" pede confirmação; o "Apagar" da confirmação manda.
+    AskDelete(i64),
+    CancelDelete,
+    Delete(i64),
+    Deleted(i64, Result<(), Error>),
     /// Sessão vencida no meio: volta pro login.
     Expired,
 }
@@ -94,6 +101,8 @@ pub struct Chat {
     images: HashMap<i64, Picture>,
     /// Anexos baixando pra abrir.
     opening: HashSet<i64>,
+    /// Mensagem com a confirmação de apagar aberta.
+    confirm: Option<i64>,
 }
 
 enum Upload {
@@ -127,6 +136,7 @@ impl Chat {
             upload: Upload::Idle,
             images: HashMap::new(),
             opening: HashSet::new(),
+            confirm: None,
         };
         let task = Task::batch([chat.recover(client), operation::focus(COMPOSER)]);
         (chat, task)
@@ -245,6 +255,27 @@ impl Chat {
                     let result = logic::open_attachment(&client, id, name, url).await;
                     App::Chat(channel, Msg::Opened(id, result))
                 });
+            }
+            Msg::AskDelete(id) => self.confirm = Some(id),
+            Msg::CancelDelete => self.confirm = None,
+            Msg::Delete(id) => {
+                self.confirm = None;
+                let client = client.clone();
+                return Task::future(async move {
+                    let result = client.delete_message(channel, id).await;
+                    App::Chat(channel, Msg::Deleted(id, result))
+                });
+            }
+            // Já apagada por outro caminho também sai da tela.
+            Msg::Deleted(id, Ok(()) | Err(Error::Server(404))) => {
+                self.timeline.remove(id);
+                self.sync();
+            }
+            Msg::Deleted(_, Err(Error::Server(403))) => {
+                self.error = Some("Só quem mandou ou um admin apaga a mensagem.".to_owned());
+            }
+            Msg::Deleted(_, Err(e)) => {
+                return self.failed(e, "Não foi possível apagar a mensagem.");
             }
             Msg::Opened(id, result) => {
                 self.opening.remove(&id);
@@ -612,7 +643,11 @@ fn message_row<'a>(
     } else {
         body.into()
     };
+    let confirming = chat.confirm == Some(id);
+    let delete = (can_delete(&m.user, message) && (hovered || confirming))
+        .then(|| delete_actions(channel, id, confirming));
     let line = row![container(gutter).width(ROSTO), main]
+        .push(delete)
         .spacing(14)
         .align_y(Alignment::Start);
     let cell = container(line)
@@ -630,6 +665,42 @@ fn message_row<'a>(
         column![space().height(10), cell].into()
     } else {
         cell.into()
+    }
+}
+
+/// A própria mensagem, ou qualquer uma pra admin. O servidor confere de novo.
+fn can_delete(user: &User, message: &Message) -> bool {
+    user.is_admin || message.author_id == Some(user.id)
+}
+
+/// Apagar não tem volta: o primeiro clique só pergunta.
+fn delete_actions<'a>(channel: i64, id: i64, confirming: bool) -> Element<'a, App> {
+    let small = |label, style: fn(&Theme, button::Status) -> button::Style, msg| {
+        button(text(label).size(12.5))
+            .padding([3, 10])
+            .style(style)
+            .on_press(App::Chat(channel, msg))
+    };
+    if !confirming {
+        return small("Apagar", delete_style, Msg::AskDelete(id)).into();
+    }
+    row![
+        text("Apagar a mensagem?").size(12.5).color(FG2),
+        small("Apagar", theme::danger, Msg::Delete(id)),
+        small("Cancelar", theme::ghost, Msg::CancelDelete),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn delete_style(_: &Theme, status: button::Status) -> button::Style {
+    let hot = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: hot.then_some(Background::Color(DANGER_SOFT)),
+        text_color: if hot { DANGER } else { FG3 },
+        border: border::rounded(8),
+        ..Default::default()
     }
 }
 
@@ -1099,6 +1170,14 @@ mod tests {
         let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
         let _ = a.update(App::Chat(1, Msg::Hover(2, true)));
         print(&a, "mensagens");
+        // Própria mensagem com o mouse em cima, e a confirmação de apagar.
+        main(&mut a).user.id = "Opedro".len() as i64;
+        let _ = a.update(App::Chat(1, Msg::Hover(5, true)));
+        print(&a, "apagar");
+        let _ = a.update(App::Chat(1, Msg::AskDelete(5)));
+        print(&a, "apagar-confirma");
+        let _ = a.update(App::Chat(1, Msg::CancelDelete));
+        let _ = a.update(App::Chat(1, Msg::Hover(2, true)));
 
         let c = chat(&mut a);
         for ch in "mensagem nova".chars() {
@@ -1262,5 +1341,52 @@ mod tests {
             &cliente,
         );
         assert!(c.images.is_empty());
+    }
+
+    #[test]
+    fn apaga_a_propria_ou_qualquer_uma_se_for_admin() {
+        let mut user = User {
+            id: 3,
+            username: "bia".into(),
+            is_admin: false,
+            avatar_url: None,
+        };
+        let minha = msg(1, "bia", 0, "x");
+        let outra = msg(2, "anabela", 0, "x");
+        let removido = Message {
+            author_id: None,
+            ..msg(3, "Usuário removido", 0, "x")
+        };
+        assert!(can_delete(&user, &minha));
+        assert!(!can_delete(&user, &outra));
+        assert!(!can_delete(&user, &removido));
+        user.is_admin = true;
+        assert!(can_delete(&user, &outra) && can_delete(&user, &removido));
+    }
+
+    #[test]
+    fn apagar_pergunta_antes_e_sai_da_tela() {
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let cliente = Client::new("https://a.b", None);
+        let c = chat(&mut a);
+        let page = Page {
+            messages: vec![msg(1, "ana", 0, "a"), msg(2, "ana", 1, "b")],
+            has_more: false,
+        };
+        let _ = c.update(Msg::Loaded(Ok(Window::first(page))), &cliente);
+        let _ = c.update(Msg::AskDelete(1), &cliente);
+        assert_eq!(c.confirm, Some(1));
+        let _ = c.update(Msg::Delete(1), &cliente);
+        assert_eq!(c.confirm, None);
+        let _ = c.update(Msg::Deleted(1, Ok(())), &cliente);
+        assert_eq!(c.timeline.messages.len(), 1);
+        assert!(!c.texts.contains_key(&1));
+        let _ = c.update(Msg::Deleted(2, Err(Error::Server(403))), &cliente);
+        assert_eq!(c.timeline.messages.len(), 1);
+        assert!(c.error.as_deref().is_some_and(|e| e.contains("admin")));
+        // Já apagada por outro caminho: sai igual.
+        let _ = c.update(Msg::Deleted(2, Err(Error::Server(404))), &cliente);
+        assert!(c.timeline.messages.is_empty());
     }
 }

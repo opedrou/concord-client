@@ -399,6 +399,13 @@ impl Client {
         parse(req.send().await.map_err(|_| Error::Offline)?).await
     }
 
+    /// 403 quando não é a própria mensagem nem admin.
+    pub async fn delete_message(&self, channel: i64, id: i64) -> Result<(), Error> {
+        let url = format!("{}/api/channels/{channel}/messages/{id}", self.base);
+        let resp = self.authed(self.http.delete(url)).send().await;
+        check(resp.map_err(|_| Error::Offline)?).map(drop)
+    }
+
     /// Corpo bruto, como a web: o servidor grava em stream. `sent` recebe quantos bytes já
     /// foram entregues pra rede, e o total. 413 é arquivo grande demais.
     pub async fn upload(

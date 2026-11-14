@@ -189,7 +189,13 @@ async fn bancada_chat() {
         .expect("envio");
     lado.tela.insert(enviada);
 
-    // Derruba o caminho do cliente e manda com ele fora.
+    // Uma que vai ser apagada com o cliente fora.
+    let apagar = format!("apagar {run}");
+    let alvo = direto.send_message(channel, &apagar, None).await.unwrap();
+    lado.ate("viu a que vai ser apagada", |l| l.tem(&apagar) == 1)
+        .await;
+
+    // Derruba o caminho do cliente, manda e apaga com ele fora.
     proxy.set_down(true);
     lado.ate("o SSE caiu", |l| l.quedas == 1).await;
     let antes = Instant::now();
@@ -199,9 +205,12 @@ async fn bancada_chat() {
             .await
             .expect("envio durante a queda");
     }
+    direto.delete_message(channel, alvo.id).await.unwrap();
     sleep(Duration::from_secs(4)).await;
     proxy.set_down(false);
-    let todas = |l: &Lado| (1..=DURANTE).all(|k| l.tem(&format!("durante-{k} {run}")) >= 1);
+    let todas = |l: &Lado| {
+        (1..=DURANTE).all(|k| l.tem(&format!("durante-{k} {run}")) >= 1) && l.tem(&apagar) == 0
+    };
     lado.ate("recuperou o que perdeu", |l| l.conexoes >= 2 && todas(l))
         .await;
     println!(
@@ -272,6 +281,12 @@ async fn bancada_chat() {
     let nome = local.file_name().unwrap().to_string_lossy().into_owned();
     assert_eq!(nome, format!("{}-notas-{run}.bin", enviada.id));
     std::fs::remove_file(local).unwrap();
+    // Apaga o arquivo: o Chrome vê sumir.
+    lado.client
+        .delete_message(channel, enviada.id)
+        .await
+        .expect("apagar a própria");
+    lado.tela.remove(enviada.id);
 
     // Foto do Chrome: chega pelo SSE e a tela consegue mostrar.
     let web_anexo = format!("web-anexo {run}");
@@ -292,6 +307,8 @@ async fn bancada_chat() {
         .unwrap();
     let (w, h, _) = thumbnail(&bytes).expect("foto do Chrome decodifica");
     println!("CLIENTE: foto do Chrome {w}x{h}, {} bytes", bytes.len());
+    // O Chrome apaga a primeira dele pelo botão; chega aqui pelo SSE.
+    lado.ate("viu o Chrome apagar", |l| l.tem(&web1) == 0).await;
 
     let status = tokio::task::spawn_blocking(move || web.wait())
         .await
