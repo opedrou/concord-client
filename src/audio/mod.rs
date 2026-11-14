@@ -1,7 +1,7 @@
 //! Motor de áudio: mic -> APM -> RNNoise -> gate -> sala, e sala -> mixer -> saída,
 //! com o som final como referência do eco. Fixo em 48 kHz e blocos de 10 ms.
 #[cfg(test)]
-mod bancada;
+pub(crate) mod bancada;
 mod device;
 mod gate;
 mod mic;

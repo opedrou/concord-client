@@ -12,7 +12,7 @@ use livekit::{
     DisconnectReason, Room, RoomEvent, RoomOptions,
     options::TrackPublishOptions,
     participant::LocalParticipant,
-    publication::LocalTrackPublication,
+    publication::{LocalTrackPublication, RemoteTrackPublication},
     track::{LocalAudioTrack, LocalTrack, RemoteTrack, RemoteVideoTrack, TrackSource},
     webrtc::{
         audio_source::native::NativeAudioSource,
@@ -97,6 +97,9 @@ enum Cmd {
     /// Identity de quem assistir; `None` para de assistir.
     Watch(Option<String>),
     Leave,
+    /// Queda simulada pelo SDK, pra bancada.
+    #[cfg(test)]
+    Simulate(livekit::SimulateScenario),
 }
 
 /// Quadro de transmissão em RGBA: o assistido, inteiro, ou a prévia, pequena.
@@ -319,6 +322,11 @@ impl Call {
         self.stop_share();
         let _ = self.cmd.send(Cmd::Leave);
     }
+
+    #[cfg(test)]
+    pub(crate) fn simulate(&self, scenario: livekit::SimulateScenario) {
+        let _ = self.cmd.send(Cmd::Simulate(scenario));
+    }
 }
 
 // --- Regras puras ------------------------------------------------------------
@@ -515,6 +523,8 @@ impl Ctl {
                     }
                     Some(Cmd::MutedPeople(p)) => self.people = p,
                     Some(Cmd::Watch(w)) => self.watching = w,
+                    #[cfg(test)]
+                    Some(Cmd::Simulate(_)) => {}
                 }
             }
         }
@@ -619,6 +629,7 @@ impl Task {
         let meter = ctl.engine.meter();
         let _forward = AbortOnDrop(tokio::spawn(forward_mic(mic, meter, source_rx, speech)));
         let end = self.lifecycle(&mut ctl, &source).await;
+        log!("sala: fim da call em {} ({end:?})", self.slug);
         // Faixa e vozes já caíram aqui: `Ended` é sempre o último evento. Soltar a tarefa
         // da tela para a captura também nos fins que não passam por `leave`.
         drop(sharing);
@@ -635,6 +646,7 @@ impl Task {
             match self.connect(ctl, source).await {
                 Ok(mut session) => {
                     attempt = 0;
+                    log!("sala: conectou em {}", self.slug);
                     self.emit(Event::Connected);
                     let outcome = self.serve(&mut session, ctl).await;
                     source.send_replace(None);
@@ -652,6 +664,7 @@ impl Task {
             if attempt > MAX_ATTEMPTS {
                 return End::GaveUp;
             }
+            log!("sala: reconectando, tentativa {attempt}");
             self.emit(Event::Reconnecting { attempt });
             if ctl.or_leave(sleep(backoff(attempt))).await.is_none() {
                 return End::Left;
@@ -757,6 +770,10 @@ impl Task {
                         debounce = Some(Instant::now() + MUTED_DEBOUNCE);
                     }
                     Some(Cmd::Watch(w)) => s.watch(ctl, w),
+                    #[cfg(test)]
+                    Some(Cmd::Simulate(scenario)) => {
+                        let _ = s.room.simulate_scenario(scenario).await;
+                    }
                     None | Some(Cmd::Leave) => return Outcome::End(s.close().await),
                 },
                 Some(sid) = ctl.peek_rx.recv() => s.end_peek(ctl, &sid),
@@ -771,6 +788,7 @@ impl Task {
     }
 
     fn on_event(&self, s: &mut Session, ctl: &Ctl, event: RoomEvent) -> Option<Outcome> {
+        log_event(&event);
         match &event {
             RoomEvent::Disconnected { reason } => {
                 return Some(match definitive(*reason) {
@@ -948,6 +966,45 @@ impl Task {
             s.last.clone_from(&list);
             self.emit(Event::Participants(list));
         }
+    }
+}
+
+/// Quem entrou e saiu, e cada faixa assinada ou solta, pro `concord.log`.
+fn log_event(event: &RoomEvent) {
+    let track = |p: &RemoteTrackPublication| format!("{:?} \"{}\"", p.source(), p.name());
+    match event {
+        RoomEvent::Disconnected { reason } => log!("sala: caiu ({reason:?})"),
+        RoomEvent::Reconnecting => log!("sala: reconectando pelo SDK"),
+        RoomEvent::Reconnected => log!("sala: reconectou pelo SDK"),
+        RoomEvent::ParticipantConnected(p) => log!("sala: {} entrou", p.identity()),
+        RoomEvent::ParticipantDisconnected(p) => log!("sala: {} saiu", p.identity()),
+        RoomEvent::TrackSubscribed {
+            publication,
+            participant,
+            ..
+        } => log!(
+            "sala: assinou {} de {}",
+            track(publication),
+            participant.identity()
+        ),
+        RoomEvent::TrackUnsubscribed {
+            publication,
+            participant,
+            ..
+        } => log!(
+            "sala: soltou {} de {}",
+            track(publication),
+            participant.identity()
+        ),
+        RoomEvent::TrackSubscriptionFailed {
+            participant,
+            track_sid,
+            error,
+        } => log!(
+            "sala: assinatura de {track_sid} de {} falhou: {error}",
+            participant.identity()
+        ),
+        _ => {}
     }
 }
 

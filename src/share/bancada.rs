@@ -535,3 +535,143 @@ async fn bancada_tela_audio() {
     let _ = room.close().await;
     println!("FIM");
 }
+
+/// Chrome falando a fala TTS na sala, e a call do cliente tem que ouvir em toda volta:
+/// entrar e sair com o som de saída tocando, prévia e assistir a tela de outro, e queda
+/// pelo SDK. Rode por `src/audio/bancada.sh bancada_ouve`, com as variáveis do
+/// `share/bancada.sh` e `OUT`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bancada_ouve() {
+    use crate::audio::{
+        Effect,
+        bancada::{Killed, level},
+    };
+    assert!(
+        std::env::var_os("BANCADA_RAIZ").is_some(),
+        "rode por src/audio/bancada.sh, num PipeWire próprio"
+    );
+    for args in [
+        "load-module module-null-sink sink_name=bancada_ouve",
+        "set-default-sink bancada_ouve",
+    ] {
+        let _ = Command::new("pactl").args(args.split(' ')).output();
+    }
+    let _chrome = Killed(
+        Command::new("node")
+            .arg(format!(
+                "{}/ouvinte.mjs",
+                option_env!("CONCORD_BANCADA").unwrap_or_default()
+            ))
+            .env(
+                "FAKE_WAV",
+                format!(
+                    "{}/Portuguese_stable.wav",
+                    option_env!("CONCORD_VOZES").unwrap_or_default()
+                ),
+            )
+            .env("WAIT_MS", "900000")
+            .spawn()
+            .expect("node"),
+    );
+    let client = cliente().await;
+    // Outra pessoa transmitindo: dá a prévia ao entrar e alguém pra assistir.
+    let room = entrar(&client).await;
+    let me = room.local_participant();
+    let mut banca = Banca::new(me.clone());
+    banca.ao_vivo(&me, Quality::Economica).await;
+    let tela = me.identity().to_string();
+
+    let mut mudas: Vec<String> = vec![];
+    let mut ouvir = async |what: String| {
+        // Duas janelas: a fala tem pausa entre as frases.
+        let rms = tokio::task::spawn_blocking(|| {
+            level("bancada_ouve.monitor").max(level("bancada_ouve.monitor"))
+        })
+        .await
+        .unwrap();
+        println!("OUVE {what}: rms={rms:.4}");
+        if rms < 0.01 {
+            mudas.push(what);
+        }
+    };
+    let prefs = AudioPrefs {
+        input: None,
+        output: None,
+        noise: NoiseLevel::Off,
+        sensitivity: Sensitivity::Auto,
+        master: 71,
+        volumes: HashMap::new(),
+    };
+    for volta in 0..6 {
+        let (engine, mic) = Engine::start(prefs.clone()).expect("motor");
+        let (call, mut events) = Call::join_with(
+            client.clone(),
+            var("CONCORD_ROOM"),
+            "bancada-ouve".to_owned(),
+            engine.clone(),
+            mic,
+            true,
+            sintetica,
+        );
+        // Conectado e com o Chrome de mic aberto na lista.
+        let mut conectou = false;
+        loop {
+            match evento(&mut events).await {
+                Event::Connected => conectou = true,
+                Event::Participants(list)
+                    if conectou
+                        && list
+                            .iter()
+                            .any(|p| !p.is_local && p.identity != tela && !p.muted) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        sleep(Duration::from_secs(2)).await;
+        ouvir(format!("volta {volta}")).await;
+        if volta == 1 {
+            for vez in 0..3 {
+                call.watch(Some(tela.clone()));
+                sleep(Duration::from_secs(3)).await;
+                ouvir(format!("assistindo {vez}")).await;
+                call.watch(None);
+                sleep(Duration::from_secs(2)).await;
+                ouvir(format!("parou de assistir {vez}")).await;
+            }
+        }
+        if volta == 2 {
+            for scenario in [
+                SimulateScenario::SignalReconnect,
+                SimulateScenario::FullReconnect,
+                SimulateScenario::ServerLeave,
+                SimulateScenario::NodeFailure,
+                SimulateScenario::Migration,
+            ] {
+                call.simulate(scenario);
+                let (mut caiu, inicio) = (false, Instant::now());
+                while inicio.elapsed() < Duration::from_secs(40) {
+                    match timeout(Duration::from_secs(1), events.recv()).await {
+                        Ok(Some(Event::Reconnecting { .. })) => caiu = true,
+                        Ok(Some(Event::Connected)) if caiu => break,
+                        Ok(Some(Event::Ended(end))) => panic!("{scenario:?} acabou: {end:?}"),
+                        _ => {}
+                    }
+                }
+                println!("CENARIO {scenario:?}: caiu={caiu}");
+                sleep(Duration::from_secs(4)).await;
+                ouvir(format!("{scenario:?}")).await;
+            }
+        }
+        // Como o botão de sair: o som, e o motor cai com ele tocando.
+        engine.play(Effect::Leave);
+        call.leave();
+        drop((engine, call));
+        while !matches!(evento(&mut events).await, Event::Ended(_)) {}
+    }
+    banca.parar(&me).await;
+    let _ = room.close().await;
+    assert!(mudas.is_empty(), "sem voz em: {mudas:?}");
+}

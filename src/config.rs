@@ -188,6 +188,11 @@ fn path() -> Option<PathBuf> {
     Some(dir()?.join("config.json"))
 }
 
+/// Ver `crate::log`.
+pub fn log_path() -> Option<PathBuf> {
+    Some(dir()?.join("concord.log"))
+}
+
 #[cfg(windows)]
 fn dir() -> Option<PathBuf> {
     Some(PathBuf::from(env::var_os("APPDATA")?).join("Concord"))

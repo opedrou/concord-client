@@ -28,13 +28,13 @@ const OPEN_TIMEOUT: Option<Duration> = Some(Duration::from_secs(2));
 
 /// Host novo a cada abertura: a conexão velha pode ser justamente o que caiu.
 #[cfg(not(windows))]
-fn host() -> Result<Host, String> {
+pub fn host() -> Result<Host, String> {
     // Só PulseAudio: linkar libpipewire derruba o processo, ver o Cargo.toml.
     cpal::host_from_id(cpal::HostId::PulseAudio).map_err(|e| e.to_string())
 }
 
 #[cfg(windows)]
-fn host() -> Result<Host, String> {
+pub fn host() -> Result<Host, String> {
     Ok(cpal::default_host())
 }
 
@@ -67,11 +67,57 @@ fn find(mut list: impl Iterator<Item = Device>, name: &str) -> Option<Device> {
     list.find(|d| name_of(d).as_deref() == Some(name))
 }
 
+fn id_of(device: &Device) -> Option<String> {
+    Some(device.id().ok()?.to_string())
+}
+
+/// Um lado do servidor agora: o padrão e cada dispositivo, pra saber se o stream aberto
+/// ainda está no lugar certo.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Seen {
+    /// Id do padrão do sistema.
+    pub default: Option<String>,
+    /// Nome e id, na ordem do servidor: a mesma que o [`find`] percorre.
+    pub devices: Vec<(String, String)>,
+}
+
+impl Seen {
+    fn of(default: Option<Device>, list: impl Iterator<Item = Device>) -> Self {
+        Seen {
+            default: default.as_ref().and_then(id_of),
+            devices: list
+                .filter_map(|d| Some((name_of(&d)?, id_of(&d)?)))
+                .collect(),
+        }
+    }
+
+    /// Id de onde o `open_*` abriria agora: o salvo, se está ligado, senão o padrão.
+    pub fn target(&self, wanted: Option<&str>) -> Option<&str> {
+        wanted
+            .and_then(|w| self.devices.iter().find(|(name, _)| name == w))
+            .map(|(_, id)| id.as_str())
+            .or(self.default.as_deref())
+    }
+}
+
+/// Saída e entrada como estão no servidor. Bloqueia; `None` se a conexão caiu.
+pub fn look(host: &Host) -> Option<(Seen, Seen)> {
+    let outputs = host.output_devices().ok()?;
+    let inputs = host.input_devices().ok()?;
+    Some((
+        Seen::of(host.default_output_device(), outputs),
+        Seen::of(host.default_input_device(), inputs),
+    ))
+}
+
 /// Stream aberto, com o anel que liga o callback à thread de áudio.
 pub struct Opened<R> {
     _stream: Stream,
     pub ring: R,
     lost: Arc<AtomicBool>,
+    /// Nome e id do dispositivo de verdade, que pode não ser o pedido.
+    pub name: String,
+    pub id: Option<String>,
 }
 
 impl<R> Opened<R> {
@@ -92,7 +138,7 @@ fn on_error(what: &'static str) -> (Arc<AtomicBool>, impl FnMut(Error) + Send + 
     let lost = Arc::new(AtomicBool::new(false));
     let flag = lost.clone();
     let callback = move |e: Error| {
-        eprintln!("áudio: {what}: {e}");
+        log!("áudio: erro no stream de {what}: {e}");
         if !matches!(
             e.kind(),
             ErrorKind::Xrun | ErrorKind::DeviceChanged | ErrorKind::RealtimeDenied
@@ -129,6 +175,8 @@ pub fn open_output(name: Option<&str>) -> Result<Opened<Producer<f32>>, String> 
         _stream: stream,
         ring,
         lost,
+        name: name_of(&device).unwrap_or_default(),
+        id: id_of(&device),
     })
 }
 
@@ -159,5 +207,7 @@ pub fn open_input(name: Option<&str>) -> Result<Opened<Consumer<f32>>, String> {
         _stream: stream,
         ring,
         lost,
+        name: name_of(&device).unwrap_or_default(),
+        id: id_of(&device),
     })
 }
