@@ -4,12 +4,13 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.7.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.8.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
 - **Voz:** microfone com cancelamento de eco, limitador de voz automático ou manual e
-  sensibilidade de entrada. Volume por pessoa e troca de dispositivo no meio da call.
+  sensibilidade de entrada. Volume por pessoa e troca de dispositivo no meio da call, e o fone
+  que cai volta sozinho quando reconecta.
 - **Transmitir a tela:** tela inteira ou janela, com o som do que está tocando. Dá pra trocar a
   tela e ligar ou desligar o áudio sem parar a transmissão, com prévia do que está saindo.
 - **Assistir** a transmissão dos outros, como no site.
@@ -44,10 +45,25 @@ o seletor de tela do sistema (xdg-desktop-portal).
 - No Linux, o monitor não é mantido aceso enquanto você assiste uma transmissão.
 - No Windows, o vídeo da transmissão é codificado na CPU (VP8).
 
-## Novidades da v0.1.7
+## Novidades da v0.1.8
 
-Nada muda no app. É a mesma versão da v0.1.6, agora compilada e publicada por
-`release/release.sh`, que gera as duas versões no Linux.
+### Novo
+- **Log em arquivo** pra investigar problema de áudio: `~/.config/concord/concord.log` no Linux,
+  `%APPDATA%\Concord\concord.log` no Windows. Guarda sala, faixas, dispositivos, mudo e surdo, e
+  recomeça ao passar de 1 MB.
+
+### Corrigido
+- **Fone que cai ou que liga depois de entrar na call:** a voz ia pro dispositivo padrão do
+  sistema e ficava lá até o fim. Agora o app confere a cada segundo e volta pro fone escolhido
+  assim que ele reaparece, na saída e no microfone.
+- **Áudio travado quando a saída some** com um som tocando: o app espera no máximo 3 s e segue.
+
+### Interno
+- Bancada que confere se a call ouve o Chrome em 22 medidas: entrar e sair, assistir, prévia e
+  quedas de rede.
+
+### Limites conhecidos
+- No Windows, a volta pro fone que reconecta ainda não foi testada com um fone de verdade.
 
 ## Compilar
 
