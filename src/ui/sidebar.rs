@@ -352,7 +352,10 @@ fn icon_button<'a>(glyph: &'static [u8], danger: bool, msg: Msg, tip: &'a str) -
     tipped(target.into(), tip)
 }
 
-pub fn tipped<'a>(target: Element<'a, Msg>, tip: &'a str) -> Element<'a, Msg> {
+pub fn tipped<'a>(
+    target: Element<'a, Msg>,
+    tip: impl iced::widget::text::IntoFragment<'a>,
+) -> Element<'a, Msg> {
     let bubble = container(text(tip).size(12).color(FG))
         .padding([4, 8])
         .style(theme::tooltip);

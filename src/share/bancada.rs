@@ -675,3 +675,119 @@ async fn bancada_ouve() {
     let _ = room.close().await;
     assert!(mudas.is_empty(), "sem voz em: {mudas:?}");
 }
+
+/// Roda `assiste-conta.mjs` e devolve os rótulos de espectadores que o site mostrou.
+async fn rotulos_do_site() -> String {
+    let web = tokio::task::spawn_blocking(|| {
+        Command::new("node")
+            .arg("src/share/assiste-conta.mjs")
+            .output()
+            .expect("node")
+    })
+    .await
+    .unwrap();
+    let saida = String::from_utf8_lossy(&web.stdout).into_owned();
+    println!("{saida}{}", String::from_utf8_lossy(&web.stderr));
+    saida
+        .lines()
+        .find_map(|l| l.strip_prefix("ROTULOS "))
+        .expect("ROTULOS")
+        .to_owned()
+}
+
+/// Ponta a ponta do `concord.watching`: uma sala crua transmite, a call do cliente assiste, e
+/// o site tem que mostrar o espectador no tile. Rode por `src/audio/bancada.sh
+/// bancada_assistindo`, com as variáveis do `share/bancada.sh` e `OUT`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bancada_assistindo() {
+    assert!(
+        std::env::var_os("BANCADA_RAIZ").is_some(),
+        "rode por src/audio/bancada.sh, num PipeWire próprio"
+    );
+    let client = cliente().await;
+    let room = entrar(&client).await;
+    let me = room.local_participant();
+    let mut banca = Banca::new(me.clone());
+    banca.ao_vivo(&me, Quality::Economica).await;
+    let sid = tela(&me).expect("publicada").sid().to_string();
+    let transmissor = me.identity().to_string();
+
+    let prefs = AudioPrefs {
+        input: None,
+        output: None,
+        noise: NoiseLevel::Off,
+        sensitivity: Sensitivity::Auto,
+        master: 71,
+        volumes: HashMap::new(),
+    };
+    let (engine, mic): (Engine, Receiver<Vec<i16>>) = Engine::start(prefs).expect("motor");
+    let (call, mut events) = Call::join_with(
+        client.clone(),
+        var("CONCORD_ROOM"),
+        "bancada-olha".to_owned(),
+        engine,
+        mic,
+        true,
+        sintetica,
+    );
+    let espectador = loop {
+        if let Event::Participants(list) = evento(&mut events).await
+            && let Some(l) = list.iter().find(|p| p.is_local)
+            && list
+                .iter()
+                .any(|p| p.identity == transmissor && p.screen_share)
+        {
+            break l.identity.clone();
+        }
+    };
+
+    call.watch(Some(transmissor.clone()));
+    // O mapa que a UI recebe: o espectador local na transmissão.
+    loop {
+        if let Event::Viewers(v) = evento(&mut events).await
+            && v.get(&transmissor) == Some(&vec![espectador.clone()])
+        {
+            break;
+        }
+    }
+    println!("CLIENTE_VE {espectador} assistindo {transmissor}");
+    // O que a sala crua lê do atributo publicado: o sid da tela, sem mais nada.
+    let atributo = loop {
+        let lido = room
+            .remote_participants()
+            .values()
+            .find(|p| p.identity().as_str() == espectador)
+            .and_then(|p| p.attributes().get("concord.watching").cloned());
+        if let Some(v) = lido.filter(|v| !v.is_empty()) {
+            break v;
+        }
+        sleep(Duration::from_millis(200)).await;
+    };
+    println!("ATRIBUTO {atributo}");
+    assert_eq!(atributo, sid);
+    // E o que o site leu dele.
+    let rotulos = rotulos_do_site().await;
+    println!("SITE_ASSISTINDO {rotulos}");
+    assert!(
+        rotulos.contains("está assistindo"),
+        "o site não mostrou: {rotulos}"
+    );
+
+    call.watch(None);
+    loop {
+        if let Event::Viewers(v) = evento(&mut events).await
+            && v.is_empty()
+        {
+            break;
+        }
+    }
+    let rotulos = rotulos_do_site().await;
+    println!("SITE_PAROU {rotulos}");
+    assert_eq!(rotulos, "[]", "o site seguiu mostrando depois de parar");
+
+    call.leave();
+    banca.parar(&me).await;
+    let _ = room.close().await;
+    println!("FIM");
+}

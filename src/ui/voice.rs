@@ -95,6 +95,8 @@ pub struct ActiveCall {
     pub screen: Option<image::Allocation>,
     /// Um quadro esperando subir pra GPU; o próximo só sai depois.
     pub screen_pending: bool,
+    /// Quem assiste a transmissão de cada um: identity de quem transmite -> identities.
+    pub viewers: HashMap<String, Vec<String>>,
     /// Prévia borrada de cada transmissão no ar, pela identity.
     pub previews: HashMap<String, image::Handle>,
     /// Prévia da própria transmissão, já na GPU, e se tem uma subindo.
@@ -147,6 +149,7 @@ impl ActiveCall {
             watching: None,
             screen: None,
             screen_pending: false,
+            viewers: HashMap::new(),
             previews: HashMap::new(),
             own: None,
             own_pending: false,
@@ -424,6 +427,19 @@ impl ActiveCall {
         if self.watching.is_some() && allocation.is_some() {
             self.screen = allocation;
         }
+    }
+
+    /// Nomes de quem assiste a transmissão de `identity`, na ordem do evento. Quem não está
+    /// na lista da sala (saiu entre um evento e outro) fica de fora.
+    pub fn viewers_of(&self, identity: &str) -> Vec<&str> {
+        let live = self.live.as_deref().unwrap_or_default();
+        self.viewers
+            .get(identity)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| live.iter().find(|l| &l.identity == v))
+            .map(name_of)
+            .collect()
     }
 
     pub fn set_preview(&mut self, identity: String, p: crate::call::Picture) {
