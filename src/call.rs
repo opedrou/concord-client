@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use livekit::{
     DisconnectReason, Room, RoomEvent, RoomOptions,
     options::TrackPublishOptions,
-    participant::LocalParticipant,
+    participant::{ConnectionQuality, LocalParticipant, Participant},
     publication::{LocalTrackPublication, RemoteTrackPublication},
     track::{
         LocalAudioTrack, LocalTrack, RemoteTrack, RemoteVideoTrack, TrackSource, VideoQuality,
@@ -42,6 +42,8 @@ pub const MAX_ATTEMPTS: u32 = 10;
 
 /// Atributo de participante com os nomes que esta pessoa deixou em volume zero.
 const MUTED_ATTRIBUTE: &str = "concord.muted";
+/// Modo foco da web: `on:` e os nomes que a pessoa ainda ouve, ou vazio com o foco desligado.
+const FOCUS_ATTRIBUTE: &str = "concord.focus";
 const MUTED_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Atributo de participante com os sids das transmissões que esta pessoa assiste: igual
 /// ao `concord.watching` da web (sids da tela, ordenados, separados por vírgula).
@@ -59,6 +61,8 @@ pub struct Live {
     pub camera: bool,
     pub screen_share: bool,
     pub speaking: bool,
+    /// Esta pessoa não me ouve: me deixou em volume zero ou está em modo foco sem me incluir.
+    pub not_hearing_me: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -85,6 +89,10 @@ pub enum Event {
     Reconnecting {
         attempt: u32,
     },
+    /// A sala está sendo gravada (`active_recording` do LiveKit). Vem ao entrar e a cada mudança.
+    Recording(bool),
+    /// A minha conexão está ruim (`Poor` ou `Lost`), como o aviso do site.
+    Unstable(bool),
     /// Lista inteira, a cada mudança.
     Participants(Vec<Live>),
     /// Quem assiste a transmissão de cada um: identity de quem transmite -> identities de
@@ -457,7 +465,32 @@ fn live(
         camera,
         screen_share,
         speaking: speaking && mic_open,
+        not_hearing_me: false,
     }
+}
+
+/// Lê `concord.muted`: vazio e pedaços vazios não contam, como `parseMuted` da web.
+fn parse_names(value: &str) -> impl Iterator<Item = &str> {
+    value.split(',').filter(|s| !s.is_empty())
+}
+
+/// A pessoa com estes atributos não me ouve? Mesma regra do `useAudibility` da web: me
+/// silenciou (`concord.muted`) ou está em foco (`concord.focus` = `on:` + nomes) sem eu na
+/// lista. Foco sem o prefixo `on:` é desligado. Ensurdecer não é anunciado pela web.
+fn not_hearing(attrs: &HashMap<String, String>, me: &str) -> bool {
+    let muted = attrs
+        .get(MUTED_ATTRIBUTE)
+        .is_some_and(|v| parse_names(v).any(|n| n == me));
+    let excluded = attrs
+        .get(FOCUS_ATTRIBUTE)
+        .and_then(|v| v.strip_prefix("on:"))
+        .is_some_and(|v| !parse_names(v).any(|n| n == me));
+    muted || excluded
+}
+
+/// O aviso de conexão do site acende em `Poor` e `Lost`, não nas oscilações Good/Excellent.
+fn unstable(quality: ConnectionQuality) -> bool {
+    matches!(quality, ConnectionQuality::Poor | ConnectionQuality::Lost)
 }
 
 /// Local primeiro; os outros em ordem estável, pra lista não pular de lugar.
@@ -577,6 +610,9 @@ struct Session {
     /// Último mapa de espectadores emitido.
     last_viewers: HashMap<String, Vec<String>>,
     reconnecting: bool,
+    /// Últimos `Recording` e `Unstable` emitidos, pra só avisar mudança.
+    recording: bool,
+    unstable: bool,
     speaking: HashSet<String>,
     /// Vídeo e áudio da transmissão assistida, por sid da publicação.
     watched: HashMap<String, AbortOnDrop>,
@@ -833,6 +869,8 @@ impl Task {
             sent_watching: String::new(),
             last_viewers: HashMap::new(),
             reconnecting: false,
+            recording: false,
+            unstable: false,
             speaking: HashSet::new(),
             watched: HashMap::new(),
             peeks: HashMap::new(),
@@ -845,6 +883,7 @@ impl Task {
         s.peek_all(ctl.watching.as_deref());
         s.send_muted(&ctl.people);
         s.send_watching(ctl.watching.as_deref());
+        self.set_recording(s);
         self.refresh(s);
         let mut debounce: Option<Instant> = None;
         loop {
@@ -1051,6 +1090,17 @@ impl Task {
                     ctl.screen.clear();
                 }
             }
+            RoomEvent::RoomUpdated { .. } => self.set_recording(s),
+            RoomEvent::ConnectionQualityChanged {
+                quality,
+                participant: Participant::Local(_),
+            } => {
+                let bad = unstable(*quality);
+                if bad != s.unstable {
+                    s.unstable = bad;
+                    self.emit(Event::Unstable(bad));
+                }
+            }
             RoomEvent::Reconnecting => {
                 s.reconnecting = true;
                 self.emit(Event::Reconnecting { attempt: 0 });
@@ -1094,6 +1144,15 @@ impl Task {
             self.refresh(s);
         }
         None
+    }
+
+    /// Emite `Recording` se o estado de gravação da sala mudou (ou é o primeiro).
+    fn set_recording(&self, s: &mut Session) {
+        let on = s.room.active_recording();
+        if on != s.recording {
+            s.recording = on;
+            self.emit(Event::Recording(on));
+        }
     }
 
     fn refresh(&self, s: &mut Session) {
@@ -1264,12 +1323,15 @@ impl Session {
                 .map(|p| (p.source(), p.is_muted())),
             self.speaking.contains(LOCAL),
         );
+        // A web compara por nome (`name || identity`), e `live` já faz esse fallback.
+        let my_name = local.name.clone();
         let remotes = self
             .room
             .remote_participants()
             .values()
-            .map(|p| {
-                live(
+            .map(|p| Live {
+                not_hearing_me: not_hearing(&p.attributes(), &my_name),
+                ..live(
                     p.identity().to_string(),
                     p.name(),
                     false,
@@ -1557,6 +1619,7 @@ mod tests {
             camera: false,
             screen_share: false,
             speaking,
+            not_hearing_me: false,
         }
     }
 
@@ -1628,6 +1691,53 @@ mod tests {
             encode_muted(&n(&["zeca", "ana", "zeca", "bia"])),
             "ana,bia,zeca"
         );
+    }
+
+    fn attrs(muted: Option<&str>, focus: Option<&str>) -> HashMap<String, String> {
+        let mut a = HashMap::new();
+        if let Some(v) = muted {
+            a.insert(MUTED_ATTRIBUTE.to_owned(), v.to_owned());
+        }
+        if let Some(v) = focus {
+            a.insert(FOCUS_ATTRIBUTE.to_owned(), v.to_owned());
+        }
+        a
+    }
+
+    #[test]
+    fn nao_me_ouve_por_mute() {
+        // Sem atributo, vazio, lixo e só os outros: me ouve.
+        assert!(!not_hearing(&attrs(None, None), "eu"));
+        assert!(!not_hearing(&attrs(Some(""), None), "eu"));
+        assert!(!not_hearing(&attrs(Some(",,"), None), "eu"));
+        assert!(!not_hearing(&attrs(Some("ana,bia"), None), "eu"));
+        // Nome parecido não conta: é igualdade, não substring.
+        assert!(!not_hearing(&attrs(Some("eu2,meu"), None), "eu"));
+        // Eu na lista, sozinho ou no meio.
+        assert!(not_hearing(&attrs(Some("eu"), None), "eu"));
+        assert!(not_hearing(&attrs(Some("ana,eu,,bia"), None), "eu"));
+    }
+
+    #[test]
+    fn nao_me_ouve_por_foco() {
+        // Foco desligado (vazio) ou sem o prefixo `on:` não conta.
+        assert!(!not_hearing(&attrs(None, Some("")), "eu"));
+        assert!(!not_hearing(&attrs(None, Some("lixo")), "eu"));
+        assert!(!not_hearing(&attrs(None, Some("ana,bia")), "eu"));
+        // Foco ligado com eu na lista: me ouve. Sem eu, ou ninguém marcado: não ouve.
+        assert!(!not_hearing(&attrs(None, Some("on:ana,eu")), "eu"));
+        assert!(not_hearing(&attrs(None, Some("on:ana,bia")), "eu"));
+        assert!(not_hearing(&attrs(None, Some("on:")), "eu"));
+        // Foco me incluindo não anula o mute individual.
+        assert!(not_hearing(&attrs(Some("eu"), Some("on:eu")), "eu"));
+    }
+
+    #[test]
+    fn conexao_instavel_so_em_poor_e_lost() {
+        assert!(unstable(ConnectionQuality::Poor));
+        assert!(unstable(ConnectionQuality::Lost));
+        assert!(!unstable(ConnectionQuality::Good));
+        assert!(!unstable(ConnectionQuality::Excellent));
     }
 
     fn pessoa(id: &str, name: &str, pubs: &[(TrackSource, bool)]) -> Live {

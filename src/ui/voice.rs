@@ -103,6 +103,10 @@ pub struct ActiveCall {
     pub cameras: HashMap<String, image::Allocation>,
     /// Câmeras com um quadro subindo pra GPU: o próximo delas só sai depois.
     cameras_pending: HashSet<String>,
+    /// A sala está sendo gravada.
+    pub recording: bool,
+    /// A minha conexão está ruim.
+    pub unstable: bool,
     /// Prévia da própria transmissão, já na GPU, e se tem uma subindo.
     pub own: Option<image::Allocation>,
     pub own_pending: bool,
@@ -157,6 +161,8 @@ impl ActiveCall {
             previews: HashMap::new(),
             cameras: HashMap::new(),
             cameras_pending: HashSet::new(),
+            recording: false,
+            unstable: false,
             own: None,
             own_pending: false,
             preview_paused: false,
@@ -582,6 +588,7 @@ pub fn test_live(name: &str, speaking: bool) -> Live {
         camera: false,
         screen_share: false,
         speaking,
+        not_hearing_me: false,
     }
 }
 

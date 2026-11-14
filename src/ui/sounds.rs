@@ -102,6 +102,7 @@ mod tests {
             camera: false,
             screen_share: share,
             speaking: false,
+            not_hearing_me: false,
         }
     }
 
