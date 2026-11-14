@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::audio::{
-    AudioPrefs, MANUAL_DEFAULT_DB, MANUAL_MAX_DB, MANUAL_MIN_DB, NoiseLevel, Sensitivity,
+    AudioPrefs, GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_DEFAULT_DB, MANUAL_MAX_DB, MANUAL_MIN_DB, MicGain,
+    NoiseLevel, Sensitivity,
 };
 use crate::share::Quality;
 
@@ -35,6 +36,10 @@ pub struct Config {
     pub sensitivity: Sensitivity,
     /// Último limiar manual, guardado também com o automático ligado.
     pub manual_db: f32,
+    /// Ganho de entrada; quem já usava fica no automático, o AGC de antes.
+    pub mic_gain: MicGain,
+    /// Último ganho manual, guardado também com o automático ligado.
+    pub manual_gain_db: f32,
     pub master_volume: u8,
     /// Nome da pessoa -> slider. Quem não está aqui fica em [`VOLUME_PADRAO`].
     pub volumes: HashMap<String, u8>,
@@ -57,6 +62,8 @@ impl Default for Config {
             noise: NoiseLevel::default(),
             sensitivity: Sensitivity::default(),
             manual_db: MANUAL_DEFAULT_DB,
+            mic_gain: MicGain::default(),
+            manual_gain_db: 0.0,
             master_volume: VOLUME_PADRAO,
             volumes: HashMap::new(),
             share_quality: Quality::default(),
@@ -83,6 +90,11 @@ impl Config {
             c.manual_db = clamp_db(db);
             c.sensitivity = Sensitivity::Manual(c.manual_db);
         }
+        c.manual_gain_db = clamp_gain(c.manual_gain_db);
+        if let MicGain::Manual(db) = c.mic_gain {
+            c.manual_gain_db = clamp_gain(db);
+            c.mic_gain = MicGain::Manual(c.manual_gain_db);
+        }
         c.volumes.values_mut().for_each(|v| *v = (*v).min(100));
         c
     }
@@ -102,6 +114,7 @@ impl Config {
             output: self.output.clone(),
             noise: self.noise,
             sensitivity: self.sensitivity,
+            mic_gain: self.mic_gain,
             master: self.master_volume,
             volumes: self.volumes.clone(),
         }
@@ -121,6 +134,22 @@ impl Config {
         if let Sensitivity::Manual(_) = self.sensitivity {
             self.manual_db = clamp_db(db);
             self.sensitivity = Sensitivity::Manual(self.manual_db);
+        }
+    }
+
+    /// Igual à sensibilidade: desligar o automático volta ao último ganho manual.
+    pub fn set_auto_gain(&mut self, auto: bool) {
+        self.mic_gain = if auto {
+            MicGain::Auto
+        } else {
+            MicGain::Manual(self.manual_gain_db)
+        };
+    }
+
+    pub fn set_gain(&mut self, db: f32) {
+        if let MicGain::Manual(_) = self.mic_gain {
+            self.manual_gain_db = clamp_gain(db);
+            self.mic_gain = MicGain::Manual(self.manual_gain_db);
         }
     }
 
@@ -181,6 +210,15 @@ pub fn clamp_db(db: f32) -> f32 {
         MANUAL_MIN_DB
     } else {
         db.clamp(MANUAL_MIN_DB, MANUAL_MAX_DB)
+    }
+}
+
+/// NaN do arquivo cai em 0 dB, que não mexe em nada.
+fn clamp_gain(db: f32) -> f32 {
+    if db.is_nan() {
+        0.0
+    } else {
+        db.clamp(GAIN_MIN_DB, GAIN_MAX_DB)
     }
 }
 
@@ -341,6 +379,28 @@ mod tests {
         assert_eq!(c.sensitivity, Sensitivity::Manual(MANUAL_MAX_DB));
         c.set_threshold(f32::NAN);
         assert_eq!(c.sensitivity, Sensitivity::Manual(MANUAL_MIN_DB));
+    }
+
+    #[test]
+    fn ganho_vem_no_automatico_e_guarda_o_ultimo_manual() {
+        let mut c: Config = serde_json::from_str(r#"{"mic_muted":true}"#).unwrap();
+        assert_eq!(
+            c.audio_prefs().mic_gain,
+            MicGain::Auto,
+            "quem já usava não muda"
+        );
+        c.set_gain(6.0);
+        assert_eq!(c.mic_gain, MicGain::Auto, "slider escondido não mexe");
+        c.set_auto_gain(false);
+        assert_eq!(c.mic_gain, MicGain::Manual(0.0));
+        c.set_gain(-7.0);
+        c.set_auto_gain(true);
+        c.set_auto_gain(false);
+        assert_eq!(c.mic_gain, MicGain::Manual(-7.0));
+        c.set_gain(99.0);
+        assert_eq!(c.mic_gain, MicGain::Manual(GAIN_MAX_DB));
+        let c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c.audio_prefs().mic_gain, MicGain::Manual(GAIN_MAX_DB));
     }
 
     #[test]

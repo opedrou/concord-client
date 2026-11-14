@@ -10,7 +10,9 @@ use super::theme::{self, BG, DANGER, FG, FG2, FG3, GREEN, IDLE};
 use super::voice::Probe;
 use super::{ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avatar};
 use crate::api::Secret;
-use crate::audio::{MANUAL_MAX_DB, MANUAL_MIN_DB, NoiseLevel, Sensitivity};
+use crate::audio::{
+    GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_MAX_DB, MANUAL_MIN_DB, MicGain, NoiseLevel, Sensitivity,
+};
 use crate::config::Config;
 use crate::update::Check;
 
@@ -353,6 +355,7 @@ fn voice_panel<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
         ),
         labeled("Redução de ruído", noise),
         sensitivity(m, config),
+        mic_gain(config),
         labeled("Volume geral", master),
     ]
     .spacing(14)
@@ -454,6 +457,37 @@ fn sensitivity<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
         }
     };
     labeled("Sensibilidade de entrada", column![toggle, body].spacing(8))
+}
+
+/// Fica embaixo da sensibilidade: o medidor dela já mostra o nível com o ganho.
+fn mic_gain(config: &Config) -> Element<'_, Msg> {
+    let toggle = toggler(config.mic_gain == MicGain::Auto)
+        .label("Ajustar automaticamente")
+        .on_toggle(Msg::AutoGain)
+        .size(20)
+        .text_size(14.4);
+    let body: Element<'_, Msg> = match config.mic_gain {
+        MicGain::Auto => text("O Concord nivela sua voz sozinho.")
+            .size(13)
+            .color(FG2)
+            .into(),
+        MicGain::Manual(db) => column![
+            slider(GAIN_MIN_DB..=GAIN_MAX_DB, db, Msg::Gain)
+                .step(1.0f32)
+                .on_release(Msg::VolumeDone)
+                .width(Length::Fill),
+            row![
+                text("A barra da sensibilidade já mostra o efeito.")
+                    .size(13)
+                    .color(FG2),
+                space::horizontal(),
+                text(format!("{db:+.0} dB")).size(13).font(theme::MEDIUM),
+            ],
+        ]
+        .spacing(2)
+        .into(),
+    };
+    labeled("Ganho de entrada", column![toggle, body].spacing(8))
 }
 
 fn about_panel(m: &Main) -> Element<'_, Msg> {
