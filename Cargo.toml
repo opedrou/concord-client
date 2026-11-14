@@ -16,6 +16,8 @@ serde_json = "1"
 keyring = "4"
 uuid = { version = "1", features = ["v4"] }
 image = "0.25"
+# Quadro de vídeo que devolve o buffer ao cair (`call::Pool`). Já vem pelo iced.
+bytes = "1"
 futures-util = "0.3"
 livekit = { version = "0.10", features = ["rustls-tls-native-roots"] }
 nnnoiseless = "0.5"

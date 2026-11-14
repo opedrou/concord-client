@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use futures_util::StreamExt;
 use livekit::{
     DisconnectReason, Room, RoomEvent, RoomOptions,
@@ -20,6 +21,7 @@ use livekit::{
         audio_source::native::NativeAudioSource,
         audio_stream::native::NativeAudioStream,
         prelude::{AudioFrame, AudioSourceOptions, RtcAudioSource, VideoFormatType},
+        video_frame::BoxVideoFrame,
         video_stream::native::NativeVideoStream,
     },
 };
@@ -123,17 +125,41 @@ enum Cmd {
 pub struct Picture {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub rgba: Bytes,
 }
 
 /// Largura da prévia. Esticada no tile, ela mesma fica borrada.
 const PREVIEW_WIDTH: u32 = 96;
 
+/// Buffers de quadro que voltam quando a interface solta a imagem, pro próximo quadro
+/// reusar. Um `Vec` novo por quadro (8 MB em 1080p), alocado numa thread e solto noutra,
+/// ficava preso nas arenas do glibc: a RAM subia enquanto assistia e não voltava.
+#[derive(Clone, Default)]
+struct Pool(Arc<Mutex<Vec<Vec<u8>>>>);
+
+/// Dono do buffer dentro do `Bytes`: ao cair o último, devolve o buffer pro [`Pool`].
+struct Pooled(Vec<u8>, Pool);
+
+impl AsRef<[u8]> for Pooled {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        let buffer = std::mem::take(&mut self.0);
+        self.1.0.lock().unwrap().push(buffer);
+    }
+}
+
 impl Picture {
-    /// Quadro do WebRTC em RGBA. ABGR do libyuv é R, G, B, A na memória: o RGBA do iced.
-    fn of(frame: &livekit::webrtc::video_frame::BoxVideoFrame) -> Self {
+    /// Quadro do WebRTC em RGBA, num buffer do `pool`. ABGR do libyuv é R, G, B, A na
+    /// memória: o RGBA do iced.
+    fn of(frame: &BoxVideoFrame, pool: &Pool) -> Self {
         let (width, height) = (frame.buffer.width(), frame.buffer.height());
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        let mut rgba = pool.0.lock().unwrap().pop().unwrap_or_default();
+        rgba.resize((width * height * 4) as usize, 0);
         let stride = width * 4;
         frame.buffer.to_argb(
             VideoFormatType::ABGR,
@@ -145,7 +171,7 @@ impl Picture {
         Self {
             width,
             height,
-            rgba,
+            rgba: Bytes::from_owner(Pooled(rgba, pool.clone())),
         }
     }
 
@@ -153,12 +179,14 @@ impl Picture {
     fn preview(&self) -> Self {
         let width = PREVIEW_WIDTH.min(self.width).max(1);
         let height = (self.height * width / self.width.max(1)).max(1);
-        let full = image::RgbaImage::from_raw(self.width, self.height, self.rgba.clone())
+        let full = image::RgbaImage::from_raw(self.width, self.height, self.rgba.to_vec())
             .unwrap_or_default();
         Self {
             width,
             height,
-            rgba: image::imageops::thumbnail(&full, width, height).into_raw(),
+            rgba: image::imageops::thumbnail(&full, width, height)
+                .into_raw()
+                .into(),
         }
     }
 }
@@ -649,8 +677,9 @@ impl Ctl {
 fn stream_screen(video: RemoteVideoTrack, screen: Screen) -> AbortOnDrop {
     let mut stream = NativeVideoStream::new(video.rtc_track());
     AbortOnDrop(tokio::spawn(async move {
+        let pool = Pool::default();
         while let Some(frame) = stream.next().await {
-            screen.put(Picture::of(&frame));
+            screen.put(Picture::of(&frame, &pool));
         }
     }))
 }
@@ -667,8 +696,9 @@ fn stream_camera(video: RemoteVideoTrack, identity: String, cameras: Cameras) ->
     let mut stream = NativeVideoStream::new(video.rtc_track());
     AbortOnDrop(tokio::spawn(async move {
         let camera = Clear(cameras, identity);
+        let pool = Pool::default();
         while let Some(frame) = stream.next().await {
-            camera.0.put(&camera.1, Picture::of(&frame));
+            camera.0.put(&camera.1, Picture::of(&frame, &pool));
         }
     }))
 }
@@ -685,7 +715,7 @@ fn peek(
     let (events, done) = (events.clone(), done.clone());
     AbortOnDrop(tokio::spawn(async move {
         if let Some(frame) = stream.next().await {
-            let preview = Picture::of(&frame).preview();
+            let preview = Picture::of(&frame, &Pool::default()).preview();
             let _ = events.send(Event::Preview(identity, preview));
         }
         let _ = done.send(sid);
@@ -1510,7 +1540,7 @@ mod tests {
         let quadro = |w| Picture {
             width: w,
             height: 1,
-            rgba: vec![0; w as usize * 4],
+            rgba: vec![0; w as usize * 4].into(),
         };
         cameras.put("ana__1", quadro(1));
         cameras.put("ana__1", quadro(2));
@@ -1521,11 +1551,37 @@ mod tests {
     }
 
     #[test]
+    fn quadro_reusa_o_buffer_que_a_interface_soltou() {
+        use livekit::webrtc::{prelude::I420Buffer, video_frame::VideoFrame};
+        let quadro = || -> BoxVideoFrame {
+            VideoFrame {
+                rotation: livekit::webrtc::video_frame::VideoRotation::VideoRotation0,
+                timestamp_us: 0,
+                frame_metadata: None,
+                buffer: Box::new(I420Buffer::new(64, 36)),
+            }
+        };
+        let pool = Pool::default();
+        let primeiro = Picture::of(&quadro(), &pool);
+        let endereco = primeiro.rgba.as_ptr();
+        let imagem = iced::widget::image::Handle::from_rgba(64, 36, primeiro.rgba.clone());
+        drop(primeiro);
+        assert!(
+            pool.0.lock().unwrap().is_empty(),
+            "a imagem ainda segura o buffer"
+        );
+        drop(imagem);
+        let segundo = Picture::of(&quadro(), &pool);
+        assert_eq!(segundo.rgba.as_ptr(), endereco, "não reusou o buffer");
+        assert_eq!(segundo.rgba.len(), 64 * 36 * 4);
+    }
+
+    #[test]
     fn previa_fica_pequena_na_mesma_proporcao() {
         let quadro = Picture {
             width: 1920,
             height: 1080,
-            rgba: vec![200; 1920 * 1080 * 4],
+            rgba: vec![200; 1920 * 1080 * 4].into(),
         };
         let p = quadro.preview();
         assert_eq!((p.width, p.height), (96, 54));
@@ -1539,7 +1595,7 @@ mod tests {
         let quadro = |w| Picture {
             width: w,
             height: 1,
-            rgba: vec![0; w as usize * 4],
+            rgba: vec![0; w as usize * 4].into(),
         };
         screen.put(quadro(1));
         screen.put(quadro(2));

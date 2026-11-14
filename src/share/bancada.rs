@@ -1025,3 +1025,109 @@ async fn bancada_avisos() {
     assert!(ligou, "o Chrome mutou e o selo não acendeu");
     assert!(apagou, "o Chrome desmutou e o selo não apagou");
 }
+
+fn rss_mb() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .unwrap_or(0)
+        / 1024
+}
+
+/// CPU do processo até agora, em segundos (utime + stime, a 100 Hz).
+fn cpu_s() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let campos: Vec<&str> = stat
+        .rsplit(')')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    let tique = |i: usize| {
+        campos
+            .get(i)
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    (tique(11) + tique(12)) / 100.0
+}
+
+/// RAM de quem assiste: a call assiste a tela do `bancada_tela_qualidade` e uma thread faz o
+/// papel da interface, pegando o quadro a 60 Hz e segurando o último, como a `Allocation`.
+/// Rode por `src/audio/bancada.sh bancada_assiste_ram`, com o publicador já no ar.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bancada_assiste_ram() {
+    assert!(
+        std::env::var_os("BANCADA_RAIZ").is_some(),
+        "rode por src/audio/bancada.sh"
+    );
+    let prefs = AudioPrefs {
+        input: None,
+        output: None,
+        noise: NoiseLevel::Off,
+        sensitivity: Sensitivity::Auto,
+        mic_gain: MicGain::Auto,
+        master: 71,
+        volumes: HashMap::new(),
+    };
+    let (engine, mic): (Engine, Receiver<Vec<i16>>) = Engine::start(prefs).expect("motor");
+    let (call, mut events) = Call::join_with(
+        cliente().await,
+        var("CONCORD_ROOM"),
+        "bancada-assiste".to_owned(),
+        engine,
+        mic,
+        true,
+        sintetica,
+    );
+    let alvo = loop {
+        if let Event::Participants(list) = evento(&mut events).await
+            && let Some(p) = list.iter().find(|p| !p.is_local && p.screen_share)
+        {
+            break p.identity.clone();
+        }
+    };
+    println!("RSS antes de assistir: {} MB", rss_mb());
+    let (cpu0, t0) = (cpu_s(), Instant::now());
+    call.watch(Some(alvo));
+    let tela = call.screen().clone();
+    let fim = Instant::now() + Duration::from_secs(segundos());
+    let ui = thread::spawn(move || {
+        let (mut quadros, mut ultimo, mut tam) = (0u32, None, (0, 0));
+        let mut marca = Instant::now();
+        while Instant::now() < fim {
+            if let Some(p) = tela.take() {
+                quadros += 1;
+                tam = (p.width, p.height);
+                ultimo = Some(iced::widget::image::Handle::from_rgba(
+                    p.width, p.height, p.rgba,
+                ));
+            }
+            if marca.elapsed() >= Duration::from_secs(5) {
+                marca = Instant::now();
+                println!(
+                    "RSS {} MB, {quadros} quadros de {}x{}",
+                    rss_mb(),
+                    tam.0,
+                    tam.1
+                );
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+        drop(ultimo);
+    });
+    while !ui.is_finished() {
+        let _ = timeout(Duration::from_millis(500), events.recv()).await;
+    }
+    let cpu = (cpu_s() - cpu0) / t0.elapsed().as_secs_f64() * 100.0;
+    println!("RSS ao parar: {} MB, CPU {cpu:.1}% de um núcleo", rss_mb());
+    call.watch(None);
+    sleep(Duration::from_secs(5)).await;
+    println!("RSS 5 s depois de parar: {} MB", rss_mb());
+    call.leave();
+    solta().await;
+    println!("FIM");
+}
