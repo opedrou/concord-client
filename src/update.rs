@@ -1,17 +1,27 @@
-//! Atualização automática pelas releases do GitHub. Ao abrir, confere a última release;
-//! se for mais nova, baixa o binário em segundo plano, confere o SHA-256 que o GitHub
-//! publica e troca o executável no lugar. Quem está rodando segue no arquivo antigo, que
-//! vira `.old` e é apagado na próxima abertura: a versão nova vale da próxima vez.
+//! Atualização automática pelas releases do GitHub. Confere a última release; se for mais
+//! nova, baixa o binário em segundo plano, confere o SHA-256 que o GitHub publica, abre ele
+//! com `--version` pra ver se roda neste computador e troca o executável no lugar. Quem está
+//! rodando segue no arquivo antigo, que vira `.old`: a versão nova vale da próxima vez.
+//!
+//! O `.old` fica guardado até a nova chegar na tela principal e ficar de pé ([`healthy`]).
+//! Se ela cair antes disso [`TENTATIVAS`] vezes seguidas, a próxima abertura põe o `.old` de
+//! volta, abre ele e marca a versão pra não baixar de novo ([`start`]).
+//!
+//! Tetos: versão que cai só depois de ficar de pé (ao entrar na call, por exemplo) não volta
+//! sozinha. Versão que nem carrega (biblioteca faltando) não roda código nenhum, então só é
+//! pega pelo teste antes da troca; a 0.1.8 e as anteriores trocam sem esse teste.
 use std::{
-    io,
+    fs, io,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
@@ -164,10 +174,133 @@ fn launch(exe: &Path, target: &Path, exists: bool, relaunched: bool) -> Launch {
     }
 }
 
-/// Apaga o `.old` da troca anterior. Chamar ao abrir.
-pub fn cleanup() {
-    if let Some(exe) = installed() {
-        let _ = std::fs::remove_file(old_of(&exe));
+/// Aberturas seguidas da versão nova que não ficaram de pé; na seguinte, volta pra anterior.
+const TENTATIVAS: u32 = 2;
+/// Quanto o teste da versão baixada espera o `--version` voltar. O antivírus do Windows
+/// confere o exe novo antes de deixar abrir.
+const ESPERA_TESTE: Duration = Duration::from_secs(20);
+
+/// O que a atualização guarda entre aberturas, em `update.json` na pasta da config.
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+struct State {
+    /// Aberturas da versão em teste que ainda não ficaram de pé nem fecharam direito.
+    tries: u32,
+    /// Versão que não abriu neste computador: não baixa de novo, espera a próxima.
+    skip: Option<String>,
+}
+
+impl State {
+    fn read(path: &Path) -> Self {
+        fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn write(&self, path: &Path) -> io::Result<()> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(path, serde_json::to_vec(self)?)
+    }
+}
+
+/// Zera as aberturas que falharam: esta ficou de pé ou fechou direito.
+fn reset(state: &Path) -> io::Result<()> {
+    let mut s = State::read(state);
+    if s.tries == 0 {
+        return Ok(());
+    }
+    s.tries = 0;
+    s.write(state)
+}
+
+/// Executável e arquivo de estado. `None` em desenvolvimento, como [`installed`].
+fn paths() -> Option<(PathBuf, PathBuf)> {
+    Some((installed()?, crate::config::update_path()?))
+}
+
+/// Ao abrir, antes da janela. Com versão nova em teste, conta a abertura; se ela já caiu
+/// demais, volta pra anterior e abre ela. `true`: abriu a anterior, este processo sai.
+pub fn start() -> bool {
+    let Some((exe, state)) = paths() else {
+        return false;
+    };
+    match rollback(&exe, &state, env!("CARGO_PKG_VERSION")) {
+        Ok(false) => false,
+        Ok(true) => {
+            log!("atualização: esta versão não ficou de pé, voltou pra anterior");
+            restart()
+        }
+        Err(e) => {
+            log!("atualização: não deu pra conferir a versão em teste: {e}");
+            false
+        }
+    }
+}
+
+/// Com `.old` ao lado, o exe é versão em teste. Conta esta abertura; se as últimas
+/// [`TENTATIVAS`] não ficaram de pé, ou se esta versão já falhou aqui, tira ela do caminho e
+/// põe a anterior no lugar. `Ok(true)` quando voltou.
+fn rollback(exe: &Path, state: &Path, version: &str) -> io::Result<bool> {
+    // Sobra de troca: download pela metade ou a versão que falhou, tirada do caminho.
+    let aside = exe.with_extension("new");
+    let _ = fs::remove_file(&aside);
+    let old = old_of(exe);
+    if !old.exists() {
+        return Ok(false);
+    }
+    let mut s = State::read(state);
+    if s.tries < TENTATIVAS && s.skip.as_deref() != Some(version) {
+        s.tries += 1;
+        s.write(state)?;
+        return Ok(false);
+    }
+    // Marca antes de trocar: sem a marca, a anterior baixaria esta de novo.
+    State {
+        tries: 0,
+        skip: Some(version.to_owned()),
+    }
+    .write(state)?;
+    // O Windows não apaga exe rodando, mas deixa renomear; o `.new` sai na próxima abertura.
+    fs::rename(exe, &aside)?;
+    if let Err(e) = fs::rename(&old, exe) {
+        let _ = fs::rename(&aside, exe);
+        return Err(e);
+    }
+    Ok(true)
+}
+
+/// Quem já trocou o exe nesta sessão não é a versão em teste: a de teste é a do disco.
+fn candidate() -> Option<(PathBuf, PathBuf)> {
+    if ready().is_some() { None } else { paths() }
+}
+
+/// A versão aberta chegou na tela principal e ficou de pé: a anterior não precisa mais
+/// ficar guardada.
+pub fn healthy() {
+    if let Some((exe, state)) = candidate() {
+        settle(&exe, &state);
+    }
+}
+
+fn settle(exe: &Path, state: &Path) {
+    let _ = reset(state);
+    // No Windows falha se outra janela ainda roda a anterior: fica pra próxima abertura.
+    if fs::remove_file(old_of(exe)).is_ok() {
+        log!(
+            "atualização: {} ficou de pé, a anterior saiu",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+}
+
+/// Fechou pela janela, sem cair: esta abertura não conta como falha, mesmo sem chegar na
+/// tela principal (sem rede, por exemplo).
+pub fn closed() {
+    if let Some((_, state)) = candidate() {
+        let _ = reset(&state);
     }
 }
 
@@ -193,13 +326,39 @@ fn old_of(exe: &Path) -> PathBuf {
     exe.with_extension("old")
 }
 
-/// Confere e, se tiver versão nova, deixa ela instalada pra próxima abertura. Devolve a
-/// versão instalada. Qualquer falha é silenciosa: tenta de novo na próxima vez.
-pub async fn run() -> Option<String> {
-    // Roda ao abrir e de tempos em tempos; uma conferência por vez.
+/// Resultado de uma conferência, pra linha do Sobre.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Check {
+    /// Conferindo agora. Só a interface põe este.
+    Searching,
+    Latest,
+    Downloading(String),
+    /// Já no disco, vale ao reiniciar.
+    Ready(String),
+    /// Outra conferência já está rodando; o resultado vem por ela.
+    Busy,
+    Failed(String),
+}
+
+const SEM_REDE: &str = "Não deu pra falar com o GitHub. Tente de novo.";
+const SEM_GRAVAR: &str = "Não deu pra gravar a versão nova.";
+
+fn not_opened(version: &str) -> String {
+    format!("A versão {version} não abriu neste computador. Fica esta até sair a próxima.")
+}
+
+/// Versão trocada nesta sessão, que já está no disco esperando reiniciar.
+fn ready() -> Option<String> {
+    INSTALLED.lock().ok()?.clone()
+}
+
+/// Confere e, se tiver versão nova, deixa ela instalada pra próxima abertura. Avisa
+/// `downloading` com a versão quando começa a baixar.
+pub async fn run(mut downloading: impl FnMut(String)) -> Check {
+    // Roda ao abrir, de tempos em tempos e pelo botão; uma conferência por vez.
     static RUNNING: AtomicBool = AtomicBool::new(false);
     if RUNNING.swap(true, Ordering::Relaxed) {
-        return None;
+        return Check::Busy;
     }
     struct Done;
     impl Drop for Done {
@@ -208,76 +367,156 @@ pub async fn run() -> Option<String> {
         }
     }
     let _done = Done;
-    let exe = installed()?;
+    check(&mut downloading).await.unwrap_or_else(Check::Failed)
+}
+
+async fn check(downloading: &mut impl FnMut(String)) -> Result<Check, String> {
+    let (exe, state) = paths().ok_or("Esta cópia não se atualiza sozinha.")?;
     let client = reqwest::Client::builder()
         .user_agent("concord-client")
         .build()
-        .ok()?;
-    let release: Release = client
+        .map_err(|_| SEM_REDE)?;
+    let latest = client
         .get(LATEST)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+        .header("Accept", "application/vnd.github+json");
+    let release: Release = send(latest).await?.json().await.map_err(|_| SEM_REDE)?;
     // Compara com a última já instalada nesta sessão, pra não baixar a mesma de novo.
-    let current = INSTALLED.lock().ok()?.clone();
+    let pending = ready();
     if !is_newer(
         &release.tag_name,
-        current.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")),
+        pending.as_deref().unwrap_or(env!("CARGO_PKG_VERSION")),
     ) {
-        return None;
-    }
-    let asset = release.assets.into_iter().find(|a| a.name == ASSET)?;
-    let expected = asset.digest.as_deref()?.strip_prefix("sha256:")?.to_owned();
-    let bytes = client
-        .get(&asset.browser_download_url)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .bytes()
-        .await
-        .ok()?;
-    if bytes.len() as u64 != asset.size || hex(&Sha256::digest(&bytes)) != expected {
-        return None;
+        return Ok(pending.map_or(Check::Latest, Check::Ready));
     }
     let version = release.tag_name.trim_start_matches('v').to_owned();
-    tokio::task::spawn_blocking(move || install(&exe, &bytes))
+    if State::read(&state).skip.as_deref() == Some(version.as_str()) {
+        return Err(not_opened(&version));
+    }
+    let missing = "A versão nova não tem o arquivo deste sistema.";
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|a| a.name == ASSET)
+        .ok_or(missing)?;
+    let expected = asset
+        .digest
+        .as_deref()
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .ok_or(missing)?
+        .to_owned();
+    downloading(version.clone());
+    let bytes = send(client.get(&asset.browser_download_url))
+        .await?
+        .bytes()
         .await
-        .ok()?
-        .ok()?;
-    *INSTALLED.lock().ok()? = Some(version.clone());
-    Some(version)
+        .map_err(|_| SEM_REDE)?;
+    if bytes.len() as u64 != asset.size || hex(&Sha256::digest(&bytes)) != expected {
+        return Err("O download veio corrompido. Tente de novo.".into());
+    }
+    let v = version.clone();
+    let opened = tokio::task::spawn_blocking(move || install(&exe, &bytes, &state, &v))
+        .await
+        .map_err(|_| SEM_GRAVAR)?
+        .map_err(|e| {
+            log!("atualização: não gravou a {version}: {e}");
+            SEM_GRAVAR
+        })?;
+    if !opened {
+        return Err(not_opened(&version));
+    }
+    if let Ok(mut installed) = INSTALLED.lock() {
+        *installed = Some(version.clone());
+    }
+    log!("atualização: {version} instalada, vale ao reiniciar");
+    Ok(Check::Ready(version))
 }
 
-/// Versão trocada nesta sessão, que já está no disco esperando reiniciar.
+/// Manda o pedido; erro de rede ou resposta que não é 2xx vira o texto da linha do Sobre.
+async fn send(request: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    let response = request.send().await.map_err(|_| SEM_REDE)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "O GitHub respondeu com erro ({}). Tente de novo.",
+            status.as_u16()
+        ));
+    }
+    Ok(response)
+}
+
+/// Ver [`ready`].
 static INSTALLED: Mutex<Option<String>> = Mutex::new(None);
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Grava ao lado, tira o atual do caminho (o Windows deixa renomear quem está rodando) e
-/// põe o novo no lugar. Se a última troca falhar, devolve o antigo.
-fn install(exe: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Grava ao lado e abre com `--version`: só troca se o novo roda neste computador. Se não
+/// rodar, marca a versão pra não baixar de novo e devolve `Ok(false)`, sem mexer no exe.
+fn install(exe: &Path, bytes: &[u8], state: &Path, version: &str) -> io::Result<bool> {
     let new = exe.with_extension("new");
-    std::fs::write(&new, bytes)?;
+    fs::write(&new, bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(&new, fs::Permissions::from_mode(0o755))?;
     }
+    if !opens(&new) {
+        log!("atualização: a {version} não abriu no teste e fica de fora");
+        let _ = fs::remove_file(&new);
+        let mut s = State::read(state);
+        s.skip = Some(version.to_owned());
+        s.write(state)?;
+        return Ok(false);
+    }
+    swap(exe, state)?;
+    Ok(true)
+}
+
+/// Roda o binário com `--version`, que sai antes de abrir janela. Biblioteca faltando ou
+/// glibc velha derrubam ele antes do `main`, e aí sai com erro. Qualquer falha conta, até
+/// não conseguir rodar: tentar de novo baixaria tudo outra vez a cada conferência.
+fn opens(exe: &Path) -> bool {
+    let child = Command::new(exe)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            log!("atualização: o teste não rodou: {e}");
+            return false;
+        }
+    };
+    let begin = Instant::now();
+    while begin.elapsed() < ESPERA_TESTE {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+/// Põe o `.new` no lugar. Sem `.old`, o atual (o Windows deixa renomear quem está rodando)
+/// vira ele; com `.old`, ele fica, porque é a última versão que abriu bem e o exe da vez
+/// ainda está em teste. Se a última troca falhar, devolve o antigo.
+fn swap(exe: &Path, state: &Path) -> io::Result<()> {
+    let new = exe.with_extension("new");
+    // A versão nova começa o teste do zero.
+    reset(state)?;
     let old = old_of(exe);
-    let _ = std::fs::remove_file(&old);
-    std::fs::rename(exe, &old)?;
-    if let Err(e) = std::fs::rename(&new, exe) {
-        let _ = std::fs::rename(&old, exe);
+    if old.exists() {
+        return fs::rename(&new, exe);
+    }
+    fs::rename(exe, &old)?;
+    if let Err(e) = fs::rename(&new, exe) {
+        let _ = fs::rename(&old, exe);
         return Err(e);
     }
     Ok(())
@@ -286,7 +525,7 @@ fn install(exe: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Abre a versão nova e fecha esta. Só fora de call.
 /// Abre a versão nova pelo caminho instalado. `false` se não abriu: aí esta segue aberta.
 pub fn restart() -> bool {
-    installed().is_some_and(|exe| std::process::Command::new(exe).spawn().is_ok())
+    installed().is_some_and(|exe| Command::new(exe).spawn().is_ok())
 }
 
 #[cfg(test)]
@@ -303,17 +542,165 @@ mod tests {
         assert!(!is_newer("nightly", "0.1.0"), "tag estranha não baixa");
     }
 
+    /// Pasta temporária só deste teste, com o exe `velho` e o caminho do estado.
+    fn pasta(nome: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let pasta =
+            std::env::temp_dir().join(format!("concord-update-{}-{nome}", std::process::id()));
+        let _ = fs::remove_dir_all(&pasta);
+        fs::create_dir_all(&pasta).unwrap();
+        let exe = pasta.join("concord-client.exe");
+        fs::write(&exe, b"velho").unwrap();
+        let estado = pasta.join("config/update.json");
+        (pasta, exe, estado)
+    }
+
+    fn ler(path: &Path) -> Vec<u8> {
+        fs::read(path).unwrap()
+    }
+
     #[test]
     fn troca_o_executavel_e_guarda_o_antigo() {
-        let pasta = std::env::temp_dir().join(format!("concord-update-{}", std::process::id()));
-        std::fs::create_dir_all(&pasta).unwrap();
-        let exe = pasta.join("concord-client.exe");
-        std::fs::write(&exe, b"velho").unwrap();
-        install(&exe, b"novo").unwrap();
-        assert_eq!(std::fs::read(&exe).unwrap(), b"novo");
-        assert_eq!(std::fs::read(old_of(&exe)).unwrap(), b"velho");
+        let (pasta, exe, estado) = pasta("troca");
+        fs::write(exe.with_extension("new"), b"novo").unwrap();
+        swap(&exe, &estado).unwrap();
+        assert_eq!(ler(&exe), b"novo");
+        assert_eq!(ler(&old_of(&exe)), b"velho");
         assert!(!exe.with_extension("new").exists());
-        std::fs::remove_dir_all(&pasta).unwrap();
+
+        // Outra versão antes de reiniciar: a guardada segue sendo a que abriu bem.
+        fs::write(exe.with_extension("new"), b"mais nova").unwrap();
+        swap(&exe, &estado).unwrap();
+        assert_eq!(ler(&exe), b"mais nova");
+        assert_eq!(ler(&old_of(&exe)), b"velho", "não guarda a que nunca rodou");
+        fs::remove_dir_all(&pasta).unwrap();
+    }
+
+    #[test]
+    fn versao_que_nao_abre_nem_entra_e_fica_marcada() {
+        let (pasta, exe, estado) = pasta("nao-abre");
+        assert!(!install(&exe, b"lixo", &estado, "0.2.0").unwrap());
+        assert_eq!(ler(&exe), b"velho");
+        assert!(!old_of(&exe).exists());
+        assert!(!exe.with_extension("new").exists());
+        assert_eq!(State::read(&estado).skip.as_deref(), Some("0.2.0"));
+        fs::remove_dir_all(&pasta).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn teste_da_versao_baixada_pelo_codigo_de_saida() {
+        let (pasta, exe, estado) = pasta("abre");
+        assert!(!install(&exe, b"#!/bin/sh\nexit 3\n", &estado, "0.2.0").unwrap());
+        assert_eq!(ler(&exe), b"velho", "saiu com erro: fica a atual");
+        let novo = b"#!/bin/sh\n[ \"$1\" = --version ]\n";
+        assert!(install(&exe, novo, &estado, "0.2.1").unwrap());
+        assert_eq!(ler(&exe), novo);
+        assert_eq!(ler(&old_of(&exe)), b"velho");
+        fs::remove_dir_all(&pasta).unwrap();
+    }
+
+    #[test]
+    fn sem_versao_em_teste_abrir_nao_mexe_em_nada() {
+        let (pasta, exe, estado) = pasta("normal");
+        fs::write(exe.with_extension("new"), b"sobra").unwrap();
+        for _ in 0..5 {
+            assert!(!rollback(&exe, &estado, "0.2.0").unwrap());
+        }
+        assert_eq!(ler(&exe), b"velho");
+        assert!(!estado.exists(), "nem cria o arquivo de estado");
+        assert!(!exe.with_extension("new").exists(), "a sobra sai");
+        fs::remove_dir_all(&pasta).unwrap();
+    }
+
+    #[test]
+    fn versao_que_cai_duas_vezes_volta_pra_anterior_na_terceira() {
+        let (pasta, exe, estado) = pasta("cai");
+        fs::write(exe.with_extension("new"), b"novo").unwrap();
+        swap(&exe, &estado).unwrap();
+        // Duas aberturas que caem antes de ficar de pé: segue na nova.
+        assert!(!rollback(&exe, &estado, "0.2.0").unwrap());
+        assert!(!rollback(&exe, &estado, "0.2.0").unwrap());
+        assert_eq!(ler(&exe), b"novo");
+        assert_eq!(State::read(&estado).tries, 2);
+        // A terceira devolve a anterior e marca a nova.
+        assert!(rollback(&exe, &estado, "0.2.0").unwrap());
+        assert_eq!(ler(&exe), b"velho");
+        assert!(!old_of(&exe).exists());
+        assert_eq!(
+            ler(&exe.with_extension("new")),
+            b"novo",
+            "tirada do caminho"
+        );
+        let s = State::read(&estado);
+        assert_eq!((s.tries, s.skip.as_deref()), (0, Some("0.2.0")));
+        // A anterior abre normal e apaga a sobra.
+        assert!(!rollback(&exe, &estado, "0.1.9").unwrap());
+        assert!(!exe.with_extension("new").exists());
+        fs::remove_dir_all(&pasta).unwrap();
+    }
+
+    #[test]
+    fn versao_que_ja_falhou_aqui_volta_na_primeira() {
+        // Instalada de novo por uma versão que não sabe pular (a 0.1.8).
+        let (pasta, exe, estado) = pasta("ja-falhou");
+        State {
+            tries: 0,
+            skip: Some("0.2.0".into()),
+        }
+        .write(&estado)
+        .unwrap();
+        fs::write(exe.with_extension("new"), b"novo").unwrap();
+        swap(&exe, &estado).unwrap();
+        assert!(rollback(&exe, &estado, "0.2.0").unwrap());
+        assert_eq!(ler(&exe), b"velho");
+        fs::remove_dir_all(&pasta).unwrap();
+    }
+
+    #[test]
+    fn versao_de_pe_solta_a_anterior() {
+        let (pasta, exe, estado) = pasta("de-pe");
+        fs::write(exe.with_extension("new"), b"novo").unwrap();
+        swap(&exe, &estado).unwrap();
+        assert!(!rollback(&exe, &estado, "0.2.0").unwrap());
+        settle(&exe, &estado);
+        assert!(!old_of(&exe).exists());
+        assert_eq!(State::read(&estado).tries, 0);
+        for _ in 0..5 {
+            assert!(
+                !rollback(&exe, &estado, "0.2.0").unwrap(),
+                "não tem mais volta"
+            );
+        }
+        assert_eq!(ler(&exe), b"novo");
+        fs::remove_dir_all(&pasta).unwrap();
+    }
+
+    #[test]
+    fn fechar_direito_zera_as_falhas_mas_segue_em_teste() {
+        // Sem rede não chega na tela principal: fechar a janela não conta como queda.
+        let (pasta, exe, estado) = pasta("fechou");
+        fs::write(exe.with_extension("new"), b"novo").unwrap();
+        swap(&exe, &estado).unwrap();
+        for _ in 0..5 {
+            assert!(!rollback(&exe, &estado, "0.2.0").unwrap());
+            reset(&estado).unwrap();
+        }
+        assert_eq!(ler(&exe), b"novo");
+        assert!(old_of(&exe).exists(), "a anterior segue guardada");
+        fs::remove_dir_all(&pasta).unwrap();
+    }
+
+    #[test]
+    fn versao_nova_comeca_o_teste_do_zero() {
+        let (pasta, exe, estado) = pasta("zero");
+        fs::write(exe.with_extension("new"), b"novo").unwrap();
+        swap(&exe, &estado).unwrap();
+        assert!(!rollback(&exe, &estado, "0.2.0").unwrap());
+        assert!(!rollback(&exe, &estado, "0.2.0").unwrap());
+        fs::write(exe.with_extension("new"), b"mais nova").unwrap();
+        swap(&exe, &estado).unwrap();
+        assert_eq!(State::read(&estado).tries, 0);
+        fs::remove_dir_all(&pasta).unwrap();
     }
 
     #[test]

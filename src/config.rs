@@ -193,6 +193,11 @@ pub fn log_path() -> Option<PathBuf> {
     Some(dir()?.join("concord.log"))
 }
 
+/// Ver `crate::update`.
+pub fn update_path() -> Option<PathBuf> {
+    Some(dir()?.join("update.json"))
+}
+
 #[cfg(windows)]
 fn dir() -> Option<PathBuf> {
     Some(PathBuf::from(env::var_os("APPDATA")?).join("Concord"))

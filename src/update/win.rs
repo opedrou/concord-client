@@ -167,12 +167,13 @@ pub fn uninstall() {
     // SAFETY: só apaga a chave do Concord no usuário.
     let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, UNINSTALL_KEY) };
     // Exe rodando não se apaga: um cmd sem janela espera uns 2 s este processo fechar e
-    // apaga o exe, o `.old` da última atualização e a pasta, se ficou vazia.
+    // apaga o exe, o `.old` e o `.new` da atualização e a pasta, se ficou vazia.
     let Some(dir) = exe.parent() else { return };
     let script = format!(
-        r#"/d /c ping -n 3 127.0.0.1 >nul & del /f /q "{}" "{}" & rmdir "{}""#,
+        r#"/d /c ping -n 3 127.0.0.1 >nul & del /f /q "{}" "{}" "{}" & rmdir "{}""#,
         exe.display(),
         super::old_of(&exe).display(),
+        exe.with_extension("new").display(),
         dir.display()
     );
     let _ = Command::new("cmd.exe")
