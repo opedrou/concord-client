@@ -1155,6 +1155,28 @@ fn bancada_ganho() {
         (&ruido, com(m(-20.0), auto)),
         (&ruido, com(m(-20.0), man)),
     ];
+    // Rodada completa leva 5 min: `BANCADA_SO=topologia` fica só no começo.
+    let so = std::env::var("BANCADA_SO").unwrap_or_default();
+    let rodadas: Vec<_> = rodadas
+        .into_iter()
+        .filter(|(s, _)| s.nome.contains(&so))
+        .collect();
+
+    // O motor grava do mic falso, e a fala toca na sala que vira esse mic.
+    let _toca = play_near("fala.wav");
+    let (engine, mut mic) = Engine::start(com(m(6.0), auto)).expect("start");
+    engine.set_mic_muted(false);
+    let mut saiu = Energy::default();
+    drain(&mut mic, Duration::from_secs(2), Some(&mut saiu));
+    let links = Command::new("pw-link").arg("-l").output().expect("pw-link");
+    println!(
+        "GANHO | topologia | {} | saída rms {:.4} | {}\n{}",
+        streams(),
+        saiu.rms(),
+        level("bancada_mic"),
+        String::from_utf8_lossy(&links.stdout)
+    );
+    drop((engine, _toca));
 
     for p in [com(MicGain::Auto, auto), com(MicGain::Auto, man)] {
         let (nivel, hash) = sem_servidor(&fala.pcm, &p);

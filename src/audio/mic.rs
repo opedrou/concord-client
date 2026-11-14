@@ -1,4 +1,5 @@
-//! Cadeia do mic: APM -> ganho manual -> RNNoise -> gate. Processa bloco a bloco, sem I/O.
+//! Cadeia do mic: APM -> ganho manual -> RNNoise -> limite -> gate. Processa bloco a bloco,
+//! sem I/O.
 use livekit::webrtc::native::apm::AudioProcessingModule;
 use nnnoiseless::DenoiseState;
 
@@ -39,23 +40,20 @@ fn new_apm(noise: NoiseLevel, gain: MicGain) -> AudioProcessingModule {
     AudioProcessingModule::new(true, gain == MicGain::Auto, true, noise == NoiseLevel::Apm)
 }
 
-/// Até aqui a amostra só leva o ganho: -6 dBFS.
+/// Até aqui a amostra passa igual: -6 dBFS.
 const KNEE: f32 = 0.5;
 
-/// Ganho fixo com limite suave. Desligar o AGC leva junto o limitador que vem nele, e
-/// voz alta com ganho alto bateria seco no teto do `i16`. Acima do joelho uma tangente
-/// hiperbólica encosta no teto sem passar, com a mesma inclinação no joelho. Não tem
-/// memória: não atrasa nem bombeia, mas distorce o pico de quem passa muito do teto.
-/// Se isso incomodar, o próximo passo é um limitador com envelope.
-fn amplify(block: &mut [i16; FRAME], db: f32) {
-    let gain = 10f32.powf(db / 20.0);
-    for s in block {
-        let x = *s as f32 / 32768.0 * gain;
-        let over = (x.abs() - KNEE).max(0.0) / (1.0 - KNEE);
-        let y = x.signum() * (x.abs().min(KNEE) + (1.0 - KNEE) * over.tanh());
-        // `as` satura: 1,0 vira 32767.
-        *s = (y * 32768.0) as i16;
-    }
+/// Limite suave do ganho manual, numa amostra na escala do `i16`. Desligar o AGC leva
+/// junto o limitador que vem nele, e voz alta com ganho alto bateria seco no teto. Acima
+/// do joelho uma tangente hiperbólica encosta no teto, com a mesma inclinação no joelho.
+/// Não tem memória: não atrasa nem bombeia, mas distorce o pico de quem passa muito do
+/// teto. Se isso incomodar, o próximo passo é um limitador com envelope.
+fn limit(sample: f32) -> i16 {
+    let x = sample / 32768.0;
+    let over = (x.abs() - KNEE).max(0.0) / (1.0 - KNEE);
+    let y = x.signum() * (x.abs().min(KNEE) + (1.0 - KNEE) * over.tanh());
+    // `as` satura: 1,0 vira 32767.
+    (y * 32768.0) as i16
 }
 
 impl MicChain {
@@ -103,11 +101,6 @@ impl MicChain {
             .process_stream(block, RATE as i32, 1)
             .inspect_err(|e| eprintln!("áudio: APM: {e}"))
             .ok();
-        // No lugar do AGC: o RNNoise, o limitador e o medidor veem o mesmo que veriam
-        // depois dele, e o eco do APM segue medido no mic cru.
-        if let MicGain::Manual(db) = self.gain {
-            amplify(block, db);
-        }
         let voice = self.denoise(block);
         let db = level_db(block);
         #[cfg(test)]
@@ -135,13 +128,28 @@ impl MicChain {
     /// Roda em todo nível: o automático precisa da probabilidade de voz, e trocar o
     /// nível não pode começar o RNNoise do zero. O áudio limpo só vale com
     /// [`NoiseLevel::Rnnoise`].
+    ///
+    /// O ganho manual entra aqui, no lugar do AGC: o RNNoise, o limitador de voz e o
+    /// medidor veem o mesmo que veriam depois dele, e o eco do APM segue medido no mic
+    /// cru. Segue em float até a saída: filtrar um pico achatado faz ele passar do teto de
+    /// novo, então o limite só vale depois do RNNoise.
     fn denoise(&mut self, block: &mut [i16; FRAME]) -> f32 {
-        let input = block.map(|s| s as f32);
+        let gain = match self.gain {
+            MicGain::Auto => 1.0,
+            MicGain::Manual(db) => 10f32.powf(db / 20.0),
+        };
+        let input = block.map(|s| s as f32 * gain);
         let mut output = [0f32; FRAME];
         let voice = self.rnnoise.process_frame(&mut output, &input);
-        if self.noise == NoiseLevel::Rnnoise {
-            *block = output.map(|s| s as i16);
-        }
+        let clean = if self.noise == NoiseLevel::Rnnoise {
+            output
+        } else {
+            input
+        };
+        *block = match self.gain {
+            MicGain::Auto => clean.map(|s| s as i16),
+            MicGain::Manual(_) => clean.map(limit),
+        };
         voice
     }
 }
@@ -286,26 +294,39 @@ mod tests {
 
     #[test]
     fn limite_suave_so_age_acima_de_menos_6_dbfs() {
-        let mut block: [i16; FRAME] = std::array::from_fn(|i| (i as i16 - 240) * 68);
-        let before = block;
-        amplify(&mut block, 0.0);
-        assert_eq!(block, before, "0 dB abaixo do joelho não mexe");
-        amplify(&mut block, -6.0206);
-        assert!(
-            block
-                .iter()
-                .zip(before)
-                .all(|(a, b)| (*a - b / 2).abs() <= 1)
-        );
-
-        // Do silêncio ao teto com +20 dB: sobe sempre, sem passar do `i16`.
-        let mut ramp: [i16; FRAME] = std::array::from_fn(|i| (i as i32 * 68) as i16);
-        amplify(&mut ramp, 20.0);
+        for s in [-16384i16, -9000, -1, 0, 1, 9000, 16384] {
+            assert_eq!(limit(s as f32), s, "abaixo do joelho passa igual");
+        }
+        // Do silêncio a 20 dB acima do teto: sobe sempre, sem passar do `i16`.
+        let ramp: Vec<i16> = (0..=1000).map(|i| limit(i as f32 * 327.68)).collect();
         assert!(ramp.windows(2).all(|w| w[0] <= w[1]));
-        assert!(ramp[FRAME - 1] >= 32_000);
-        let mut low = [i16::MIN; FRAME];
-        amplify(&mut low, 20.0);
-        assert!(low.iter().all(|s| *s <= -32_000));
+        assert!(
+            limit(32768.0) < 32767,
+            "o teto de entrada ainda não encosta"
+        );
+        assert!(ramp[1000] >= 32_700);
+        assert!(limit(-327_680.0) <= -32_700);
+    }
+
+    #[test]
+    fn ganho_alto_nao_corta_nem_depois_do_rnnoise() {
+        let mut chain = MicChain::new(
+            NoiseLevel::Rnnoise,
+            Sensitivity::Manual(-80.0),
+            MicGain::Manual(20.0),
+            Meter::new(),
+        );
+        chain.muted = false;
+        let peak = (0..300)
+            .filter_map(|t| chain.process(&mut speech_like(t)))
+            .flatten()
+            .map(|s| s.unsigned_abs())
+            .max();
+        // O tom tem pico a -12,5 dBFS: com +20 dB passaria do teto em 7,5 dB.
+        assert!(
+            peak.is_some_and(|p| (30_000..32_767).contains(&p)),
+            "{peak:?}"
+        );
     }
 
     /// Saída do mic em dBFS depois de 3 s, com o gate aberto.
