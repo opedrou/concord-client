@@ -12,6 +12,7 @@ mod api;
 mod audio;
 mod awake;
 mod call;
+mod chat;
 mod config;
 mod icon;
 mod log;

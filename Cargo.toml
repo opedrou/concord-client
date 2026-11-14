@@ -21,6 +21,8 @@ nnnoiseless = "0.5"
 rtrb = "0.4"
 # Confere o binário baixado pelo autoupdater contra o digest da release.
 sha2 = "0.10"
+# Hora local das mensagens do chat: a std não sabe o fuso. Já vinha compilado pelo livekit.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.18"

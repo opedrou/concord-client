@@ -96,6 +96,53 @@ pub struct Member {
     pub avatar_url: Option<String>,
 }
 
+/// Mensagem de canal de texto. `created_at` em ms desde 1970.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Message {
+    pub id: i64,
+    pub author_id: Option<i64>,
+    pub author_name: String,
+    pub content: String,
+    pub created_at: i64,
+    pub attachment: Option<Attachment>,
+}
+
+/// Nome, tipo e tamanho vêm do corpo de quem mandou, sem conferência no servidor: só a
+/// `url` é gerada lá.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Attachment {
+    pub name: String,
+    pub kind: Kind,
+    /// `f64` porque qualquer número passa no servidor: negativo ou quebrado não derruba a
+    /// página inteira.
+    size: f64,
+}
+
+impl Attachment {
+    pub fn size(&self) -> u64 {
+        self.size as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Image,
+    Video,
+    Audio,
+    #[serde(other)]
+    File,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Page {
+    /// Em ordem cronológica.
+    pub messages: Vec<Message>,
+    pub has_more: bool,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionDetails {
@@ -289,9 +336,37 @@ impl Client {
 
     async fn json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
         let resp = self.get(path).send().await.map_err(|_| Error::Offline)?;
-        let bytes = read_limited(check(resp)?, MAX_JSON).await?;
-        serde_json::from_slice(&bytes).map_err(|_| Error::NotConcord)
+        parse(resp).await
     }
+
+    /// Página do histórico, em ordem cronológica. `before` é o id da mais antiga já na tela.
+    pub async fn messages(
+        &self,
+        channel: i64,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<Page, Error> {
+        let mut req = self
+            .get(&format!("/api/channels/{channel}/messages"))
+            .query(&[("limit", limit)]);
+        if let Some(before) = before {
+            req = req.query(&[("before", before)]);
+        }
+        parse(req.send().await.map_err(|_| Error::Offline)?).await
+    }
+
+    pub async fn send_message(&self, channel: i64, content: &str) -> Result<Message, Error> {
+        let url = format!("{}/api/channels/{channel}/messages", self.base);
+        let req = self
+            .authed(self.http.post(url))
+            .json(&json!({ "content": content }));
+        parse(req.send().await.map_err(|_| Error::Offline)?).await
+    }
+}
+
+async fn parse<T: DeserializeOwned>(resp: Response) -> Result<T, Error> {
+    let bytes = read_limited(check(resp)?, MAX_JSON).await?;
+    serde_json::from_slice(&bytes).map_err(|_| Error::NotConcord)
 }
 
 fn is_avatar_path(path: &str) -> bool {
