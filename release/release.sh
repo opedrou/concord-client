@@ -2,7 +2,8 @@
 # Compila Linux e Windows num container e publica a release no GitHub.
 #   release/release.sh           compila, cria a tag vX.Y.Z do Cargo.toml, push e release
 #   release/release.sh --build   só compila, em target/docker/dist
-# Antes: subir `version` no Cargo.toml e commitar.
+# Antes de publicar: subir `version` no Cargo.toml e escrever a seção "## Novidades da vX.Y.Z"
+# no README.md, tudo commitado. As notas da release saem dessa seção.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -18,6 +19,9 @@ if ((publica)); then
     git merge-base --is-ancestor origin/main main || die "main local atrás da origin/main"
     ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null ||
         die "tag $tag já existe: sobe a version no Cargo.toml"
+    # Do título até o próximo "## ", sem o título.
+    notas=$(awk -v t="## Novidades da $tag" '$0 == t {p = 1; next} /^## / {p = 0} p' README.md)
+    [[ -n ${notas//[[:space:]]/} ]] || die "README.md sem a seção '## Novidades da $tag'"
 fi
 
 # Registry do cargo e CRT/SDK da Microsoft ficam fora do container, pra não baixar de novo.
@@ -45,4 +49,4 @@ sha256sum "$dist"/*
 
 git tag "$tag"
 git push origin main "$tag"
-gh release create "$tag" "$dist"/* --title "$tag" --generate-notes
+gh release create "$tag" "$dist"/* --title "$tag" --notes "$notas"

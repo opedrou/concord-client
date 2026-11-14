@@ -1,15 +1,66 @@
 # Concord Client
 
 Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust, para Windows e
-Linux. Aponta para qualquer servidor Concord: o endereço é escolhido na primeira abertura.
+Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
+escolhido na primeira abertura.
 
-Em desenvolvimento. Hoje entra no servidor, mostra os canais e quem está em cada um. Voz e
-transmissão ainda não existem aqui.
+**Versão atual: v0.1.7.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
-## Rodar
+## O que já faz
+
+- **Voz:** microfone com cancelamento de eco, limitador de voz automático ou manual e
+  sensibilidade de entrada. Volume por pessoa e troca de dispositivo no meio da call.
+- **Transmitir a tela:** tela inteira ou janela, com o som do que está tocando. Dá pra trocar a
+  tela e ligar ou desligar o áudio sem parar a transmissão, com prévia do que está saindo.
+- **Assistir** a transmissão dos outros, como no site.
+- **Sons** de entrar, sair e começar a transmitir.
+- **Atualiza sozinho:** confere versão nova a cada 15 min, e a seta verde reinicia na nova. O
+  arquivo baixado é conferido pelo SHA-256 da release.
+
+Ainda só no site: soundboard e chat de texto.
+
+## Instalar
+
+**Windows 11** (o 10 não foi testado): baixe `concord-client-windows-x86_64.exe` e abra. Ele se instala em
+`%LOCALAPPDATA%\Programs\Concord`, cria o atalho no Menu Iniciar e aparece em "Aplicativos
+instalados", que é por onde se desinstala. O arquivo não é assinado: se o SmartScreen bloquear,
+clique em "Mais informações" e depois em "Executar assim mesmo".
+
+**Linux (Ubuntu 24.04 ou mais novo, Debian 13 ou mais novo, x86_64):**
+
+```bash
+mkdir -p ~/.local/bin
+mv ~/Downloads/concord-client-linux-x86_64 ~/.local/bin/concord-client
+chmod +x ~/.local/bin/concord-client
+~/.local/bin/concord-client
+```
+
+Na primeira abertura ele entra no menu de aplicativos. Precisa de PipeWire, e a transmissão usa
+o seletor de tela do sistema (xdg-desktop-portal).
+
+## Limites conhecidos
+
+- O som da transmissão chega mono.
+- No Linux, o monitor não é mantido aceso enquanto você assiste uma transmissão.
+- No Windows, o vídeo da transmissão é codificado na CPU (VP8).
+
+## Novidades da v0.1.7
+
+Nada muda no app. É a mesma versão da v0.1.6, agora compilada e publicada por
+`release/release.sh`, que gera as duas versões no Linux.
+
+## Compilar
+
+Precisa de Rust (a versão fica fixa em `rust-toolchain.toml`) e clang 21 ou mais novo no Linux.
 
 ```bash
 cargo run --release
+```
+
+Os binários de Windows e Linux iguais aos da release saem de um container Docker:
+
+```bash
+release/release.sh --build    # vão pra target/docker/dist/
 ```
 
 ## Testes
