@@ -30,6 +30,11 @@ fn main() -> iced::Result {
         log!("pânico: {info}");
         default_hook(info);
     }));
+    // `--register` e `--uninstall` rodam sem janela e sem tocar no log.
+    #[cfg(target_os = "linux")]
+    if update::cli() {
+        return Ok(());
+    }
     log!("Concord {} começou", env!("CARGO_PKG_VERSION"));
     #[cfg(windows)]
     if update::setup() {

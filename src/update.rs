@@ -55,20 +55,80 @@ fn is_newer(tag: &str, current: &str) -> bool {
 /// o ícone; sem ele aparece a engrenagem genérica.
 pub const APP_ID: &str = "concord";
 
+/// Pasta de dados do usuário: `$XDG_DATA_HOME`, senão `~/.local/share`.
+#[cfg(target_os = "linux")]
+fn data_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+}
+
 /// No Linux, põe o app no menu: `.desktop` apontando pra este executável, e o ícone. Só na
 /// cópia instalada, e só reescreve o que mudou (o caminho muda se a pessoa mover o arquivo).
 #[cfg(target_os = "linux")]
 pub fn register() {
     let Some(exe) = installed() else { return };
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    let Some(data) = data else { return };
+    let Some(data) = data_dir() else { return };
     let icon = data.join("concord/icon.png");
     let entry = data.join(format!("applications/{APP_ID}.desktop"));
     let _ = write_if_changed(&icon, crate::icon::PNG);
     let _ = write_if_changed(&entry, desktop_entry(&exe, &icon).as_bytes());
+}
+
+/// Flags de linha de comando do Linux que não abrem janela: `--register` (usado pelo
+/// `install.sh`) põe no menu e `--uninstall` tira tudo. Devolve `true` quando o processo deve sair.
+#[cfg(target_os = "linux")]
+pub fn cli() -> bool {
+    let arg = std::env::args_os().nth(1);
+    match arg.as_deref().and_then(|a| a.to_str()) {
+        Some("--register") => register(),
+        Some("--uninstall") => match (installed(), data_dir()) {
+            (Some(exe), Some(data)) => uninstall(&exe, &data),
+            _ => println!(
+                "Este não é o Concord instalado (build de desenvolvimento): nada removido."
+            ),
+        },
+        _ => return false,
+    }
+    true
+}
+
+/// `concord-client --uninstall`: tira o `.desktop`, o ícone (e a pasta, se ficar vazia), o
+/// binário e os `.old`/`.new` da atualização. A config em `~/.config/concord` e o login no
+/// cofre ficam, como no Windows. O binário rodando se apaga normal: o Linux só solta o inode
+/// quando o processo sai.
+#[cfg(target_os = "linux")]
+fn uninstall(exe: &Path, data: &Path) {
+    let pasta = data.join("concord");
+    let alvos = [
+        data.join(format!("applications/{APP_ID}.desktop")),
+        pasta.join("icon.png"),
+        exe.to_owned(),
+        old_of(exe),
+        exe.with_extension("new"),
+    ];
+    for alvo in alvos {
+        if std::fs::remove_file(&alvo).is_ok() {
+            println!("Removido: {}", alvo.display());
+        }
+    }
+    // `remove_dir` só apaga pasta vazia; se a pessoa guardou algo lá, fica.
+    if std::fs::remove_dir(&pasta).is_ok() {
+        println!("Removido: {}", pasta.display());
+    }
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("concord"))
+        .filter(|c| c.exists());
+    if let Some(config) = config {
+        println!(
+            "Mantido: {} (config e log). Apague à mão se quiser.",
+            config.display()
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -301,6 +361,42 @@ mod tests {
         assert!(!is_newer("v0.1.0", "0.1.0"), "mesma versão não baixa");
         assert!(!is_newer("v0.0.9", "0.1.0"), "mais velha não baixa");
         assert!(!is_newer("nightly", "0.1.0"), "tag estranha não baixa");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desinstala_so_o_que_o_app_instalou() {
+        let raiz = std::env::temp_dir().join(format!("concord-uninstall-{}", std::process::id()));
+        let (data, bin) = (raiz.join("share"), raiz.join("bin"));
+        let exe = bin.join("concord-client");
+        std::fs::create_dir_all(data.join("applications")).unwrap();
+        std::fs::create_dir_all(data.join("concord")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let outro = data.join("applications/outro.desktop");
+        let vivos = [&exe, &old_of(&exe), &exe.with_extension("new")];
+        let mortos = [
+            data.join("applications/concord.desktop"),
+            data.join("concord/icon.png"),
+            outro.clone(),
+        ];
+        for f in vivos
+            .iter()
+            .map(|p| p.as_path())
+            .chain(mortos.iter().map(|p| p.as_path()))
+        {
+            std::fs::write(f, b"x").unwrap();
+        }
+        uninstall(&exe, &data);
+        assert!(vivos.iter().all(|f| !f.exists()));
+        assert!(!mortos[0].exists() && !mortos[1].exists());
+        assert!(!data.join("concord").exists(), "pasta vazia some");
+        assert!(outro.exists(), "outros apps não são tocados");
+        // Com algo de fora na pasta, ela fica.
+        std::fs::create_dir_all(data.join("concord")).unwrap();
+        std::fs::write(data.join("concord/meu.txt"), b"x").unwrap();
+        uninstall(&exe, &data);
+        assert!(data.join("concord/meu.txt").exists());
+        std::fs::remove_dir_all(&raiz).unwrap();
     }
 
     #[test]
