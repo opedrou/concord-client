@@ -12,6 +12,7 @@ use super::{ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avat
 use crate::api::Secret;
 use crate::audio::{MANUAL_MAX_DB, MANUAL_MIN_DB, NoiseLevel, Sensitivity};
 use crate::config::Config;
+use crate::update::Check;
 
 /// Primeira opção das listas de dispositivo: `None` na config.
 const PADRAO: &str = "Padrão do sistema";
@@ -196,7 +197,7 @@ pub fn settings<'a>(m: &'a Main, config: &'a Config, tab: Tab) -> Element<'a, Ms
         Tab::Server => server_panel(m),
         Tab::Account => account_panel(m),
         Tab::Voice => voice_panel(m, config),
-        Tab::About => about_panel(),
+        Tab::About => about_panel(m),
     };
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(32))
         .padding(0)
@@ -245,13 +246,13 @@ fn title<'a>(content: &'a str) -> Element<'a, Msg> {
 
 fn action<'a>(
     label: &'a str,
-    msg: Msg,
+    msg: impl Into<Option<Msg>>,
     style: fn(&Theme, button::Status) -> button::Style,
 ) -> Element<'a, Msg> {
     button(text(label).size(14).font(theme::SEMIBOLD))
         .padding([9, 16])
         .style(style)
-        .on_press(msg)
+        .on_press_maybe(msg.into())
         .into()
 }
 
@@ -455,11 +456,28 @@ fn sensitivity<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
     labeled("Sensibilidade de entrada", column![toggle, body].spacing(8))
 }
 
-fn about_panel<'a>() -> Element<'a, Msg> {
+fn about_panel(m: &Main) -> Element<'_, Msg> {
+    let status = m.check.as_ref().map(|check| {
+        let (line, color) = match check {
+            Check::Searching | Check::Busy => ("Procurando…".to_owned(), FG2),
+            Check::Latest => ("Esta já é a versão mais nova.".to_owned(), FG2),
+            Check::Downloading(v) => (format!("Baixando a versão {v}…"), FG2),
+            Check::Ready(v) => (
+                format!("Versão {v} pronta. Clique na seta verde pra reiniciar."),
+                GREEN,
+            ),
+            Check::Failed(e) => (e.clone(), DANGER),
+        };
+        text(line).size(13).color(color)
+    });
+    let search = (!m.checking()).then_some(Msg::CheckUpdate);
     column![
         title("Sobre"),
         text(concat!("Concord ", env!("CARGO_PKG_VERSION"))).size(15),
         text("Cliente desktop nativo, em Rust.").size(14).color(FG2),
+        column![action("Procurar atualização", search, theme::outline)]
+            .push(status)
+            .spacing(8),
     ]
     .spacing(12)
     .into()

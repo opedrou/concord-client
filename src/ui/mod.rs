@@ -23,10 +23,14 @@ use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::session;
 use crate::share::{Quality, Source, Thumb};
+use crate::update::Check;
 
 const POLL: Duration = Duration::from_secs(4);
 /// De quanto em quanto tempo confere se saiu versão nova, com o app aberto.
 const CONFERE_UPDATE: Duration = Duration::from_secs(15 * 60);
+/// Tempo na tela principal pra versão aberta contar como boa (`update::healthy`). A
+/// primeira conferência de atualização espera isso, pra não trocar a versão ainda em teste.
+const DE_PE: Duration = Duration::from_secs(10);
 /// Falhas seguidas de presença até o rodapé trocar "Online" por "Sem conexão".
 const FALHAS_ATE_AVISAR: u8 = 3;
 
@@ -112,6 +116,8 @@ struct Main {
     full_window: bool,
     /// Versão nova já baixada e instalada, que vale na próxima abertura.
     update: Option<String>,
+    /// Última conferência de atualização, pra linha do Sobre.
+    check: Option<Check>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -191,12 +197,14 @@ pub enum Msg {
     BarNear(bool),
     /// Mouse no palco: onde está e se está perto do pé.
     StageMouse(iced::Point, bool),
-    /// Fim da conferência de atualização: a versão instalada, se teve.
-    Updated(Option<String>),
+    /// Andamento e fim da conferência de atualização.
+    Updated(Check),
     /// Clique no ícone de atualização: abre a versão nova agora.
     RestartForUpdate,
-    /// Hora de conferir de novo se saiu versão nova.
+    /// Hora de conferir de novo se saiu versão nova, ou o botão do Sobre.
     CheckUpdate,
+    /// A versão aberta ficou de pé na tela principal.
+    Healthy,
     /// Seta do botão de transmitir: abre e fecha o menu.
     ShareMenu,
     /// Liga ou desliga o áudio da transmissão no ar.
@@ -233,6 +241,21 @@ fn read_sources(call: &mut ActiveCall) -> Task<Msg> {
         let sources = tokio::task::spawn_blocking(crate::share::sources).await;
         Msg::ShareSources(sources.unwrap_or_default())
     })
+}
+
+/// Confere atualização. Avisa quando começa a baixar e de novo no fim.
+fn check_update() -> Task<Msg> {
+    Task::run(
+        iced::stream::channel(2, async |mut done| {
+            let mut early = done.clone();
+            let end = crate::update::run(move |version| {
+                let _ = early.try_send(Check::Downloading(version));
+            })
+            .await;
+            let _ = done.try_send(end);
+        }),
+        Msg::Updated,
+    )
 }
 
 fn connect(server: String) -> Task<Msg> {
@@ -785,11 +808,14 @@ impl App {
                 }
                 Task::none()
             }
-            Msg::Updated(version) => {
+            Msg::Updated(check) => {
                 if let Screen::Main(m) = &mut self.screen
-                    && version.is_some()
+                    && check != Check::Busy
                 {
-                    m.update = version;
+                    if let Check::Ready(version) = &check {
+                        m.update = Some(version.clone());
+                    }
+                    m.check = Some(check);
                 }
                 Task::none()
             }
@@ -800,7 +826,17 @@ impl App {
                 }
                 _ => Task::none(),
             },
-            Msg::CheckUpdate => Task::future(async { Msg::Updated(crate::update::run().await) }),
+            Msg::CheckUpdate => match &mut self.screen {
+                Screen::Main(m) if !m.checking() => {
+                    m.check = Some(Check::Searching);
+                    check_update()
+                }
+                _ => Task::none(),
+            },
+            Msg::Healthy => {
+                crate::update::healthy();
+                Task::done(Msg::CheckUpdate)
+            }
             Msg::StageMouse(at, near) => {
                 if let Some(call) = self.call_mut() {
                     call.cursor = at;
@@ -1190,12 +1226,16 @@ impl App {
             open: false,
             closing: None,
             update: None,
+            check: None,
         };
         let avatars = main.fetch_avatars();
         self.screen = Screen::Main(Box::new(main));
         Task::batch([
             avatars,
-            Task::future(async { Msg::Updated(crate::update::run().await) }),
+            Task::future(async {
+                tokio::time::sleep(DE_PE).await;
+                Msg::Healthy
+            }),
             Task::future(async move { Msg::Channels(a.channels().await) }),
             Task::future(async move { Msg::Members(b.members().await) }),
             Task::future(async move { Msg::Presence(c.presence().await) }),
@@ -1300,6 +1340,11 @@ impl Main {
         self.probe = Probe::Off;
         self.level = MANUAL_MIN_DB;
         self.open = false;
+    }
+
+    /// Conferência de atualização no meio: o botão do Sobre espera ela acabar.
+    fn checking(&self) -> bool {
+        matches!(self.check, Some(Check::Searching | Check::Downloading(_)))
     }
 
     /// Só a aba Voz aberta com medidor pede o relógio; fora disso a janela fica parada.
@@ -2216,6 +2261,34 @@ mod tests {
     }
 
     #[test]
+    fn linha_de_atualizacao_segue_a_conferencia() {
+        let mut a = main_app();
+        let _ = a.update(Msg::CheckUpdate);
+        assert_eq!(main_of(&mut a).check, Some(Check::Searching));
+        let _ = a.update(Msg::Updated(Check::Downloading("0.2.0".into())));
+        let _ = a.update(Msg::CheckUpdate);
+        assert_eq!(
+            main_of(&mut a).check,
+            Some(Check::Downloading("0.2.0".into())),
+            "no meio não começa outra"
+        );
+        let _ = a.update(Msg::Updated(Check::Busy));
+        assert!(main_of(&mut a).checking(), "a ocupada não apaga a linha");
+        let _ = a.update(Msg::Updated(Check::Ready("0.2.0".into())));
+        assert_eq!(
+            main_of(&mut a).update.as_deref(),
+            Some("0.2.0"),
+            "seta verde"
+        );
+        let _ = a.update(Msg::Updated(Check::Failed("x".into())));
+        assert_eq!(
+            main_of(&mut a).update.as_deref(),
+            Some("0.2.0"),
+            "a seta fica"
+        );
+    }
+
+    #[test]
     fn fechar_as_configuracoes_solta_o_motor_de_teste() {
         for msg in [Msg::CloseSettings, Msg::Escape] {
             let mut a = voice_tab();
@@ -2391,6 +2464,20 @@ mod tests {
             }
             print(&a, nome);
         }
+
+        // Linha do "Procurar atualização": baixando (botão parado), pronta e erro.
+        main_of(&mut a).settings = Some(Tab::About);
+        main_of(&mut a).check = Some(Check::Downloading("0.2.0".into()));
+        print(&a, "sobre-baixando");
+        main_of(&mut a).check = Some(Check::Ready("0.2.0".into()));
+        main_of(&mut a).update = Some("0.2.0".into());
+        print(&a, "sobre-pronta");
+        main_of(&mut a).update = None;
+        main_of(&mut a).check = Some(Check::Failed(
+            "A versão 0.2.0 não abriu neste computador. Fica esta até sair a próxima.".into(),
+        ));
+        print(&a, "sobre-erro");
+        main_of(&mut a).check = None;
 
         // Sensibilidade de entrada: automático (com voz e em silêncio), manual (abaixo e
         // acima do limiar), erro do motor e a janela mínima.

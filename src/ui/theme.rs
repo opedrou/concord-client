@@ -174,7 +174,11 @@ pub fn outline(_: &Theme, status: button::Status) -> button::Style {
     };
     button::Style {
         background,
-        text_color: FG,
+        text_color: if status == button::Status::Disabled {
+            FG3
+        } else {
+            FG
+        },
         border: Border {
             color: BORDER2,
             width: 1.0,

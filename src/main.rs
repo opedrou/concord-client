@@ -24,6 +24,11 @@ use iced::{Size, window};
 use ui::{App, theme};
 
 fn main() -> iced::Result {
+    // A atualização roda o binário baixado assim pra ver se ele abre neste computador.
+    if std::env::args_os().any(|a| a == "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     // Pânico numa tarefa da sala some calado: ao menos fica no log.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -40,7 +45,9 @@ fn main() -> iced::Result {
     if update::setup() {
         return Ok(());
     }
-    update::cleanup();
+    if update::start() {
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     update::register();
     let window = window::Settings {
@@ -65,5 +72,9 @@ fn main() -> iced::Result {
     for font in theme::FONTS {
         app = app.font(font);
     }
-    app.run()
+    let result = app.run();
+    if result.is_ok() {
+        update::closed();
+    }
+    result
 }
