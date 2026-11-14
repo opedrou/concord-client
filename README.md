@@ -4,7 +4,7 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.10.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.11.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
@@ -15,7 +15,8 @@ escolhido na primeira abertura.
 - **Transmitir a tela:** tela inteira ou janela, com o som do que está tocando, em estéreo. Dá
   pra trocar a tela e ligar ou desligar o áudio sem parar a transmissão, com prévia do que está
   saindo.
-- **Assistir** a transmissão dos outros, como no site, vendo quem mais está assistindo.
+- **Assistir** a transmissão dos outros, com o som, também de quem transmite pelo site, vendo
+  quem mais está assistindo.
 - **Câmera dos outros** no tile de voz, no lugar da foto.
 - **Chat de texto** nos canais de texto, em tempo real, com anexos.
 - **Sons** de entrar, sair e começar a transmitir.
@@ -62,32 +63,21 @@ o seletor de tela do sistema (xdg-desktop-portal).
 
 - No Linux, o monitor não é mantido aceso enquanto você assiste uma transmissão.
 - No Windows, o vídeo da transmissão é codificado na CPU (VP8).
-
-## Novidades da v0.1.10
-
-### Novo
-- **Chat de texto:** clicar num canal de texto abre o chat, sem sair da call. Histórico com
-  "Carregar mais", mensagens em tempo real, imagem na mensagem, anexo de até 95 MiB pelo seletor
-  do sistema e apagar mensagem (a própria, ou qualquer uma se for admin). Se a conexão cair, o
-  chat busca o que perdeu ao voltar.
-- **Ganho de entrada** na aba Voz: automático, como antes, ou manual de -20 a +20 dB.
-- **Avisos da call, como no site:** selo em quem não está te ouvindo, moldura vermelha com a call
-  sendo gravada e "Conexão instável" no teu tile.
-- **Windows:** atalho na Área de Trabalho ao instalar, e o desinstalar pergunta se apaga também a
-  config e o login salvo.
-- **Linux:** `concord-client --uninstall` faz a mesma pergunta no terminal.
-
-### Corrigido
-- **Windows, fone Bluetooth que cai e volta:** o áudio não voltava pro fone e nada tocava até
-  sair da call. Cada tentativa de reabrir nele falhava com `RPC_E_CHANGED_MODE`.
-- **Menos RAM assistindo transmissão:** cada quadro reaproveita a memória do anterior. Depois de
-  90 s em 1080p, ficavam presos 152 MB; agora 117 MB.
-
-### Limites conhecidos
-- Nada desta versão foi testado num Windows de verdade, só compilado. O conserto do fone
-  Bluetooth saiu do log de uma call real, mas ainda não foi visto funcionando.
 - No chat, selecionar e copiar funciona dentro de uma mensagem, não pegando várias de uma vez.
 - O chat manda a foto original; o site encolhe antes de enviar.
+
+## Novidades da v0.1.11
+
+### Corrigido
+- **Windows, fone Bluetooth que cai e volta:** com a Saída ou a Entrada em "Padrão", o áudio não
+  voltava pro fone. O conserto da v0.1.10 não resolvia. Agora o app abre o fone pela lista de
+  dispositivos do sistema, e no teste num Windows de verdade o fone caiu e o som voltou nele.
+- **Transmissão feita pelo site chegava muda:** quem assistia no app via a tela sem o som. Agora
+  o áudio da tela compartilhada pelo navegador toca.
+
+### Limites conhecidos
+- No Linux, a troca de dispositivo foi testada só numa bancada de áudio isolada, e o som de uma
+  transmissão do site ainda não foi ouvido.
 
 ## Compilar
 
