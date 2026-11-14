@@ -26,7 +26,7 @@ sha2 = "0.10"
 cpal = "0.18"
 # Áudio da transmissão: WASAPI process loopback, como no spike.
 wasapi = "0.26"
-# Atalho no Menu Iniciar e "Aplicativos instalados" (`update::win`). A mesma versão que o
+# Atalhos, "Aplicativos instalados" e a pergunta do desinstalar (`update::win`). A mesma versão que o
 # `wasapi` já puxa.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -36,6 +36,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # O libwebrtc embute `pw_*` vazios: linkar libpipewire derruba o processo. Por isso

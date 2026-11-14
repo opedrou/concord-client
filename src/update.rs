@@ -94,7 +94,10 @@ pub fn cli() -> bool {
     match arg.as_deref().and_then(|a| a.to_str()) {
         Some("--register") => register(),
         Some("--uninstall") => match (installed(), data_dir()) {
-            (Some(exe), Some(data)) => uninstall(&exe, &data),
+            (Some(exe), Some(data)) => {
+                uninstall(&exe, &data);
+                ask_wipe();
+            }
             _ => println!(
                 "Este não é o Concord instalado (build de desenvolvimento): nada removido."
             ),
@@ -105,9 +108,9 @@ pub fn cli() -> bool {
 }
 
 /// `concord-client --uninstall`: tira o `.desktop`, o ícone (e a pasta, se ficar vazia), o
-/// binário e os `.old`/`.new` da atualização. A config em `~/.config/concord` e o login no
-/// cofre ficam, como no Windows. O binário rodando se apaga normal: o Linux só solta o inode
-/// quando o processo sai.
+/// binário e os `.old`/`.new` da atualização. A config e o login ficam, a não ser que a
+/// pessoa responda que sim a [`ask_wipe`]. O binário rodando se apaga normal: o Linux só
+/// solta o inode quando o processo sai.
 #[cfg(target_os = "linux")]
 fn uninstall(exe: &Path, data: &Path) {
     let pasta = data.join("concord");
@@ -127,18 +130,40 @@ fn uninstall(exe: &Path, data: &Path) {
     if std::fs::remove_dir(&pasta).is_ok() {
         println!("Removido: {}", pasta.display());
     }
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .map(|c| c.join("concord"))
-        .filter(|c| c.exists());
-    if let Some(config) = config {
+}
+
+/// Pergunta no terminal se apaga também a config e o login. Sem terminal (script, pipe)
+/// não pergunta e mantém.
+#[cfg(target_os = "linux")]
+fn ask_wipe() {
+    use std::io::IsTerminal;
+    let Some(dir) = config_dir().filter(|d| d.exists()) else {
+        return;
+    };
+    let stdin = io::stdin();
+    let wipe = wants_wipe(stdin.is_terminal(), &mut stdin.lock());
+    if wipe_data(&dir, wipe, crate::session::delete_blocking) {
+        println!("Removido: {} e o login salvo", dir.display());
+    } else {
         println!(
             "Mantido: {} (config e log). Apague à mão se quiser.",
-            config.display()
+            dir.display()
         );
     }
+}
+
+/// Lê a resposta do `[s/N]`: só "s" ou "sim" apagam. Sem terminal nem chega a perguntar.
+#[cfg(target_os = "linux")]
+fn wants_wipe(terminal: bool, input: &mut impl io::BufRead) -> bool {
+    use io::Write;
+    if !terminal {
+        return false;
+    }
+    print!("Apagar também as configurações e o login salvo do Concord? [s/N] ");
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    input.read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_lowercase().as_str(), "s" | "sim")
 }
 
 #[cfg(target_os = "linux")]
@@ -195,7 +220,13 @@ pub fn setup() -> bool {
             win::register(&target);
             false
         }
-        Launch::Copy => win::copy(&exe, &target).is_ok() && win::open(&target),
+        Launch::Copy => {
+            let copied = win::copy(&exe, &target).is_ok();
+            if copied {
+                win::desktop_shortcut(&target);
+            }
+            copied && win::open(&target)
+        }
         Launch::Open => win::open(&target),
     }
 }
@@ -372,7 +403,11 @@ pub fn closed() {
 fn installed() -> Option<PathBuf> {
     static EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
     EXE.get_or_init(|| {
-        if cfg!(debug_assertions) || std::env::var_os("CONCORD_NO_UPDATE").is_some() {
+        if cfg!(debug_assertions) {
+            // Só no build de debug: o teste do `--uninstall` aponta um exe de mentira.
+            return std::env::var_os("CONCORD_TESTE_INSTALADO").map(PathBuf::from);
+        }
+        if std::env::var_os("CONCORD_NO_UPDATE").is_some() {
             return None;
         }
         let exe = std::env::current_exe().ok()?;
@@ -380,6 +415,29 @@ fn installed() -> Option<PathBuf> {
         (!dev).then_some(exe)
     })
     .clone()
+}
+
+/// Pasta da config (`~/.config/concord`, `%APPDATA%\Concord`): a mesma onde mora o
+/// `update.json`, pra seguir o que `crate::config` decide.
+fn config_dir() -> Option<PathBuf> {
+    crate::config::update_path()?.parent().map(Path::to_owned)
+}
+
+/// Com `wipe`, apaga a sessão do cofre (da `server` do `config.json`, via `vault`) e a pasta
+/// da config. Sem, não toca em nada. O cofre vai primeiro: se a pasta não apagar, a próxima
+/// tentativa ainda sabe o servidor. Devolve se apagou.
+fn wipe_data(dir: &Path, wipe: bool, vault: impl FnOnce(&str)) -> bool {
+    if !wipe {
+        return false;
+    }
+    let server = fs::read(dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|c| c["server"].as_str().map(str::to_owned));
+    if let Some(server) = server {
+        vault(&server);
+    }
+    fs::remove_dir_all(dir).is_ok()
 }
 
 fn old_of(exe: &Path) -> PathBuf {
@@ -636,6 +694,39 @@ mod tests {
         uninstall(&exe, &data);
         assert!(data.join("concord/meu.txt").exists());
         std::fs::remove_dir_all(&raiz).unwrap();
+    }
+
+    #[test]
+    fn apagar_dados_so_com_sim_e_limpa_o_cofre() {
+        let dir = std::env::temp_dir().join(format!("concord-wipe-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.json"), br#"{"server":"https://a.b"}"#).unwrap();
+        let chamados = std::cell::RefCell::new(Vec::new());
+        let cofre = |s: &str| chamados.borrow_mut().push(s.to_owned());
+        assert!(!wipe_data(&dir, false, cofre));
+        assert!(
+            dir.exists() && chamados.borrow().is_empty(),
+            "Não mantém tudo"
+        );
+        assert!(wipe_data(&dir, true, cofre));
+        assert!(!dir.exists(), "Sim apaga a pasta");
+        assert_eq!(*chamados.borrow(), ["https://a.b"]);
+        // Sem config.json não há servidor: pasta some, cofre não é chamado.
+        fs::create_dir_all(&dir).unwrap();
+        assert!(wipe_data(&dir, true, |_| panic!("sem servidor")));
+        assert!(!dir.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pergunta_do_terminal() {
+        let ask = |terminal, texto: &str| wants_wipe(terminal, &mut texto.as_bytes());
+        assert!(ask(true, "s\n") && ask(true, "Sim\n"));
+        assert!(!ask(true, "n\n") && !ask(true, "\n") && !ask(true, ""));
+        assert!(
+            !ask(false, "s\n"),
+            "sem terminal mantém, mesmo com 's' na entrada"
+        );
     }
 
     /// Pasta temporária só deste teste, com o exe `velho` e o caminho do estado.
