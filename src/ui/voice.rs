@@ -97,6 +97,10 @@ pub struct ActiveCall {
     pub screen_pending: bool,
     /// Prévia borrada de cada transmissão no ar, pela identity.
     pub previews: HashMap<String, image::Handle>,
+    /// Último quadro da câmera de cada pessoa, já na GPU, pela identity.
+    pub cameras: HashMap<String, image::Allocation>,
+    /// Câmeras com um quadro subindo pra GPU: o próximo delas só sai depois.
+    cameras_pending: HashSet<String>,
     /// Prévia da própria transmissão, já na GPU, e se tem uma subindo.
     pub own: Option<image::Allocation>,
     pub own_pending: bool,
@@ -148,6 +152,8 @@ impl ActiveCall {
             screen: None,
             screen_pending: false,
             previews: HashMap::new(),
+            cameras: HashMap::new(),
+            cameras_pending: HashSet::new(),
             own: None,
             own_pending: false,
             preview_paused: false,
@@ -391,6 +397,9 @@ impl ActiveCall {
         });
         self.previews
             .retain(|id, _| live.iter().any(|l| &l.identity == id && l.screen_share));
+        // Câmera desligada ou muda: o tile volta pra foto.
+        self.cameras
+            .retain(|id, _| live.iter().any(|l| &l.identity == id && l.camera));
         self.live = Some(live);
         if self.watching.is_some() && !still {
             self.watch(None);
@@ -423,6 +432,43 @@ impl ActiveCall {
         self.screen_pending = false;
         if self.watching.is_some() && allocation.is_some() {
             self.screen = allocation;
+        }
+    }
+
+    /// Relógio das câmeras: só com alguém de câmera ligada.
+    pub fn camera_clock(&self) -> bool {
+        self.live.iter().flatten().any(|l| l.camera && !l.is_local)
+    }
+
+    /// Quadros novos de câmera pra subir pra GPU, um por pessoa, de quem não tem um subindo.
+    pub fn pull_cameras(&mut self) -> Vec<(String, image::Handle)> {
+        let Some(call) = &self.call else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for l in self.live.iter().flatten().filter(|l| l.camera) {
+            if self.cameras_pending.contains(&l.identity) {
+                continue;
+            }
+            if let Some(p) = call.cameras().take(&l.identity) {
+                self.cameras_pending.insert(l.identity.clone());
+                let handle = image::Handle::from_rgba(p.width, p.height, p.rgba);
+                out.push((l.identity.clone(), handle));
+            }
+        }
+        out
+    }
+
+    /// O quadro subiu: troca o do tile, se a câmera ainda está ligada.
+    pub fn camera_ready(&mut self, identity: String, allocation: Option<image::Allocation>) {
+        self.cameras_pending.remove(&identity);
+        let on = self
+            .live
+            .iter()
+            .flatten()
+            .any(|l| l.identity == identity && l.camera);
+        if let (true, Some(a)) = (on, allocation) {
+            self.cameras.insert(identity, a);
         }
     }
 

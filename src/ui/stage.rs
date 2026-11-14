@@ -224,6 +224,16 @@ fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Eleme
     let speaking = call.speaking(name);
     let face = size.width.min(size.height) * 0.34;
     let face = avatar::view(name, m.avatar(name), face.min(96.0));
+    // Câmera ligada: o vídeo cobre o tile no lugar da foto, como no site.
+    let face: Element<'_, Msg> = match call.cameras.get(&p.identity) {
+        Some(a) => image(a.handle().clone())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .content_fit(ContentFit::Cover)
+            .border_radius(18)
+            .into(),
+        None => center(face).into(),
+    };
 
     let label = text(name)
         .size(13)
@@ -241,18 +251,27 @@ fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Eleme
         .align_y(Alignment::Center);
     let tag = container(tag).padding([5, 10]).style(theme::pill);
 
-    let body = stack![
-        center(face),
-        container(tag)
-            .align_left(Length::Fill)
-            .align_bottom(Length::Fill)
-            .padding(10),
-    ];
     let ring = if speaking {
         GREEN
     } else {
         iced::Color::TRANSPARENT
     };
+    // O anel numa camada por cima: a borda do próprio tile fica embaixo do vídeo.
+    let ring = container(space())
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            border: border::rounded(18).color(ring).width(2),
+            ..Default::default()
+        });
+    let body = stack![
+        face,
+        container(tag)
+            .align_left(Length::Fill)
+            .align_bottom(Length::Fill)
+            .padding(10),
+        ring,
+    ];
     let bg = m.tint(name).unwrap_or(BG2);
     let tile = container(body)
         .width(size.width)
@@ -260,7 +279,7 @@ fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Eleme
         .clip(true)
         .style(move |_| container::Style {
             background: Some(bg.into()),
-            border: border::rounded(18).color(ring).width(2),
+            border: border::rounded(18),
             ..Default::default()
         });
     if p.is_local {

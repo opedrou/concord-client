@@ -87,8 +87,13 @@ async fn cliente() -> Client {
 }
 
 async fn entrar(client: &Client) -> Room {
+    entrar_como(client, INSTALL).await
+}
+
+/// [`entrar`] com outra identity, pra não derrubar a de outra bancada na mesma sala.
+async fn entrar_como(client: &Client, install: &str) -> Room {
     let details = client
-        .connection_details(&var("CONCORD_ROOM"), INSTALL)
+        .connection_details(&var("CONCORD_ROOM"), install)
         .await
         .expect("token");
     let mut options = RoomOptions::default();
@@ -674,4 +679,139 @@ async fn bancada_ouve() {
     banca.parar(&me).await;
     let _ = room.close().await;
     assert!(mudas.is_empty(), "sem voz em: {mudas:?}");
+}
+
+/// Quadros de câmera de `quem` que chegam em `tempo`, e o tamanho do último.
+async fn quadros_de_camera(call: &Call, quem: &str, tempo: Duration) -> (u32, Option<(u32, u32)>) {
+    let (mut n, mut tamanho, inicio) = (0, None, Instant::now());
+    while inicio.elapsed() < tempo {
+        if let Some(p) = call.cameras().take(quem) {
+            n += 1;
+            tamanho = Some((p.width, p.height));
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    (n, tamanho)
+}
+
+/// Espera a câmera de `quem` na lista como `ligada`, ou a pessoa fora da sala com `None`.
+async fn camera_fica(events: &mut UnboundedReceiver<Event>, quem: &str, ligada: Option<bool>) {
+    loop {
+        if let Event::Participants(list) = evento(events).await {
+            let agora = list.iter().find(|p| p.identity == quem).map(|p| p.camera);
+            if agora == ligada {
+                return;
+            }
+        }
+    }
+}
+
+/// Câmera do Chrome até o cliente: assina ao ligar, quadros chegando, nada com ela muda,
+/// volta, e nada depois que a pessoa sai. Rode por `src/audio/bancada.sh bancada_camera`,
+/// com as variáveis do `share/bancada.sh` e `OUT`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bancada_camera() {
+    use crate::audio::bancada::Killed;
+    assert!(
+        std::env::var_os("BANCADA_RAIZ").is_some(),
+        "rode por src/audio/bancada.sh, num PipeWire próprio"
+    );
+    let _ = Command::new("pactl")
+        .args(["load-module", "module-null-sink", "sink_name=bancada"])
+        .output();
+    let prefs = AudioPrefs {
+        input: None,
+        output: None,
+        noise: NoiseLevel::Off,
+        sensitivity: Sensitivity::Auto,
+        master: 71,
+        volumes: HashMap::new(),
+    };
+    let client = cliente().await;
+    // Outra pessoa transmitindo: a prévia e o Assistir seguem com a câmera assinada.
+    let room = entrar_como(&client, "bancada-camera-tela").await;
+    let me = room.local_participant();
+    let mut banca = Banca::new(me.clone());
+    banca.ao_vivo(&me, Quality::Economica).await;
+    let tela = me.identity().to_string();
+
+    let (engine, mic) = Engine::start(prefs).expect("motor");
+    let (call, mut events) = Call::join_with(
+        client,
+        var("CONCORD_ROOM"),
+        "bancada-camera".to_owned(),
+        engine,
+        mic,
+        true,
+        sintetica,
+    );
+    let (mut conectou, mut previa) = (false, None);
+    while !conectou || previa.is_none() {
+        match evento(&mut events).await {
+            Event::Connected => conectou = true,
+            Event::Preview(quem, p) if quem == tela => previa = Some((p.width, p.height)),
+            _ => {}
+        }
+    }
+    println!("PREVIA da tela: {previa:?}");
+    let mut chrome = Killed(
+        Command::new("node")
+            .arg("src/share/camera.mjs")
+            .spawn()
+            .expect("node"),
+    );
+    let quem = loop {
+        if let Event::Participants(list) = evento(&mut events).await
+            && let Some(p) = list.iter().find(|p| !p.is_local && p.camera)
+        {
+            break p.identity.clone();
+        }
+    };
+    let segundos = 8;
+    let (ligada, tamanho) = quadros_de_camera(&call, &quem, Duration::from_secs(segundos)).await;
+    println!(
+        "CAMERA LIGADA: {ligada} quadros em {segundos} s ({:.1}/s), {tamanho:?}",
+        ligada as f32 / segundos as f32
+    );
+
+    call.watch(Some(tela.clone()));
+    let (mut telas, mut cameras, inicio) = (0, 0, Instant::now());
+    while inicio.elapsed() < Duration::from_secs(3) {
+        telas += u32::from(call.screen().take().is_some());
+        cameras += u32::from(call.cameras().take(&quem).is_some());
+        sleep(Duration::from_millis(5)).await;
+    }
+    call.watch(None);
+    println!("ASSISTINDO: {telas} quadros da tela e {cameras} da câmera em 3 s");
+
+    camera_fica(&mut events, &quem, Some(false)).await;
+    // O que já estava a caminho ainda chega, e fica de fora da conta.
+    sleep(Duration::from_secs(1)).await;
+    call.cameras().take(&quem);
+    let (muda, _) = quadros_de_camera(&call, &quem, Duration::from_secs(4)).await;
+    println!("CAMERA MUTADA: {muda} quadros em 4 s");
+
+    camera_fica(&mut events, &quem, Some(true)).await;
+    let (voltou, tamanho) = quadros_de_camera(&call, &quem, Duration::from_secs(4)).await;
+    println!("CAMERA VOLTOU: {voltou} quadros em 4 s, {tamanho:?}");
+
+    camera_fica(&mut events, &quem, None).await;
+    // Sem esvaziar: o que sobrou some quando a tarefa da câmera cai, logo depois.
+    sleep(Duration::from_secs(1)).await;
+    let (saiu, _) = quadros_de_camera(&call, &quem, Duration::from_secs(2)).await;
+    println!("CAMERA SAIU: {saiu} quadros em 2 s");
+    // Matar o node no meio deixaria o Chrome dele vivo, preso ao perfil.
+    let _ = chrome.0.wait();
+
+    call.leave();
+    while !matches!(evento(&mut events).await, Event::Ended(_)) {}
+    banca.parar(&me).await;
+    let _ = room.close().await;
+    assert!(ligada >= segundos as u32 * 10, "câmera ligada: {ligada}");
+    assert!(telas >= 10, "tela assistida: {telas}");
+    assert!(cameras >= 30, "câmera enquanto assiste: {cameras}");
+    assert_eq!(muda, 0, "câmera muda ainda manda quadro");
+    assert!(voltou >= 20, "câmera de volta: {voltou}");
+    assert_eq!(saiu, 0, "quadro depois de sair");
 }

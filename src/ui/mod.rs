@@ -40,6 +40,8 @@ const MEDIDOR: Duration = Duration::from_millis(33);
 const TELA: Duration = Duration::from_millis(16);
 /// Relógio da prévia da própria transmissão, no ritmo em que ela é gerada.
 const PREVIA: Duration = Duration::from_millis(200);
+/// Relógio das câmeras: 30 por segundo, o ritmo de uma câmera.
+const CAMERA: Duration = Duration::from_millis(33);
 
 // Quantas vezes `persist` rodou nesta thread de teste.
 #[cfg(test)]
@@ -181,6 +183,9 @@ pub enum Msg {
     /// Relógio da prévia própria e a prévia já na GPU.
     PreviewTick,
     PreviewReady(Option<image::Allocation>),
+    /// Relógio das câmeras e o quadro de uma, pela identity, já na GPU.
+    CameraTick,
+    CameraReady(String, Option<image::Allocation>),
     /// A janela ganhou ou perdeu o foco.
     Focus(bool),
     /// Põe a transmissão assistida em tela cheia, pelo menu do botão direito.
@@ -320,6 +325,9 @@ impl App {
             }
             if m.call.as_ref().is_some_and(ActiveCall::preview_clock) {
                 subs.push(time::every(PREVIA).map(|_| Msg::PreviewTick));
+            }
+            if m.call.as_ref().is_some_and(ActiveCall::camera_clock) {
+                subs.push(time::every(CAMERA).map(|_| Msg::CameraTick));
             }
             if m.meter_clock() {
                 subs.push(time::every(MEDIDOR).map(|_| Msg::MeterTick));
@@ -754,6 +762,19 @@ impl App {
             Msg::PreviewReady(allocation) => {
                 if let Some(call) = self.call_mut() {
                     call.own_ready(allocation);
+                }
+                Task::none()
+            }
+            // Mesmo cuidado, uma câmera por vez: só troca depois do `allocate`.
+            Msg::CameraTick => {
+                let frames = self.call_mut().map(ActiveCall::pull_cameras);
+                Task::batch(frames.into_iter().flatten().map(|(identity, handle)| {
+                    image::allocate(handle).map(move |r| Msg::CameraReady(identity.clone(), r.ok()))
+                }))
+            }
+            Msg::CameraReady(identity, allocation) => {
+                if let Some(call) = self.call_mut() {
+                    call.camera_ready(identity, allocation);
                 }
                 Task::none()
             }
@@ -2059,6 +2080,32 @@ mod tests {
     }
 
     #[test]
+    fn camera_aparece_ligada_e_volta_pra_foto_muda() {
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        let camera = |on| {
+            let mut l = voice::test_live("Ana", false);
+            l.camera = on;
+            vec![l]
+        };
+        assert!(!call_of(&mut a).camera_clock(), "sem câmera, sem relógio");
+        let _ = a.update(Msg::CameraReady("Ana__1".into(), Some(alocada(64, 36))));
+        assert!(
+            call_of(&mut a).cameras.is_empty(),
+            "atrasado, câmera desligada"
+        );
+
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(camera(true))));
+        assert!(call_of(&mut a).camera_clock());
+        let _ = a.update(Msg::CameraReady("Ana__1".into(), Some(alocada(64, 36))));
+        assert!(call_of(&mut a).cameras.contains_key("Ana__1"));
+
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(camera(false))));
+        assert!(call_of(&mut a).cameras.is_empty(), "muda: volta pra foto");
+        assert!(!call_of(&mut a).camera_clock());
+    }
+
+    #[test]
     fn trocar_no_ar_nao_para_a_transmissao() {
         let mut a = in_call(&["Ana"]);
         share(&mut a, ShareState::Live);
@@ -2452,6 +2499,26 @@ mod tests {
             );
         }
         print(&a, "palco-cores");
+        // Câmera ligada: o quadro cobre o tile, em 16:9 e em 4:3, com o anel por cima.
+        let (mut a, id) = palco(4);
+        let lista = nomes[..4]
+            .iter()
+            .enumerate()
+            .map(|(i, nome)| {
+                let mut l = voice::test_live(nome, i == 1);
+                l.is_local = i == 0;
+                l.camera = i == 1 || i == 2;
+                l
+            })
+            .collect();
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
+        for (who, h) in [
+            ("Ana__1", 360),
+            ("Bruno com nome bem comprido demais__1", 480),
+        ] {
+            let _ = a.update(Msg::CameraReady(who.into(), Some(alocada(640, h))));
+        }
+        print(&a, "palco-camera");
         let (mut a, id) = palco(4);
         let _ = a.update(Msg::CallEvent(id, call::Event::Reconnecting { attempt: 3 }));
         let _ = a.update(Msg::OpenVolume("Ana".into()));
