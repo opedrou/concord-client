@@ -1,9 +1,12 @@
 //! Instalação no Windows, toda no usuário e sem admin: o programa em
-//! `%LOCALAPPDATA%\Programs\Concord`, atalho no Menu Iniciar (o Windows+S acha por ele) e
-//! entrada em "Aplicativos instalados", que desinstala com `--uninstall`.
+//! `%LOCALAPPDATA%\Programs\Concord`, atalho no Menu Iniciar (o Windows+S acha por ele) e na
+//! Área de Trabalho (este só na instalação) e entrada em "Aplicativos instalados", que
+//! desinstala com `--uninstall`.
 use std::{
-    env, fs, io,
-    os::windows::process::CommandExt,
+    env,
+    ffi::{OsString, c_void},
+    fs, io,
+    os::windows::{ffi::OsStringExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -13,14 +16,20 @@ use windows::{
         System::{
             Com::{
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-                CoUninitialize, IPersistFile, STGM_READ,
+                CoTaskMemFree, CoUninitialize, IPersistFile, STGM_READ,
             },
             Registry::{
                 HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
                 RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
             },
         },
-        UI::Shell::{IShellLinkW, SLGP_RAWPATH, ShellLink},
+        UI::{
+            Shell::{
+                FOLDERID_Desktop, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, SLGP_RAWPATH,
+                ShellLink,
+            },
+            WindowsAndMessaging::{IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW},
+        },
     },
     core::{HSTRING, Interface, PCWSTR, Result, w},
 };
@@ -43,6 +52,26 @@ pub fn exe() -> Option<PathBuf> {
 /// `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Concord.lnk`
 fn link() -> Option<PathBuf> {
     Some(folder("APPDATA")?.join(r"Microsoft\Windows\Start Menu\Programs\Concord.lnk"))
+}
+
+/// `Concord.lnk` na Área de Trabalho. Pergunta ao Windows onde ela fica: com o OneDrive
+/// ligado ela mora em outra pasta, e `%USERPROFILE%\Desktop` não existe.
+fn desktop_link() -> Option<PathBuf> {
+    // SAFETY: o Windows devolve o texto alocado com `CoTaskMemAlloc`; copiamos e soltamos.
+    unsafe {
+        let text = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None).ok()?;
+        let dir = PathBuf::from(OsString::from_wide(text.as_wide()));
+        CoTaskMemFree(Some(text.as_ptr() as *const c_void));
+        Some(dir.join("Concord.lnk"))
+    }
+}
+
+/// Só na instalação (a primeira cópia): quem apagar o atalho da Área de Trabalho não o vê
+/// voltar, ao contrário do Menu Iniciar, que [`register`] refaz a cada abertura.
+pub fn desktop_shortcut(exe: &Path) {
+    if let Some(link) = desktop_link() {
+        let _ = shortcut(&link, exe);
+    }
 }
 
 /// Copia por um `.new` ao lado: queda no meio não deixa um `Concord.exe` pela metade. Lê
@@ -157,12 +186,30 @@ fn uninstall_entry(exe: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `Concord.exe --uninstall`, que "Aplicativos instalados" chama. Tira atalho, chave e o
-/// programa; a config em `%APPDATA%\Concord` e o login no cofre do Windows ficam.
+/// Sim/Não, com Não de padrão: apagar o login e a config não se desfaz.
+fn ask_wipe() -> bool {
+    // SAFETY: textos literais com terminador e sem janela dona; a caixa fecha antes de voltar.
+    unsafe {
+        MessageBoxW(
+            None,
+            w!("Apagar também as configurações e o login salvo do Concord?"),
+            w!("Desinstalar o Concord"),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+}
+
+/// `Concord.exe --uninstall`, que "Aplicativos instalados" chama. Tira atalhos, chave e o
+/// programa. Pergunta antes se apaga também a config em `%APPDATA%\Concord` e o login no
+/// cofre do Windows; sem "Sim" eles ficam.
 pub fn uninstall() {
     let Some(exe) = exe() else { return };
-    if let Some(link) = link() {
+    let wipe = ask_wipe();
+    for link in [link(), desktop_link()].into_iter().flatten() {
         let _ = fs::remove_file(link);
+    }
+    if let Some(dir) = super::config_dir() {
+        super::wipe_data(&dir, wipe, crate::session::delete_blocking);
     }
     // SAFETY: só apaga a chave do Concord no usuário.
     let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, UNINSTALL_KEY) };
