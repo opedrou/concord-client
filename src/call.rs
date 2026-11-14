@@ -41,6 +41,9 @@ pub const MAX_ATTEMPTS: u32 = 10;
 /// Atributo de participante com os nomes que esta pessoa deixou em volume zero.
 const MUTED_ATTRIBUTE: &str = "concord.muted";
 const MUTED_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Atributo de participante com os sids das transmissões que esta pessoa assiste: igual
+/// ao `concord.watching` da web (sids da tela, ordenados, separados por vírgula).
+const WATCHING_ATTRIBUTE: &str = "concord.watching";
 /// Sem isso um `close()` travado seguraria o `Ended` pra sempre.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -82,6 +85,9 @@ pub enum Event {
     },
     /// Lista inteira, a cada mudança.
     Participants(Vec<Live>),
+    /// Quem assiste a transmissão de cada um: identity de quem transmite -> identities de
+    /// quem assiste, o local primeiro. Só entra quem tem espectador.
+    Viewers(HashMap<String, Vec<String>>),
     Share(share::State),
     /// Áudio da transmissão no ar: a escolha e os apps tocando.
     ShareAudio(share::View),
@@ -357,6 +363,38 @@ fn encode_muted(names: &[String]) -> String {
     v.join(",")
 }
 
+/// Sids ordenados e sem repetição, separados por vírgula: o valor de `concord.watching`.
+fn encode_watching(sids: &[String]) -> String {
+    encode_muted(sids)
+}
+
+/// Lê um `concord.watching`: vazio e pedaços vazios não contam, como na web.
+fn parse_watching(value: &str) -> impl Iterator<Item = &str> {
+    value.split(',').filter(|s| !s.is_empty())
+}
+
+/// Quem assiste a transmissão de cada pessoa. `shares` é cada transmissor com os sids da
+/// tela dele; `watchers` é cada pessoa com o `concord.watching` dela, na ordem em que
+/// aparecem os avatares. Quem anuncia o sid de uma tela conta como espectador dela.
+fn viewers_by_sharer(
+    shares: &[(String, Vec<String>)],
+    watchers: &[(String, String)],
+) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for (sharer, sids) in shares {
+        for (who, attr) in watchers {
+            let list = out.entry(sharer.clone()).or_default();
+            if !list.contains(who) && parse_watching(attr).any(|s| sids.iter().any(|x| x == s)) {
+                list.push(who.clone());
+            }
+        }
+        if out.get(sharer).is_some_and(Vec::is_empty) {
+            out.remove(sharer);
+        }
+    }
+    out
+}
+
 /// Monta uma pessoa a partir das publicações. Sem mic publicado conta como mudo, a
 /// mesma regra do servidor em `/api/channels/presence`.
 fn live(
@@ -500,6 +538,11 @@ struct Session {
     last: Vec<Live>,
     /// Último `concord.muted` enviado nesta sala.
     sent_muted: String,
+    /// Último `concord.watching` enviado nesta sala; também vale como o valor local, que
+    /// o servidor só devolve depois.
+    sent_watching: String,
+    /// Último mapa de espectadores emitido.
+    last_viewers: HashMap<String, Vec<String>>,
     reconnecting: bool,
     speaking: HashSet<String>,
     /// Vídeo e áudio da transmissão assistida, por sid da publicação.
@@ -729,6 +772,8 @@ impl Task {
             voices: HashMap::new(),
             last: Vec::new(),
             sent_muted: String::new(),
+            sent_watching: String::new(),
+            last_viewers: HashMap::new(),
             reconnecting: false,
             speaking: HashSet::new(),
             watched: HashMap::new(),
@@ -740,6 +785,7 @@ impl Task {
         s.subscribe_all(ctl.watching.as_deref());
         s.peek_all(ctl.watching.as_deref());
         s.send_muted(&ctl.people);
+        s.send_watching(ctl.watching.as_deref());
         self.refresh(s);
         let mut debounce: Option<Instant> = None;
         loop {
@@ -769,7 +815,11 @@ impl Task {
                         ctl.people = p;
                         debounce = Some(Instant::now() + MUTED_DEBOUNCE);
                     }
-                    Some(Cmd::Watch(w)) => s.watch(ctl, w),
+                    Some(Cmd::Watch(w)) => {
+                        s.watch(ctl, w);
+                        s.send_watching(ctl.watching.as_deref());
+                        self.refresh(s);
+                    }
                     #[cfg(test)]
                     Some(Cmd::Simulate(scenario)) => {
                         let _ = s.room.simulate_scenario(scenario).await;
@@ -926,6 +976,7 @@ impl Task {
                 s.peek_all(ctl.watching.as_deref());
                 s.sent_muted.clear();
                 s.send_muted(&ctl.people);
+                s.sent_watching.clear();
             }
             RoomEvent::LocalTrackRepublished { publication, .. }
                 if publication.source() == TrackSource::Microphone =>
@@ -950,6 +1001,9 @@ impl Task {
                 | RoomEvent::Reconnecting
                 | RoomEvent::Reconnected
         ) {
+            s.send_watching(ctl.watching.as_deref());
+            self.refresh(s);
+        } else if matches!(event, RoomEvent::ParticipantAttributesChanged { .. }) {
             self.refresh(s);
         }
         None
@@ -965,6 +1019,11 @@ impl Task {
         if list != s.last {
             s.last.clone_from(&list);
             self.emit(Event::Participants(list));
+        }
+        let viewers = s.viewers();
+        if viewers != s.last_viewers {
+            s.last_viewers.clone_from(&viewers);
+            self.emit(Event::Viewers(viewers));
         }
     }
 }
@@ -1151,6 +1210,76 @@ impl Session {
         });
     }
 
+    /// Sids das telas de quem tem `Screenshare` publicado. O áudio do app é `Unknown`.
+    fn screen_sids<'a>(pubs: impl IntoIterator<Item = (&'a str, TrackSource)>) -> Vec<String> {
+        pubs.into_iter()
+            .filter(|(_, source)| *source == TrackSource::Screenshare)
+            .map(|(sid, _)| sid.to_owned())
+            .collect()
+    }
+
+    /// Espectadores de cada transmissão, a partir dos atributos de todos.
+    fn viewers(&self) -> HashMap<String, Vec<String>> {
+        let me = self.room.local_participant();
+        let mut shares = vec![(
+            me.identity().to_string(),
+            Self::screen_sids(
+                me.track_publications()
+                    .iter()
+                    .map(|(sid, p)| (sid.as_str(), p.source())),
+            ),
+        )];
+        let mut watchers = vec![(me.identity().to_string(), self.sent_watching.clone())];
+        let mut remotes: Vec<_> = self.room.remote_participants().values().cloned().collect();
+        remotes.sort_by_cached_key(|p| (p.name().to_lowercase(), p.identity().to_string()));
+        for p in remotes {
+            let identity = p.identity().to_string();
+            shares.push((
+                identity.clone(),
+                Self::screen_sids(
+                    p.track_publications()
+                        .iter()
+                        .map(|(sid, t)| (sid.as_str(), t.source())),
+                ),
+            ));
+            let attr = p
+                .attributes()
+                .remove(WATCHING_ATTRIBUTE)
+                .unwrap_or_default();
+            watchers.push((identity, attr));
+        }
+        viewers_by_sharer(&shares, &watchers)
+    }
+
+    /// Anuncia `concord.watching`: os sids da tela de quem está sendo assistido. Só se
+    /// mudou. A tela que ainda não chegou fica de fora e entra quando ela for publicada.
+    fn send_watching(&mut self, watching: Option<&str>) {
+        let sids: Vec<String> = self
+            .room
+            .remote_participants()
+            .values()
+            .filter(|p| watching == Some(p.identity().as_str()))
+            .flat_map(|p| {
+                Self::screen_sids(
+                    p.track_publications()
+                        .iter()
+                        .map(|(sid, t)| (sid.as_str(), t.source())),
+                )
+            })
+            .collect();
+        let value = encode_watching(&sids);
+        if value == self.sent_watching {
+            return;
+        }
+        self.sent_watching.clone_from(&value);
+        let me = self.room.local_participant();
+        tokio::spawn(async move {
+            let _ = me
+                .set_attributes(HashMap::from([(WATCHING_ATTRIBUTE.to_owned(), value)]))
+                .await;
+        });
+    }
+
     /// Saída limpa: sem isso o nome fica preso na lista do servidor até o timeout.
     async fn close(&self) -> End {
         let _ = timeout(CLOSE_TIMEOUT, self.room.close()).await;
@@ -1161,6 +1290,46 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watching_ordena_dedup_e_ignora_vazio() {
+        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(encode_watching(&[]), "");
+        assert_eq!(encode_watching(&v(&["TR_b", "TR_a", "TR_b"])), "TR_a,TR_b");
+        assert_eq!(parse_watching("").count(), 0);
+        assert_eq!(parse_watching(",,").count(), 0);
+        assert_eq!(parse_watching("a,,b,").collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    #[test]
+    fn espectadores_por_transmissao() {
+        let s = |x: &str| x.to_owned();
+        let shares = [
+            (s("eu"), vec![s("TR_eu")]),
+            (s("ana"), vec![s("TR_ana")]),
+            (s("bia"), vec![]),
+        ];
+        let w = |who: &str, attr: &str| (s(who), s(attr));
+        let watchers = [
+            w("eu", "TR_ana"),
+            w("ana", ""),
+            w("bia", "TR_ana,TR_eu"),
+            w("cai", "TR_ana,TR_ana"),
+            w("dan", "lixo,,TR_inexistente"),
+        ];
+        let v = viewers_by_sharer(&shares, &watchers);
+        assert_eq!(
+            v["ana"],
+            ["eu", "bia", "cai"],
+            "ordem dos watchers, sem repetir"
+        );
+        assert_eq!(v["eu"], ["bia"]);
+        assert!(
+            !v.contains_key("bia"),
+            "sem tela ou sem espectador não entra"
+        );
+        assert_eq!(v.len(), 2);
+    }
 
     #[test]
     fn so_tela_e_audio_de_app_esperam_o_assistir() {

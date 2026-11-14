@@ -977,6 +977,7 @@ impl App {
             call::Event::Participants(list) => active.participants(list, Instant::now()),
             call::Event::Share(state) => active.set_share(state),
             call::Event::ShareAudio(view) => active.set_share_audio(view),
+            call::Event::Viewers(viewers) => active.viewers = viewers,
             call::Event::Preview(identity, picture) => active.set_preview(identity, picture),
             call::Event::Ended(end) => return self.call_ended(end),
         }
@@ -1805,6 +1806,26 @@ mod tests {
     }
 
     #[test]
+    fn espectadores_viram_nomes_na_ordem_e_sem_quem_saiu() {
+        let mut a = in_call(&["Ana", "Bia", "Cai"]);
+        let id = call_id(&mut a);
+        assert!(call_of(&mut a).viewers_of("Ana__1").is_empty());
+        let quem = vec![
+            "Cai__1".to_owned(),
+            "Zeca__1".to_owned(),
+            "Bia__1".to_owned(),
+        ];
+        let _ = a.update(Msg::CallEvent(
+            id,
+            call::Event::Viewers(HashMap::from([("Ana__1".to_owned(), quem)])),
+        ));
+        assert_eq!(call_of(&mut a).viewers_of("Ana__1"), ["Cai", "Bia"]);
+        assert!(call_of(&mut a).viewers_of("Bia__1").is_empty());
+        let _ = a.update(Msg::CallEvent(id, call::Event::Viewers(HashMap::new())));
+        assert!(call_of(&mut a).viewers_of("Ana__1").is_empty());
+    }
+
+    #[test]
     fn assistir_tela_cheia_e_volta_quando_a_pessoa_para() {
         let mut a = in_call(&["Ana"]);
         let id = call_id(&mut a);
@@ -2433,6 +2454,29 @@ mod tests {
             (11, "palco-11"),
         ] {
             print(&palco(n).0, nome);
+        }
+        // Transmissão da Ana com 1, 3 e 5 espectadores, vista de quem não assiste.
+        for (quantos, nome) in [
+            (1, "tela-1-espectador"),
+            (3, "tela-3-espectadores"),
+            (5, "tela-5-espectadores"),
+        ] {
+            let (mut a, id) = palco(7);
+            let mut lista = call_of(&mut a).live.clone().unwrap();
+            lista
+                .iter_mut()
+                .filter(|l| l.name == "Ana")
+                .for_each(|l| l.screen_share = true);
+            let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
+            let quem = nomes[2..2 + quantos]
+                .iter()
+                .map(|n| format!("{n}__1"))
+                .collect();
+            let _ = a.update(Msg::CallEvent(
+                id,
+                call::Event::Viewers(HashMap::from([("Ana__1".to_owned(), quem)])),
+            ));
+            print(&a, nome);
         }
         // Fotos sintéticas: o fundo do tile toma a cor dominante de cada uma.
         let (mut a, _) = palco(4);

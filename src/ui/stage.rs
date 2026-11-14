@@ -35,6 +35,9 @@ const THUMB_NAME_SIZE: f32 = 12.0;
 const ABOVE_BAR: f32 = 94.0;
 /// Faixa do pé do palco onde o mouse faz a barra aparecer.
 const BAR_ZONE: f32 = 140.0;
+/// Espectadores desenhados no tile da transmissão: o resto vira "+N". Como no site.
+const MAX_VIEWERS: usize = 3;
+const VIEWER_FACE: f32 = 18.0;
 /// Coluna das pessoas ao lado da transmissão grande.
 const SIDE: Size = Size::new(240.0, 135.0);
 
@@ -119,7 +122,7 @@ fn focus<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) ->
         .find(|p| Some(&p.identity) == call.watching.as_ref());
     let big: Element<'_, Msg> = match watched {
         Some(p) => {
-            let body = stack![screen_image(call, 15.0), screen_tag(p, area.width)];
+            let body = stack![screen_image(call, 15.0), screen_tag(m, call, p, area.width)];
             mouse_area(
                 container(body)
                     .width(Length::Fill)
@@ -136,7 +139,7 @@ fn focus<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) ->
     let others = live
         .iter()
         .filter(|p| p.screen_share && Some(&p.identity) != call.watching.as_ref())
-        .map(|p| screen_tile(call, p, SIDE))
+        .map(|p| screen_tile(m, call, p, SIDE))
         .chain(live.iter().map(|p| tile(m, call, p, SIDE)));
     let side = scrollable(Column::with_children(others).spacing(GAP))
         .width(SIDE.width)
@@ -173,8 +176,41 @@ fn screen_image(call: &ActiveCall, loading: f32) -> Element<'_, Msg> {
     }
 }
 
-/// "Nome · tela" com o selo, no canto de baixo.
-fn screen_tag(p: &Live, width: f32) -> Element<'_, Msg> {
+/// Avatares de quem assiste, até [`MAX_VIEWERS`], e "+N" pro resto. Vazio sem espectador.
+fn viewers<'a>(m: &'a Main, names: &[&str]) -> Option<Element<'a, Msg>> {
+    if names.is_empty() {
+        return None;
+    }
+    let faces = names
+        .iter()
+        .take(MAX_VIEWERS)
+        .map(|n| avatar::view(n, m.avatar(n), VIEWER_FACE));
+    let more = (names.len() > MAX_VIEWERS).then(|| {
+        text(format!("+{}", names.len() - MAX_VIEWERS))
+            .size(11)
+            .color(FG2)
+    });
+    let tip = if names.len() == 1 {
+        format!("{} está assistindo", names[0])
+    } else {
+        format!("{} pessoas assistindo: {}", names.len(), names.join(", "))
+    };
+    Some(tipped(
+        Row::with_children(faces)
+            .push(more)
+            .spacing(3)
+            .align_y(Alignment::Center)
+            .into(),
+        tip,
+    ))
+}
+
+/// "Nome · tela" com o selo e os espectadores, no canto de baixo.
+fn screen_tag<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, width: f32) -> Element<'a, Msg> {
+    let names = call.viewers_of(&p.identity);
+    // O nome cede o que os avatares e o "+N" ocupam.
+    let faces = names.len().min(MAX_VIEWERS) as f32 * (VIEWER_FACE + 3.0)
+        + if names.len() > MAX_VIEWERS { 24.0 } else { 0.0 };
     let label = text(Config::screen_key(voice::name_of(p)))
         .size(13)
         .font(theme::SEMIBOLD)
@@ -182,9 +218,10 @@ fn screen_tag(p: &Live, width: f32) -> Element<'_, Msg> {
     let tag = row![
         live_badge(),
         container(label)
-            .max_width((width - 110.0).max(40.0))
+            .max_width((width - 110.0 - faces).max(40.0))
             .clip(true)
     ]
+    .push(viewers(m, &names))
     .spacing(6)
     .align_y(Alignment::Center);
     container(container(tag).padding([5, 10]).style(theme::pill))
@@ -208,7 +245,7 @@ fn grid<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) -> 
     let rows = cells.chunks(cols).map(|chunk| {
         Row::with_children(chunk.iter().map(|&(p, screen)| {
             if screen {
-                screen_tile(call, p, size)
+                screen_tile(m, call, p, size)
             } else {
                 tile(m, call, p, size)
             }
@@ -274,9 +311,9 @@ fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Eleme
 
 /// Tile da transmissão de alguém. Sem assistir: a prévia borrada e o botão. Assistindo: o
 /// vídeo, com tela cheia e parar no canto.
-fn screen_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
+fn screen_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
     if p.is_local {
-        return own_tile(call, p, size);
+        return own_tile(m, call, p, size);
     }
     let watching = call.watching.as_ref() == Some(&p.identity);
     let mut body = stack![];
@@ -312,7 +349,7 @@ fn screen_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a,
                 .style(theme::fill(Color::from_rgba8(0, 0, 0, 0.45))),
         );
     }
-    body = body.push(screen_tag(p, size.width));
+    body = body.push(screen_tag(m, call, p, size.width));
     let tile = container(body)
         .width(size.width)
         .height(size.height)
@@ -329,7 +366,7 @@ fn screen_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a,
 
 /// Tile da própria transmissão: a prévia do que sai, com Trocar no canto. Sem foco a
 /// prévia para no último quadro, com o aviso.
-fn own_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
+fn own_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
     let preview: Element<'_, Msg> = match &call.own {
         Some(a) => image(a.handle().clone())
             .width(Length::Fill)
@@ -359,7 +396,7 @@ fn own_tile<'a>(call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Ms
     });
     let body = stack![preview, corner(swap.into(), true)]
         .push(paused)
-        .push(screen_tag(p, size.width));
+        .push(screen_tag(m, call, p, size.width));
     // Fundo de tile, não de palco: carregando, o tile não some no escuro.
     container(body)
         .width(size.width)
