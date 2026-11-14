@@ -1,6 +1,6 @@
 [package]
 name = "concord-client"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 license = "MIT"
 description = "Cliente desktop nativo do Concord"
