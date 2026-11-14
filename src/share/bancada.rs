@@ -559,10 +559,16 @@ async fn bancada_ouve() {
     }
     let _chrome = Killed(
         Command::new("node")
-            .arg(format!("{}/ouvinte.mjs", option_env!("CONCORD_BANCADA").unwrap_or_default()))
+            .arg(format!(
+                "{}/ouvinte.mjs",
+                option_env!("CONCORD_BANCADA").unwrap_or_default()
+            ))
             .env(
                 "FAKE_WAV",
-                format!("{}/Portuguese_stable.wav", option_env!("CONCORD_VOZES").unwrap_or_default()),
+                format!(
+                    "{}/Portuguese_stable.wav",
+                    option_env!("CONCORD_VOZES").unwrap_or_default()
+                ),
             )
             .env("WAIT_MS", "900000")
             .spawn()
