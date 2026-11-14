@@ -7,7 +7,7 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length, Padding, border, mouse};
 
 use super::theme::{self, ACCENT2, BG2, BG3, BORDER, DANGER, FG, FG2, FG3, GREEN, IDLE};
-use super::{FALHAS_ATE_AVISAR, Main, Msg, Tab, avatar, voice};
+use super::{FALHAS_ATE_AVISAR, Main, Msg, Tab, avatar, chat, voice};
 use crate::api::{self, Channel, ChannelKind};
 use crate::config::Config;
 
@@ -17,7 +17,7 @@ macro_rules! icon {
     };
 }
 
-const HASH: &[u8] = icon!("hash");
+pub const HASH: &[u8] = icon!("hash");
 const SPEAKER: &[u8] = icon!("speaker");
 pub const MIC: &[u8] = icon!("mic");
 pub const MIC_OFF: &[u8] = icon!("mic-off");
@@ -87,10 +87,14 @@ pub fn view<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
     .width(Length::Fill);
 
     let of_kind = |kind| m.channels.iter().filter(move |c: &&Channel| c.kind == kind);
-    let text_rows = of_kind(ChannelKind::Text).map(|c| channel_row(HASH, &c.name, None));
+    let text_rows = of_kind(ChannelKind::Text).map(|c| {
+        let open = m.chat.as_ref().is_some_and(|chat| chat.channel == c.id);
+        let go = Some((Msg::Chat(c.id, chat::Msg::Open), open));
+        channel_row(HASH, &c.name, go)
+    });
     let voice_rows = of_kind(ChannelKind::Voice).map(|c| {
         let active = m.call.as_ref().filter(|call| call.slug == c.slug);
-        let go = Some((c.slug.clone(), active.is_some()));
+        let go = Some((Msg::JoinChannel(c.slug.clone()), active.is_some()));
         let people = match active.and_then(|call| call.live.as_ref()) {
             // Na call ativa a lista vem da sala, não do polling.
             Some(live) => live
@@ -182,11 +186,11 @@ fn section<'a>(title: &'a str, rows: impl Iterator<Item = Element<'a, Msg>>) -> 
     column![label, Column::with_children(rows).spacing(4).padding(8)].into()
 }
 
-/// `go` é o slug e se a call está nele. Canal de texto não tem clique: fica pra Fase 7.
+/// `go` é o clique e se o canal está aberto: o chat, ou a call nele.
 fn channel_row<'a>(
     glyph: &'static [u8],
     name: &'a str,
-    go: Option<(String, bool)>,
+    go: Option<(Msg, bool)>,
 ) -> Element<'a, Msg> {
     let active = go.as_ref().is_some_and(|(_, active)| *active);
     let icon_color = if active {
@@ -199,11 +203,11 @@ fn channel_row<'a>(
         .spacing(9)
         .align_y(Alignment::Center);
     match go {
-        Some((slug, active)) => button(line)
+        Some((msg, active)) => button(line)
             .padding([8, 9])
             .width(Length::Fill)
             .style(theme::nav_item(active))
-            .on_press(Msg::JoinChannel(slug))
+            .on_press(msg)
             .into(),
         None => container(line.height(Length::Shrink))
             .padding([8, 9])

@@ -96,6 +96,84 @@ pub struct Member {
     pub avatar_url: Option<String>,
 }
 
+/// Mensagem de canal de texto. `created_at` em ms desde 1970.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Message {
+    pub id: i64,
+    pub author_id: Option<i64>,
+    pub author_name: String,
+    pub content: String,
+    pub created_at: i64,
+    pub attachment: Option<Attachment>,
+}
+
+/// Nome, tipo e tamanho vêm do corpo de quem mandou, sem conferência no servidor: só a
+/// `url` é gerada lá.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Attachment {
+    pub url: String,
+    pub name: String,
+    pub kind: Kind,
+    /// `f64` porque qualquer número passa no servidor: negativo ou quebrado não derruba a
+    /// página inteira.
+    size: f64,
+}
+
+impl Attachment {
+    pub fn size(&self) -> u64 {
+        self.size as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Image,
+    Video,
+    Audio,
+    #[serde(other)]
+    File,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Page {
+    /// Em ordem cronológica.
+    pub messages: Vec<Message>,
+    pub has_more: bool,
+}
+
+/// Recibo do upload. Volta inteiro no POST da mensagem.
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
+pub struct Uploaded {
+    pub path: String,
+    pub name: String,
+    pub mime: String,
+    pub kind: String,
+    pub size: u64,
+}
+
+/// Evento do SSE do canal.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ChatEvent {
+    Created {
+        message: Message,
+    },
+    #[serde(rename_all = "camelCase")]
+    Deleted {
+        message_id: i64,
+    },
+}
+
+/// Mesmo teto do servidor (`MAX_ATTACHMENT_BYTES`), abaixo dos 100 MB do Cloudflare.
+pub const MAX_ANEXO: u64 = 95 * 1024 * 1024;
+/// Upload de 95 MiB numa conexão lenta.
+const ENVIO: Duration = Duration::from_secs(30 * 60);
+/// O SSE fica aberto: quem vê se morreu é o leitor, pelo ping de 25 s.
+const ABERTO: Duration = Duration::from_secs(24 * 3600);
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionDetails {
@@ -289,13 +367,105 @@ impl Client {
 
     async fn json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
         let resp = self.get(path).send().await.map_err(|_| Error::Offline)?;
-        let bytes = read_limited(check(resp)?, MAX_JSON).await?;
-        serde_json::from_slice(&bytes).map_err(|_| Error::NotConcord)
+        parse(resp).await
+    }
+
+    /// Página do histórico, em ordem cronológica. `before` é o id da mais antiga já na tela.
+    pub async fn messages(
+        &self,
+        channel: i64,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<Page, Error> {
+        let mut req = self
+            .get(&format!("/api/channels/{channel}/messages"))
+            .query(&[("limit", limit)]);
+        if let Some(before) = before {
+            req = req.query(&[("before", before)]);
+        }
+        parse(req.send().await.map_err(|_| Error::Offline)?).await
+    }
+
+    pub async fn send_message(
+        &self,
+        channel: i64,
+        content: &str,
+        attachment: Option<&Uploaded>,
+    ) -> Result<Message, Error> {
+        let url = format!("{}/api/channels/{channel}/messages", self.base);
+        let req = self
+            .authed(self.http.post(url))
+            .json(&json!({ "content": content, "attachment": attachment }));
+        parse(req.send().await.map_err(|_| Error::Offline)?).await
+    }
+
+    /// 403 quando não é a própria mensagem nem admin.
+    pub async fn delete_message(&self, channel: i64, id: i64) -> Result<(), Error> {
+        let url = format!("{}/api/channels/{channel}/messages/{id}", self.base);
+        let resp = self.authed(self.http.delete(url)).send().await;
+        check(resp.map_err(|_| Error::Offline)?).map(drop)
+    }
+
+    /// Corpo bruto, como a web: o servidor grava em stream. `sent` recebe quantos bytes já
+    /// foram entregues pra rede, e o total. 413 é arquivo grande demais.
+    pub async fn upload(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+        mut sent: impl FnMut(u64, u64) + Send + Sync + 'static,
+    ) -> Result<Uploaded, Error> {
+        const PEDACO: usize = 256 * 1024;
+        let total = bytes.len();
+        let chunks = futures_util::stream::iter((0..total).step_by(PEDACO).map(move |at| {
+            let end = (at + PEDACO).min(total);
+            sent(end as u64, total as u64);
+            Ok::<_, std::io::Error>(bytes[at..end].to_vec())
+        }));
+        let url = format!("{}/api/attachments", self.base);
+        let req = self
+            .authed(self.http.post(url))
+            .query(&[("name", name)])
+            .header(header::CONTENT_LENGTH, total)
+            .timeout(ENVIO)
+            .body(reqwest::Body::wrap_stream(chunks));
+        parse(req.send().await.map_err(|_| Error::Offline)?).await
+    }
+
+    /// Bytes de um anexo, até `max`. `url` vem do servidor: só caminho de anexo passa.
+    pub async fn attachment(&self, url: &str, max: usize) -> Result<Vec<u8>, Error> {
+        if !is_server_path(url, "/api/attachments/") {
+            return Err(Error::NotConcord);
+        }
+        let resp = self.get(url).timeout(ENVIO).send().await;
+        read_limited(check(resp.map_err(|_| Error::Offline)?)?, max).await
+    }
+
+    /// SSE do canal, já com a resposta 200: a partir daqui o servidor entrega os eventos.
+    pub async fn message_stream(&self, channel: i64) -> Result<Response, Error> {
+        let req = self
+            .get(&format!("/api/channels/{channel}/messages/stream"))
+            .header(header::ACCEPT, "text/event-stream")
+            .timeout(ABERTO);
+        let resp = tokio::time::timeout(Duration::from_secs(15), req.send()).await;
+        check(
+            resp.map_err(|_| Error::Offline)?
+                .map_err(|_| Error::Offline)?,
+        )
     }
 }
 
+async fn parse<T: DeserializeOwned>(resp: Response) -> Result<T, Error> {
+    let bytes = read_limited(check(resp)?, MAX_JSON).await?;
+    serde_json::from_slice(&bytes).map_err(|_| Error::NotConcord)
+}
+
 fn is_avatar_path(path: &str) -> bool {
-    path.starts_with("/api/avatars/") && !path.contains("..")
+    is_server_path(path, "/api/avatars/")
+}
+
+/// Caminho que vem do servidor e leva o cookie: tem que ficar nele.
+fn is_server_path(path: &str, prefix: &str) -> bool {
+    path.starts_with(prefix) && !path.contains("..")
 }
 
 fn check(resp: Response) -> Result<Response, Error> {
@@ -455,6 +625,18 @@ mod tests {
         assert!(!is_avatar_path("https://evil.com/api/avatars/3"));
         assert!(!is_avatar_path("//evil.com/api/avatars/3"));
         assert!(!is_avatar_path("/api/avatars/../auth/me"));
+        assert!(is_server_path(
+            "/api/attachments/8?v=a.png",
+            "/api/attachments/"
+        ));
+        assert!(!is_server_path(
+            "https://evil.com/api/attachments/8",
+            "/api/attachments/"
+        ));
+        assert!(!is_server_path(
+            "/api/attachments/../auth/me",
+            "/api/attachments/"
+        ));
     }
 
     #[test]

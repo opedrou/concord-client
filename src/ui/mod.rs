@@ -1,5 +1,6 @@
 //! Telas e estado do app. A rede roda em `Task`; o resto é síncrono.
 mod avatar;
+mod chat;
 mod screens;
 mod sidebar;
 mod sounds;
@@ -120,6 +121,8 @@ struct Main {
     update: Option<String>,
     /// Última conferência de atualização, pra linha do Sobre.
     check: Option<Check>,
+    /// Canal de texto aberto no lugar do palco.
+    chat: Option<chat::Chat>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -240,6 +243,8 @@ pub enum Msg {
     FocusNext,
     FocusPrevious,
     Escape,
+    /// Canal de texto, pelo id: respostas de outro canal caem fora.
+    Chat(i64, chat::Msg),
 }
 
 /// Telas e janelas pro seletor do Windows. Listar e tirar as miniaturas bloqueia: lê fora
@@ -362,6 +367,9 @@ impl App {
             if m.resizing {
                 subs.push(event::listen_with(drag));
             }
+            if let Some(open) = &m.chat {
+                subs.push(open.subscription(&m.client));
+            }
         }
         Subscription::batch(subs)
     }
@@ -376,9 +384,10 @@ impl App {
                 if let Some(call) = m.call.as_ref().filter(|c| c.fullscreen()) {
                     return stage::full(call, &self.config);
                 }
-                let content = match &m.call {
-                    Some(call) => stage::view(m, call, &self.config),
-                    None => screens::home(&m.user.username, m.notice.as_deref()),
+                let content = match (&m.chat, &m.call) {
+                    (Some(open), _) => chat::view(m, open),
+                    (None, Some(call)) => stage::view(m, call, &self.config),
+                    (None, None) => screens::home(&m.user.username, m.notice.as_deref()),
                 };
                 let base = row![
                     sidebar::view(m, &self.config),
@@ -884,6 +893,40 @@ impl App {
             Msg::Logout => self.logout(),
             Msg::FocusNext => operation::focus_next(),
             Msg::FocusPrevious => operation::focus_previous(),
+            Msg::Chat(channel, msg) => self.chat(channel, msg),
+        }
+    }
+
+    /// Canal de texto: abre no lugar do palco, e a call continua por trás.
+    fn chat(&mut self, channel: i64, msg: chat::Msg) -> Task<Msg> {
+        let Screen::Main(m) = &mut self.screen else {
+            return Task::none();
+        };
+        match msg {
+            chat::Msg::Open => {
+                let text = |c: &&Channel| c.id == channel && c.kind == ChannelKind::Text;
+                let Some(c) = m.channels.iter().find(text) else {
+                    return Task::none();
+                };
+                if m.chat.as_ref().is_some_and(|open| open.channel == channel) {
+                    return Task::none();
+                }
+                let (open, task) = chat::Chat::open(&m.client, c);
+                m.chat = Some(open);
+                task
+            }
+            chat::Msg::Close => {
+                m.chat = None;
+                Task::none()
+            }
+            chat::Msg::Expired => self.session_expired(),
+            msg => match m.chat.as_mut().filter(|open| open.channel == channel) {
+                Some(open) => {
+                    let task = open.update(msg, &m.client);
+                    Task::batch([task, m.fetch_avatars()])
+                }
+                None => Task::none(),
+            },
         }
     }
 
@@ -981,6 +1024,10 @@ impl App {
             .iter()
             .any(|c| c.slug == slug && c.kind == ChannelKind::Voice);
         let same = m.call.as_ref().is_some_and(|c| c.slug == slug);
+        // Canal de voz sai do chat: o da call volta pra ela, outro entra.
+        if is_voice {
+            m.chat = None;
+        }
         if !is_voice || same || m.closing.is_some() {
             return Task::none();
         }
@@ -1273,6 +1320,7 @@ impl App {
             closing: None,
             update: None,
             check: None,
+            chat: None,
         };
         let avatars = main.fetch_avatars();
         self.screen = Screen::Main(Box::new(main));
@@ -1407,13 +1455,14 @@ impl Main {
         }
     }
 
-    /// Só baixa quem aparece na tela: quem está em canal, e a própria pessoa.
+    /// Só baixa quem aparece na tela: quem está em canal, no chat aberto, e a própria pessoa.
     fn fetch_avatars(&mut self) -> Task<Msg> {
         let mut paths: Vec<String> = self
             .presence
             .values()
             .flatten()
             .map(|p| p.display_name())
+            .chain(self.chat.iter().flat_map(chat::Chat::authors))
             .chain([self.user.username.as_str()])
             .filter_map(|name| self.avatar_paths.get(name))
             .filter(|path| !self.requested.contains(*path))
