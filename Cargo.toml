@@ -49,6 +49,12 @@ livekit = { version = "0.10", features = ["glib-main-loop"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
 
+# Cópia do livekit 0.10.1 com um patch: manda TF_STEREO quando a fonte tem 2 canais, como o
+# livekit-client. Sem isso o áudio da transmissão chega mono (`vendor/livekit`, procurar
+# "Concord:"). Até o 0.11.0 o crate não manda. Subir o livekit exige copiar de novo.
+[patch.crates-io]
+livekit = { path = "vendor/livekit" }
+
 [build-dependencies]
 # Ícone embutido no .exe do Windows (`build.rs`).
 winresource = "0.1"

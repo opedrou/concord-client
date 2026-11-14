@@ -463,7 +463,14 @@ impl LocalParticipant {
                     }];
                 }
             }
-            LocalTrack::Audio(_audio_track) => {
+            LocalTrack::Audio(audio_track) => {
+                // Concord: a mudança desta cópia. O 0.10.1 original tinha `_audio_track` e
+                // nunca mandava TF_STEREO. Sem ele o SFU responde o opus sem `stereo=1` e o
+                // encoder sai mono, mesmo com a fonte em 2 canais. Mesma regra do
+                // livekit-client: mais de um canal na fonte é estéreo.
+                if audio_track.rtc_source().num_channels() > 1 {
+                    req.audio_features.push(proto::AudioTrackFeature::TfStereo as i32);
+                }
                 // Setup audio encoding
                 let audio_encoding =
                     options.audio_encoding.as_ref().unwrap_or(&options::audio::MUSIC.encoding);

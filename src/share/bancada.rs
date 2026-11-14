@@ -507,10 +507,13 @@ async fn bancada_tela_audio() {
             .expect("node")
     });
     sleep(Duration::from_secs(10)).await;
-    println!("{}", som_enviado(&me).await);
+    let enviado = som_enviado(&me).await;
+    println!("{enviado}");
     let web = web.await.unwrap();
     let saida = String::from_utf8_lossy(&web.stdout);
     println!("{saida}{}", String::from_utf8_lossy(&web.stderr));
+    // Sem `stereo=1` na resposta do SFU o encoder sai mono, com a fonte em 2 canais.
+    assert!(enviado.contains("stereo=1"), "o áudio saiu mono");
     let depois = saida
         .lines()
         .find(|l| l.starts_with("DEPOIS"))
@@ -528,7 +531,12 @@ async fn bancada_tela_audio() {
     assert_eq!(banca.estado().await, State::Live);
     som_no_ar(&me).await;
     sleep(Duration::from_secs(3)).await;
-    println!("SALA NOVA {}", som_enviado(&me).await);
+    let enviado = som_enviado(&me).await;
+    println!("SALA NOVA {enviado}");
+    assert!(
+        enviado.contains("stereo=1"),
+        "o áudio saiu mono na sala nova"
+    );
     assert_eq!(ABERTAS.load(Ordering::SeqCst), 1, "abriu o seletor de novo");
 
     banca.parar(&me).await;

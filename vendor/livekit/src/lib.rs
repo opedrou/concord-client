@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![doc = include_str!("../README.md")]
+// Concord: no original, `#![doc = include_str!("../README.md")]`, e o README não veio na
+// cópia. Os avisos ficam calados como num crate do crates.io, que o cargo compila com
+// `--cap-lints`. A mudança de verdade está em `room/participant/local_participant.rs`.
+#![allow(warnings)]
 
 mod plugin;
 pub mod proto;
