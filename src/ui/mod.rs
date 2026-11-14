@@ -1030,7 +1030,10 @@ impl App {
             }
             call::Event::Reconnecting { attempt } => {
                 active.status = voice::Status::Reconnecting(attempt);
+                active.unstable = false;
             }
+            call::Event::Recording(on) => active.recording = on,
+            call::Event::Unstable(on) => active.unstable = on,
             call::Event::Participants(list) => active.participants(list, Instant::now()),
             call::Event::Share(state) => active.set_share(state),
             call::Event::ShareAudio(view) => active.set_share_audio(view),
@@ -2406,6 +2409,21 @@ mod tests {
         assert!(!main_of(&mut a).open);
     }
 
+    #[test]
+    fn avisos_de_gravacao_e_conexao_seguem_os_eventos() {
+        let mut a = voice_app();
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Recording(true)));
+        let _ = a.update(Msg::CallEvent(id, call::Event::Unstable(true)));
+        assert!(call_of(&mut a).recording && call_of(&mut a).unstable);
+        // Cair e reconectar apaga o aviso de rede ruim; a gravação vem de novo na sala nova.
+        let _ = a.update(Msg::CallEvent(id, call::Event::Reconnecting { attempt: 1 }));
+        assert!(call_of(&mut a).recording && !call_of(&mut a).unstable);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Recording(false)));
+        assert!(!call_of(&mut a).recording);
+    }
+
     /// Gera `snapshots/*.png` sem abrir janela: `cargo test -- --ignored prints`.
     #[test]
     #[ignore]
@@ -2659,6 +2677,15 @@ mod tests {
         let _ = a.update(Msg::ToggleDeafen);
         a.config.volumes.insert("Ana".into(), 40);
         print(&a, "palco-surdo-volume");
+
+        // Avisos da web: selo de quem não me ouve, gravação e conexão instável (no meu tile).
+        let (mut a, id) = palco(4);
+        let mut lista = call_of(&mut a).live.clone().unwrap();
+        lista[1].not_hearing_me = true;
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
+        let _ = a.update(Msg::CallEvent(id, call::Event::Recording(true)));
+        let _ = a.update(Msg::CallEvent(id, call::Event::Unstable(true)));
+        print(&a, "palco-avisos");
 
         // Transmissão: painel de qualidade, seletor do sistema, no ar e falha.
         let (mut a, id) = palco(4);

@@ -939,3 +939,84 @@ async fn bancada_camera() {
     assert!(voltou >= 20, "câmera de volta: {voltou}");
     assert_eq!(saiu, 0, "quadro depois de sair");
 }
+
+/// Espera `quem` na lista com `not_hearing_me` igual a `esperado`, ou desiste em `tempo`.
+async fn nao_ouve(
+    events: &mut UnboundedReceiver<Event>,
+    quem: &str,
+    esperado: bool,
+    tempo: Duration,
+) -> bool {
+    timeout(tempo, async {
+        loop {
+            if let Event::Participants(list) = evento(events).await
+                && list
+                    .iter()
+                    .any(|p| p.identity == quem && p.not_hearing_me == esperado)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Selo de "não está te ouvindo": o Chrome muta o cliente pelo card de volume, o atributo
+/// `concord.muted` chega e `not_hearing_me` acende; desmutar apaga. Rode por
+/// `src/audio/bancada.sh bancada_avisos`, com as variáveis do `share/bancada.sh` e `OUT`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bancada_avisos() {
+    use crate::audio::bancada::Killed;
+    assert!(
+        std::env::var_os("BANCADA_RAIZ").is_some(),
+        "rode por src/audio/bancada.sh, num PipeWire próprio"
+    );
+    let _ = Command::new("pactl")
+        .args(["load-module", "module-null-sink", "sink_name=bancada"])
+        .output();
+    let prefs = AudioPrefs {
+        input: None,
+        output: None,
+        noise: NoiseLevel::Off,
+        sensitivity: Sensitivity::Auto,
+        master: 71,
+        volumes: HashMap::new(),
+    };
+    let (engine, mic) = Engine::start(prefs).expect("motor");
+    let (call, mut events) = Call::join_with(
+        cliente().await,
+        var("CONCORD_ROOM"),
+        "bancada-avisos".to_owned(),
+        engine,
+        mic,
+        true,
+        sintetica,
+    );
+    while !matches!(evento(&mut events).await, Event::Connected) {}
+    let mut chrome = Killed(
+        Command::new("node")
+            .arg("src/share/avisos.mjs")
+            .spawn()
+            .expect("node"),
+    );
+    // O Chrome entra e ninguém o silenciou: o selo ainda não existe.
+    let quem = loop {
+        if let Event::Participants(list) = evento(&mut events).await
+            && let Some(p) = list.iter().find(|p| !p.is_local)
+        {
+            assert!(!p.not_hearing_me, "selo antes de mutar");
+            break p.identity.clone();
+        }
+    };
+    let ligou = nao_ouve(&mut events, &quem, true, Duration::from_secs(40)).await;
+    println!("SELO LIGOU: {ligou}");
+    let apagou = nao_ouve(&mut events, &quem, false, Duration::from_secs(40)).await;
+    println!("SELO APAGOU: {apagou}");
+    let _ = chrome.0.wait();
+    call.leave();
+    while !matches!(evento(&mut events).await, Event::Ended(_)) {}
+    assert!(ligou, "o Chrome mutou e o selo não acendeu");
+    assert!(apagou, "o Chrome desmutou e o selo não apagou");
+}

@@ -17,6 +17,9 @@ use crate::call::{Live, MAX_ATTEMPTS};
 use crate::config::{Config, SCREEN as SCREEN_KEY};
 use crate::share::{Quality, Source, State};
 
+const ALERT: &[u8] = include_bytes!("../../assets/icons/alert-triangle.svg").as_slice();
+const VIDEO: &[u8] = include_bytes!("../../assets/icons/video.svg").as_slice();
+
 /// Largura fixa e altura aproximada do painel de volume, pra centrar no tile.
 const PANEL: Size = Size::new(280.0, 104.0);
 /// Largura do painel de qualidade.
@@ -56,6 +59,9 @@ pub fn view<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Elemen
     let mut layers = vec![container(base).style(theme::fill(theme::STAGE)).into()];
     if let Status::Reconnecting(n) = call.status {
         layers.push(banner(n));
+    }
+    if call.recording {
+        layers.push(recording());
     }
     overlays(call, config, &mut layers);
     stack(layers).into()
@@ -284,6 +290,13 @@ fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Eleme
                 .max_width(size.width - if p.screen_share { 110.0 } else { 70.0 })
                 .clip(true),
         )
+        // Como na web: alto-falante cortado (o mic dela pode estar aberto, o que não chega é a
+        // minha voz) e, só no meu tile, o aviso de rede ruim.
+        .push(
+            p.not_hearing_me
+                .then(|| tipped(icon(VOLUME_X, 14.0, IDLE), "Não está te ouvindo")),
+        )
+        .push((p.is_local && call.unstable).then(unstable_tag))
         .spacing(6)
         .align_y(Alignment::Center);
     let tag = container(tag).padding([5, 10]).style(theme::pill);
@@ -531,6 +544,50 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     )
     .padding([8, 10])
     .style(theme::bar)
+    .into()
+}
+
+/// "Conexão instável" no tile da própria pessoa: triângulo e texto vermelhos, como na web.
+fn unstable_tag<'a>() -> Element<'a, Msg> {
+    row![
+        icon(ALERT, 14.0, DANGER),
+        text("Conexão instável")
+            .size(12)
+            .font(theme::SEMIBOLD)
+            .color(DANGER)
+            .wrapping(Wrapping::None)
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// Gravação em andamento, como na web: moldura vermelha no palco e o aviso no canto.
+fn recording<'a>() -> Element<'a, Msg> {
+    let frame = container(space())
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            border: border::width(3).color(DANGER),
+            ..Default::default()
+        });
+    let label = row![
+        icon(VIDEO, 16.0, DANGER),
+        text("Esta reunião está sendo gravada")
+            .size(13.5)
+            .font(theme::SEMIBOLD)
+            .color(IDLE)
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let note = container(label).padding([7, 14]).style(theme::tooltip);
+    stack![
+        frame,
+        container(note)
+            .align_right(Length::Fill)
+            .align_top(Length::Fill)
+            .padding(14)
+    ]
     .into()
 }
 
