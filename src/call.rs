@@ -727,10 +727,14 @@ fn always_subscribed(source: TrackSource) -> bool {
     matches!(source, TrackSource::Microphone | TrackSource::Camera)
 }
 
-/// Faixas que só são assinadas por quem clicou em Assistir: a tela e o áudio de app,
-/// pelo nome que o site usa.
+/// Faixas que só são assinadas por quem clicou em Assistir: a tela, o áudio de app do
+/// desktop, pelo nome, e o áudio da tela do navegador, que chega como `ScreenshareAudio`
+/// sem nome.
 fn is_watch_track(source: TrackSource, name: &str) -> bool {
-    source == TrackSource::Screenshare || name == share::TRACK
+    matches!(
+        source,
+        TrackSource::Screenshare | TrackSource::ScreenshareAudio
+    ) || name == share::TRACK
 }
 
 /// Fechar o motor antes da faixa, abrir a faixa antes do motor: nenhum bloco sai
@@ -1031,7 +1035,7 @@ impl Task {
                 track: RemoteTrack::Audio(audio),
                 publication,
                 participant,
-            } if publication.name() == share::TRACK
+            } if is_watch_track(publication.source(), &publication.name())
                 && ctl.watching.as_deref() == Some(participant.identity().as_str()) =>
             {
                 let sid = publication.sid().to_string();
@@ -1213,6 +1217,15 @@ fn log_event(event: &RoomEvent) {
         RoomEvent::Reconnected => log!("sala: reconectou pelo SDK"),
         RoomEvent::ParticipantConnected(p) => log!("sala: {} entrou", p.identity()),
         RoomEvent::ParticipantDisconnected(p) => log!("sala: {} saiu", p.identity()),
+        // O que não é assinado não aparece no "assinou": sem isto, faixa ignorada some do log.
+        RoomEvent::TrackPublished {
+            publication,
+            participant,
+        } => log!(
+            "sala: {} publicou {}",
+            participant.identity(),
+            track(publication)
+        ),
         RoomEvent::TrackSubscribed {
             publication,
             participant,
@@ -1515,6 +1528,8 @@ mod tests {
     fn so_tela_e_audio_de_app_esperam_o_assistir() {
         assert!(is_watch_track(TrackSource::Screenshare, "screen_share"));
         assert!(is_watch_track(TrackSource::Unknown, share::TRACK));
+        // A tela com áudio do navegador: sem isto a transmissão do site chegava muda.
+        assert!(is_watch_track(TrackSource::ScreenshareAudio, ""));
         assert!(!is_watch_track(TrackSource::Microphone, "microphone"));
         assert!(!is_watch_track(TrackSource::Unknown, "outra"));
     }
