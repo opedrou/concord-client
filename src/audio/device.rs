@@ -63,8 +63,22 @@ pub fn list() -> Devices {
     }
 }
 
-fn find(mut list: impl Iterator<Item = Device>, name: &str) -> Option<Device> {
-    list.find(|d| name_of(d).as_deref() == Some(name))
+/// O salvo, se está ligado, senão o padrão, sempre pelo dispositivo concreto da lista e
+/// com a conta do [`Seen::target`], a mesma que o `follow` usa pra decidir se fecha. O
+/// padrão virtual do cpal (`ActivateAudioInterfaceAsync`) falhou com `RPC_E_CHANGED_MODE`
+/// logo depois de o fone Bluetooth se reconfigurar, em MTA e em STA, enquanto o mesmo
+/// endpoint abria pela lista. Ele fica só de último recurso, com o padrão fora da lista.
+fn pick(
+    list: impl Iterator<Item = Device>,
+    default: Option<Device>,
+    name: Option<&str>,
+) -> Option<Device> {
+    let list: Vec<Device> = list.collect();
+    let seen = Seen::of(default.clone(), list.iter().cloned());
+    let target = seen.target(name).map(String::from);
+    list.into_iter()
+        .find(|d| target.is_some() && id_of(d) == target)
+        .or(default)
 }
 
 fn id_of(device: &Device) -> Option<String> {
@@ -77,7 +91,7 @@ fn id_of(device: &Device) -> Option<String> {
 pub struct Seen {
     /// Id do padrão do sistema.
     pub default: Option<String>,
-    /// Nome e id, na ordem do servidor: a mesma que o [`find`] percorre.
+    /// Nome e id, na ordem do servidor: a mesma que o [`pick`] percorre.
     pub devices: Vec<(String, String)>,
 }
 
@@ -152,10 +166,9 @@ fn on_error(what: &'static str) -> (Arc<AtomicBool>, impl FnMut(Error) + Send + 
 /// Sem o dispositivo salvo, usa o padrão do sistema.
 pub fn open_output(name: Option<&str>) -> Result<Opened<Producer<f32>>, String> {
     let host = host()?;
-    let device = name
-        .and_then(|name| find(host.output_devices().ok()?, name))
-        .or_else(|| host.default_output_device())
-        .ok_or("sem dispositivo de saída")?;
+    let list = host.output_devices().into_iter().flatten();
+    let device =
+        pick(list, host.default_output_device(), name).ok_or("sem dispositivo de saída")?;
     let (ring, mut samples) = RingBuffer::new(OUTPUT_RING);
     let (lost, errors) = on_error("saída");
     let stream = device
@@ -183,10 +196,9 @@ pub fn open_output(name: Option<&str>) -> Result<Opened<Producer<f32>>, String> 
 /// Sem o dispositivo salvo, usa o padrão do sistema.
 pub fn open_input(name: Option<&str>) -> Result<Opened<Consumer<f32>>, String> {
     let host = host()?;
-    let device = name
-        .and_then(|name| find(host.input_devices().ok()?, name))
-        .or_else(|| host.default_input_device())
-        .ok_or("sem dispositivo de entrada")?;
+    let list = host.input_devices().into_iter().flatten();
+    let device =
+        pick(list, host.default_input_device(), name).ok_or("sem dispositivo de entrada")?;
     let (mut samples, ring) = RingBuffer::new(INPUT_RING);
     let (lost, errors) = on_error("entrada");
     let stream = device
