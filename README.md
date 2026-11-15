@@ -4,7 +4,7 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.11.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.12.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
@@ -66,18 +66,24 @@ o seletor de tela do sistema (xdg-desktop-portal).
 - No chat, selecionar e copiar funciona dentro de uma mensagem, não pegando várias de uma vez.
 - O chat manda a foto original; o site encolhe antes de enviar.
 
-## Novidades da v0.1.11
+## Novidades da v0.1.12
 
-### Corrigido
-- **Windows, fone Bluetooth que cai e volta:** com a Saída ou a Entrada em "Padrão", o áudio não
-  voltava pro fone. O conserto da v0.1.10 não resolvia. Agora o app abre o fone pela lista de
-  dispositivos do sistema, e no teste num Windows de verdade o fone caiu e o som voltou nele.
-- **Transmissão feita pelo site chegava muda:** quem assistia no app via a tela sem o som. Agora
-  o áudio da tela compartilhada pelo navegador toca.
+### Novo
+- **Um log por abertura, pra relatar bug:** cada vez que o app abre, ele grava um arquivo novo em
+  `%APPDATA%\Concord\logs` no Windows ou `~/.config/concord/logs` no Linux, com a data e a hora
+  no nome. Ficam os 10 mais novos, com até 3 MB cada. Se algo der errado, mande o arquivo daquela
+  abertura.
+- **Log mais completo:** memória e threads do app a cada minuto, quanto som chegou de cada pessoa,
+  qualidade da rede e do vídeo a cada 30 s, quanto tempo um dispositivo ou a call ficou fora,
+  travamentos, os cliques e as configurações. Nunca senha nem texto do chat.
+
+### Interno
+- Erros do Windows aparecem em hexadecimal e com o nome (`0x88890004 AUDCLNT_E_DEVICE_INVALIDATED`).
+- Avisos do LiveKit e da placa de vídeo, e a placa que o app escolheu, entram no mesmo log.
 
 ### Limites conhecidos
-- No Linux, a troca de dispositivo foi testada só numa bancada de áudio isolada, e o som de uma
-  transmissão do site ainda não foi ouvido.
+- O `concord.log` das versões anteriores fica onde estava e pode ser apagado à mão.
+- No Windows, um erro grave aparece no log sem o nome das funções.
 
 ## Compilar
 
