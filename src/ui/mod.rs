@@ -22,6 +22,7 @@ use crate::api::{
 use crate::audio::{self, Devices, Effect, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
 use crate::call::{self, Call, End};
 use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
+use crate::health::{self, Beat};
 use crate::session;
 use crate::share::{Quality, Source, Thumb};
 use crate::update::Check;
@@ -247,6 +248,59 @@ pub enum Msg {
     Chat(i64, chat::Msg),
 }
 
+/// O que a pessoa fez, pro log: cliques e escolhas, nunca texto digitado nem título de
+/// janela. Slider entra pela config, gravada ao soltar.
+fn action(msg: &Msg) -> Option<String> {
+    let on = |b: bool, yes: &str, no: &str| if b { yes } else { no }.to_owned();
+    let device = |d: &Option<String>| d.as_deref().unwrap_or("padrão").to_owned();
+    Some(match msg {
+        Msg::ServerSubmit => "conectou num servidor".into(),
+        Msg::LoginSubmit => "entrou com usuário e senha".into(),
+        Msg::Logout => "saiu da conta".into(),
+        Msg::ToggleMic => "clicou no mic".into(),
+        Msg::ToggleDeafen => "clicou em ensurdecer".into(),
+        Msg::JoinChannel(slug) => format!("entrou na call {slug}"),
+        Msg::Leave => "saiu da call".into(),
+        Msg::OpenVolume(name) => format!("abriu o volume de {name}"),
+        Msg::ShareButton => "clicou em transmitir".into(),
+        Msg::ShareQuality(q) => format!("escolheu a qualidade {q:?}"),
+        Msg::ShareAudio(b) => on(
+            *b,
+            "ligou o áudio da transmissão",
+            "desligou o áudio da transmissão",
+        ),
+        Msg::ShareStart => "começou a transmitir".into(),
+        Msg::ShareStop => "parou de transmitir".into(),
+        Msg::ShareSwap => "trocou o que transmite".into(),
+        Msg::ShareSource(s) => on(s.window, "escolheu uma janela", "escolheu uma tela"),
+        Msg::ShareSound => "clicou no áudio da transmissão no ar".into(),
+        Msg::Watch(Some(who)) => format!("clicou em Assistir {who}"),
+        Msg::Watch(None) => "parou de assistir".into(),
+        Msg::Fullscreen => "pôs a transmissão em tela cheia".into(),
+        Msg::FocusScreen => "clicou na transmissão".into(),
+        Msg::Focus(b) => on(*b, "janela ganhou o foco", "janela perdeu o foco"),
+        Msg::RestartForUpdate => "clicou pra abrir a versão nova".into(),
+        Msg::Input(d) => format!("escolheu a entrada {}", device(d)),
+        Msg::Output(d) => format!("escolheu a saída {}", device(d)),
+        Msg::Noise(level) => format!("escolheu a redução de ruído {level:?}"),
+        Msg::AutoSensitivity(b) => on(
+            *b,
+            "ligou a sensibilidade automática",
+            "desligou a sensibilidade automática",
+        ),
+        Msg::AutoGain(b) => on(
+            *b,
+            "ligou o ganho automático",
+            "desligou o ganho automático",
+        ),
+        Msg::OpenSettings(tab) => format!("abriu as configurações em {tab:?}"),
+        Msg::CloseSettings => "fechou as configurações".into(),
+        Msg::CloseRequested(_) => "fechou a janela".into(),
+        Msg::Chat(channel, chat::Msg::Open) => format!("abriu o chat do canal {channel}"),
+        _ => return None,
+    })
+}
+
 /// Telas e janelas pro seletor do Windows. Listar e tirar as miniaturas bloqueia: lê fora
 /// da thread da interface.
 fn read_sources(call: &mut ActiveCall) -> Task<Msg> {
@@ -403,7 +457,16 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Task<Msg> {
+        if let Some(what) = action(&msg) {
+            log!("ação: {what}");
+        }
         let task = self.handle(msg);
+        // Na tela principal o relógio de 4 s garante uma mensagem: mais de 10 s sem nenhuma é
+        // a interface travada.
+        match &self.screen {
+            Screen::Main(_) => health::beat(Beat::Ui),
+            _ => health::idle(Beat::Ui),
+        }
         Task::batch([task, self.sync_window()])
     }
 
@@ -493,9 +556,14 @@ impl App {
             }
             // Sem a lista, os avatares caem nas iniciais.
             Msg::Members(Err(_)) => Task::none(),
-            Msg::Tick => window::oldest()
-                .and_then(window::is_minimized)
-                .map(Msg::PollIf),
+            Msg::Tick => {
+                if let Screen::Main(m) = &self.screen {
+                    m.gauges();
+                }
+                window::oldest()
+                    .and_then(window::is_minimized)
+                    .map(Msg::PollIf)
+            }
             Msg::PollIf(minimized) => {
                 let Screen::Main(m) = &mut self.screen else {
                     return Task::none();
@@ -1430,6 +1498,16 @@ impl LoginForm {
 }
 
 impl Main {
+    /// O que a interface segura e pode crescer, pros contadores de saúde.
+    fn gauges(&self) {
+        let images = self.call.as_ref().map_or(0, ActiveCall::images);
+        let (messages, pictures) = self.chat.as_ref().map_or((0, 0), chat::Chat::sizes);
+        health::set("imagens_call", images as i64);
+        health::set("avatares", self.avatars.len() as i64);
+        health::set("chat_mensagens", messages as i64);
+        health::set("chat_imagens", pictures as i64);
+    }
+
     fn stop_probe(&mut self) {
         self.probe = Probe::Off;
         self.level = MANUAL_MIN_DB;

@@ -457,6 +457,15 @@ impl ActiveCall {
             .collect()
     }
 
+    /// Imagens que a call segura: a tela assistida, a prévia própria, as câmeras e as prévias
+    /// das transmissões.
+    pub fn images(&self) -> usize {
+        usize::from(self.screen.is_some())
+            + usize::from(self.own.is_some())
+            + self.cameras.len()
+            + self.previews.len()
+    }
+
     /// Relógio das câmeras: só com alguém de câmera ligada.
     pub fn camera_clock(&self) -> bool {
         self.live.iter().flatten().any(|l| l.camera && !l.is_local)

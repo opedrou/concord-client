@@ -3,7 +3,10 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -37,7 +40,10 @@ use tokio::{
 use crate::api::{self, Client};
 use crate::audio::{Engine, Meter, MicFrames, RATE};
 use crate::config::Config;
+use crate::health::{self, Alive};
 use crate::share::{self, Capturer, Choice, Quality};
+
+mod stats;
 
 /// Máximo de tentativas de reconexão, como na web.
 pub const MAX_ATTEMPTS: u32 = 10;
@@ -135,7 +141,22 @@ const PREVIEW_WIDTH: u32 = 96;
 /// reusar. Um `Vec` novo por quadro (8 MB em 1080p), alocado numa thread e solto noutra,
 /// ficava preso nas arenas do glibc: a RAM subia enquanto assistia e não voltava.
 #[derive(Clone, Default)]
-struct Pool(Arc<Mutex<Vec<Vec<u8>>>>);
+struct Pool(Arc<Shelf>);
+
+/// Os buffers parados. Ao cair, tira do contador de saúde o que eles ocupavam.
+#[derive(Default)]
+struct Shelf(Mutex<Vec<Vec<u8>>>);
+
+impl Drop for Shelf {
+    fn drop(&mut self) {
+        let shelf = self.0.get_mut().unwrap_or_else(|e| e.into_inner());
+        let bytes: usize = shelf.iter().map(Vec::capacity).sum();
+        health::add(FRAME_BYTES, -(bytes as i64));
+    }
+}
+
+/// Contador de saúde com a memória de todos os buffers de quadro, em uso ou parados.
+const FRAME_BYTES: &str = "quadros_bytes";
 
 /// Dono do buffer dentro do `Bytes`: ao cair o último, devolve o buffer pro [`Pool`].
 struct Pooled(Vec<u8>, Pool);
@@ -149,7 +170,7 @@ impl AsRef<[u8]> for Pooled {
 impl Drop for Pooled {
     fn drop(&mut self) {
         let buffer = std::mem::take(&mut self.0);
-        self.1.0.lock().unwrap().push(buffer);
+        self.1.0.0.lock().unwrap().push(buffer);
     }
 }
 
@@ -158,8 +179,10 @@ impl Picture {
     /// memória: o RGBA do iced.
     fn of(frame: &BoxVideoFrame, pool: &Pool) -> Self {
         let (width, height) = (frame.buffer.width(), frame.buffer.height());
-        let mut rgba = pool.0.lock().unwrap().pop().unwrap_or_default();
+        let mut rgba = pool.0.0.lock().unwrap().pop().unwrap_or_default();
+        let before = rgba.capacity();
         rgba.resize((width * height * 4) as usize, 0);
+        health::add(FRAME_BYTES, rgba.capacity() as i64 - before as i64);
         let stride = width * 4;
         frame.buffer.to_argb(
             VideoFormatType::ABGR,
@@ -194,19 +217,28 @@ impl Picture {
 /// Último quadro da transmissão assistida. A interface pega no relógio dela: quadro que
 /// ela não chegou a desenhar é trocado pelo novo, sem fila.
 #[derive(Clone, Default)]
-pub struct Screen(Arc<Mutex<Option<Picture>>>);
+pub struct Screen(Arc<(Mutex<Option<Picture>>, AtomicU64)>);
 
 impl Screen {
     pub fn take(&self) -> Option<Picture> {
-        self.0.lock().unwrap().take()
+        let picture = self.0.0.lock().unwrap().take();
+        if picture.is_some() {
+            self.0.1.fetch_add(1, Ordering::Relaxed);
+        }
+        picture
     }
 
     fn put(&self, picture: Picture) {
-        *self.0.lock().unwrap() = Some(picture);
+        *self.0.0.lock().unwrap() = Some(picture);
     }
 
     fn clear(&self) {
-        self.0.lock().unwrap().take();
+        self.0.0.lock().unwrap().take();
+    }
+
+    /// Quadros que a interface já pegou pra desenhar, desde o começo.
+    fn taken(&self) -> u64 {
+        self.0.1.load(Ordering::Relaxed)
     }
 }
 
@@ -414,6 +446,18 @@ fn definitive(reason: DisconnectReason) -> Option<End> {
         DisconnectReason::ParticipantRemoved => Some(End::Removed),
         DisconnectReason::RoomDeleted | DisconnectReason::RoomClosed => Some(End::RoomClosed),
         _ => None,
+    }
+}
+
+/// `8 min 40 s`, `12.3 s`: duração pro log.
+fn human(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{:.1} s", d.as_secs_f32())
+    } else if secs < 3600 {
+        format!("{} min {} s", secs / 60, secs % 60)
+    } else {
+        format!("{} h {} min", secs / 3600, secs / 60 % 60)
     }
 }
 
@@ -637,7 +681,8 @@ struct Session {
     sent_watching: String,
     /// Último mapa de espectadores emitido.
     last_viewers: HashMap<String, Vec<String>>,
-    reconnecting: bool,
+    /// Desde quando o SDK está retomando a conexão.
+    reconnecting: Option<Instant>,
     /// Últimos `Recording` e `Unstable` emitidos, pra só avisar mudança.
     recording: bool,
     unstable: bool,
@@ -648,6 +693,8 @@ struct Session {
     peeks: HashMap<String, AbortOnDrop>,
     /// Câmeras, por sid: o mesmo par de dono e tarefa da voz.
     cameras: HashMap<String, Voice>,
+    /// Contadores da última leitura das estatísticas do WebRTC.
+    stats: stats::Last,
 }
 
 impl Ctl {
@@ -673,10 +720,15 @@ impl Ctl {
     }
 }
 
+/// Contadores de saúde das tarefas que recebem mídia: uma por faixa assinada.
+const VIDEO_TASKS: &str = "tarefas_video";
+const AUDIO_TASKS: &str = "tarefas_audio";
+
 /// Vídeo da transmissão assistida, quadro a quadro, até a tarefa cair.
 fn stream_screen(video: RemoteVideoTrack, screen: Screen) -> AbortOnDrop {
     let mut stream = NativeVideoStream::new(video.rtc_track());
     AbortOnDrop(tokio::spawn(async move {
+        let _alive = Alive::new(VIDEO_TASKS);
         let pool = Pool::default();
         while let Some(frame) = stream.next().await {
             screen.put(Picture::of(&frame, &pool));
@@ -695,6 +747,7 @@ fn stream_camera(video: RemoteVideoTrack, identity: String, cameras: Cameras) ->
     }
     let mut stream = NativeVideoStream::new(video.rtc_track());
     AbortOnDrop(tokio::spawn(async move {
+        let _alive = Alive::new(VIDEO_TASKS);
         let camera = Clear(cameras, identity);
         let pool = Pool::default();
         while let Some(frame) = stream.next().await {
@@ -714,6 +767,7 @@ fn peek(
     let mut stream = NativeVideoStream::new(video.rtc_track());
     let (events, done) = (events.clone(), done.clone());
     AbortOnDrop(tokio::spawn(async move {
+        let _alive = Alive::new(VIDEO_TASKS);
         if let Some(frame) = stream.next().await {
             let preview = Picture::of(&frame, &Pool::default()).preview();
             let _ = events.send(Event::Preview(identity, preview));
@@ -799,8 +853,13 @@ impl Task {
         let speech = ctl.speech_tx.clone();
         let meter = ctl.engine.meter();
         let _forward = AbortOnDrop(tokio::spawn(forward_mic(mic, meter, source_rx, speech)));
+        let started = Instant::now();
         let end = self.lifecycle(&mut ctl, &source).await;
-        log!("sala: fim da call em {} ({end:?})", self.slug);
+        log!(
+            "sala: fim da call em {} ({end:?}) depois de {}",
+            self.slug,
+            human(started.elapsed())
+        );
         // Faixa e vozes já caíram aqui: `Ended` é sempre o último evento. Soltar a tarefa
         // da tela para a captura também nos fins que não passam por `leave`.
         drop(sharing);
@@ -813,11 +872,20 @@ impl Task {
         source: &watch::Sender<Option<NativeAudioSource>>,
     ) -> End {
         let mut attempt = 0;
+        // Desde quando caiu, pra dizer quanto ficou fora ao voltar.
+        let mut down: Option<Instant> = None;
         loop {
             match self.connect(ctl, source).await {
                 Ok(mut session) => {
                     attempt = 0;
-                    log!("sala: conectou em {}", self.slug);
+                    match down.take() {
+                        Some(t) => log!(
+                            "sala: conectou em {} depois de {} fora",
+                            self.slug,
+                            human(t.elapsed())
+                        ),
+                        None => log!("sala: conectou em {}", self.slug),
+                    }
                     self.emit(Event::Connected);
                     let outcome = self.serve(&mut session, ctl).await;
                     source.send_replace(None);
@@ -831,6 +899,7 @@ impl Task {
                 Err(Fail::Leave) => return End::Left,
                 Err(Fail::Retry) => {}
             }
+            down.get_or_insert_with(Instant::now);
             attempt += 1;
             if attempt > MAX_ATTEMPTS {
                 return End::GaveUp;
@@ -902,13 +971,14 @@ impl Task {
             sent_muted: String::new(),
             sent_watching: String::new(),
             last_viewers: HashMap::new(),
-            reconnecting: false,
+            reconnecting: None,
             recording: false,
             unstable: false,
             speaking: HashSet::new(),
             watched: HashMap::new(),
             peeks: HashMap::new(),
             cameras: HashMap::new(),
+            stats: stats::Last::default(),
         })
     }
 
@@ -920,6 +990,7 @@ impl Task {
         self.set_recording(s);
         self.refresh(s);
         let mut debounce: Option<Instant> = None;
+        let mut stats_tick = tokio::time::interval_at(Instant::now() + stats::EVERY, stats::EVERY);
         loop {
             tokio::select! {
                 event = s.events.recv() => {
@@ -959,6 +1030,10 @@ impl Task {
                     None | Some(Cmd::Leave) => return Outcome::End(s.close().await),
                 },
                 Some(sid) = ctl.peek_rx.recv() => s.end_peek(ctl, &sid),
+                // Em outra tarefa: o `get_stats` passa pela thread de sinalização do WebRTC.
+                _ = stats_tick.tick() => {
+                    tokio::spawn(stats::log(s.stat_tracks(ctl), s.stats.clone()));
+                }
                 _ = wait_until(debounce) => {
                     debounce = None;
                     s.send_muted(&ctl.people);
@@ -1050,6 +1125,7 @@ impl Task {
                 let mut sink = ctl.engine.add_voice(sid.clone(), Config::screen_key(&name));
                 let mut stream = NativeAudioStream::new(audio.rtc_track(), RATE as i32, 1);
                 let task = tokio::spawn(async move {
+                    let _alive = Alive::new(AUDIO_TASKS);
                     while let Some(frame) = stream.next().await {
                         sink.push(&frame.data);
                     }
@@ -1078,6 +1154,7 @@ impl Task {
                 let speech = ctl.speech_tx.clone();
                 let who = identity.clone();
                 let task = tokio::spawn(async move {
+                    let _alive = Alive::new(AUDIO_TASKS);
                     let mut detector = Speech::default();
                     while let Some(frame) = stream.next().await {
                         if let Some(on) = detector.update(&frame.data) {
@@ -1136,11 +1213,16 @@ impl Task {
                 }
             }
             RoomEvent::Reconnecting => {
-                s.reconnecting = true;
+                s.reconnecting = Some(Instant::now());
                 self.emit(Event::Reconnecting { attempt: 0 });
             }
             RoomEvent::Reconnected => {
-                s.reconnecting = false;
+                if let Some(since) = s.reconnecting.take() {
+                    log!(
+                        "sala: reconectou pelo SDK depois de {}",
+                        human(since.elapsed())
+                    );
+                }
                 self.emit(Event::Connected);
                 // A retomada pode ter perdido assinaturas e atributos.
                 s.subscribe_all(ctl.watching.as_deref());
@@ -1191,7 +1273,7 @@ impl Task {
 
     fn refresh(&self, s: &mut Session) {
         let list = s.participants();
-        let list = if s.reconnecting {
+        let list = if s.reconnecting.is_some() {
             hold_remotes(list, &s.last)
         } else {
             list
@@ -1214,7 +1296,6 @@ fn log_event(event: &RoomEvent) {
     match event {
         RoomEvent::Disconnected { reason } => log!("sala: caiu ({reason:?})"),
         RoomEvent::Reconnecting => log!("sala: reconectando pelo SDK"),
-        RoomEvent::Reconnected => log!("sala: reconectou pelo SDK"),
         RoomEvent::ParticipantConnected(p) => log!("sala: {} entrou", p.identity()),
         RoomEvent::ParticipantDisconnected(p) => log!("sala: {} saiu", p.identity()),
         // O que não é assinado não aparece no "assinou": sem isto, faixa ignorada some do log.
@@ -1270,6 +1351,40 @@ fn hold_remotes(list: Vec<Live>, last: &[Live]) -> Vec<Live> {
 }
 
 impl Session {
+    /// Cada faixa com mídia agora, minha e dos outros, pras estatísticas.
+    fn stat_tracks(&self, ctl: &Ctl) -> Vec<stats::Labeled> {
+        let mut out = Vec::new();
+        for p in self.room.remote_participants().values() {
+            let identity = p.identity().to_string();
+            let name = p.name();
+            let name = if name.is_empty() { &identity } else { &name };
+            for publication in p.track_publications().values() {
+                let Some(track) = publication.track() else {
+                    continue;
+                };
+                let source = publication.source();
+                let watched = ctl.watching.as_deref() == Some(identity.as_str());
+                out.push(stats::Labeled {
+                    label: format!("{} de {name}", stats::source(source, &publication.name())),
+                    track: stats::Track::Remote(track),
+                    drawn: (watched && source == TrackSource::Screenshare)
+                        .then(|| ctl.screen.taken()),
+                });
+            }
+        }
+        for publication in self.room.local_participant().track_publications().values() {
+            if let Some(track) = publication.track() {
+                let source = stats::source(publication.source(), &publication.name());
+                out.push(stats::Labeled {
+                    label: format!("{source} (eu)"),
+                    track: stats::Track::Local(track),
+                    drawn: None,
+                });
+            }
+        }
+        out
+    }
+
     /// A voz e a câmera de todo mundo. Tela e `concord-app-audio` só de quem está sendo
     /// assistido.
     fn subscribe_all(&self, watching: Option<&str>) {
@@ -1582,7 +1697,7 @@ mod tests {
         let imagem = iced::widget::image::Handle::from_rgba(64, 36, primeiro.rgba.clone());
         drop(primeiro);
         assert!(
-            pool.0.lock().unwrap().is_empty(),
+            pool.0.0.lock().unwrap().is_empty(),
             "a imagem ainda segura o buffer"
         );
         drop(imagem);

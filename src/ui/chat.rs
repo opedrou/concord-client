@@ -119,6 +119,11 @@ enum Picture {
 }
 
 impl Chat {
+    /// Mensagens e imagens na memória, pros contadores de saúde.
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.timeline.messages.len(), self.images.len())
+    }
+
     pub fn open(client: &Client, channel: &Channel) -> (Self, Task<App>) {
         let chat = Self {
             channel: channel.id,

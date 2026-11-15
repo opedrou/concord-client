@@ -2,10 +2,8 @@
 //! pessoa não dividem fila.
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    fmt::Write,
+    sync::{Arc, Mutex},
 };
 
 use super::{FRAME, RATE, gain};
@@ -19,18 +17,39 @@ const EFFECT_GAIN: f32 = 0.6;
 
 /// A fila fica fora do `rtrb` porque só a sala e a thread de áudio tocam nela, nunca
 /// o callback, e descartar o mais antigo exige o lado do produtor mexer na ponta do
-/// consumidor. O segundo campo conta as amostras descartadas, pro log.
+/// consumidor.
 #[derive(Default)]
-pub struct VoiceQueue(Mutex<VecDeque<i16>>, AtomicUsize);
+pub struct VoiceQueue(Mutex<Queue>);
+
+#[derive(Default)]
+struct Queue {
+    samples: VecDeque<i16>,
+    /// Desde o último [`Mixer::report`]: o que chegou, o que caiu por fila cheia e a
+    /// energia e o pico do que chegou. Separa "não chegou" de "chegou mudo".
+    pushed: usize,
+    dropped: usize,
+    energy: f64,
+    peak: u16,
+}
 
 impl VoiceQueue {
     pub fn push(&self, pcm: &[i16]) {
-        let mut queue = self.0.lock().unwrap();
-        queue.extend(pcm);
-        let excess = queue.len().saturating_sub(MAX_QUEUED);
-        queue.drain(..excess);
-        self.1.fetch_add(excess, Ordering::Relaxed);
+        let mut q = self.0.lock().unwrap();
+        q.samples.extend(pcm);
+        q.pushed += pcm.len();
+        for &s in pcm {
+            q.energy += f64::from(s) * f64::from(s);
+            q.peak = q.peak.max(s.unsigned_abs());
+        }
+        let excess = q.samples.len().saturating_sub(MAX_QUEUED);
+        q.samples.drain(..excess);
+        q.dropped += excess;
     }
+}
+
+/// Nível em dBFS de uma amplitude de 0 a 32768.
+fn dbfs(amplitude: f64) -> f64 {
+    20.0 * (amplitude / 32768.0).log10()
 }
 
 struct Track {
@@ -78,15 +97,44 @@ impl Mixer {
         self.volumes.insert(name, slider);
     }
 
-    /// Quanto cada faixa descartou por fila cheia desde a última chamada, em ms.
-    pub fn dropped(&self) -> Vec<(&str, usize)> {
-        self.tracks
-            .values()
-            .filter_map(|t| {
-                let samples = t.queue.1.swap(0, Ordering::Relaxed);
-                (samples > 0).then(|| (t.name.as_str(), samples * 1000 / RATE as usize))
-            })
-            .collect()
+    /// Uma linha pro log com cada faixa desde a última chamada: quanto chegou, em que nível e
+    /// quanto caiu por fila cheia. Devolve também quantas faixas há e quanto está na fila,
+    /// em ms, pros contadores de saúde.
+    pub fn report(&self) -> (String, usize, usize) {
+        let ms = |samples: usize| samples * 1000 / RATE as usize;
+        let mut names: Vec<_> = self.tracks.values().collect();
+        names.sort_by(|a, b| a.name.cmp(&b.name));
+        let (mut text, mut queued) = (String::new(), 0);
+        for t in names {
+            let mut q = t.queue.0.lock().unwrap();
+            let q = &mut *q;
+            queued += q.samples.len();
+            let _ = write!(
+                text,
+                "{}{} ",
+                if text.is_empty() { "" } else { "; " },
+                t.name
+            );
+            if q.pushed == 0 {
+                text.push_str("nada chegou");
+            } else if q.peak == 0 {
+                let _ = write!(text, "{:.1} s de silêncio", q.pushed as f64 / RATE as f64);
+            } else {
+                let rms = (q.energy / q.pushed as f64).sqrt();
+                let _ = write!(
+                    text,
+                    "{:.1} s a {:.0} dBFS (pico {:.0})",
+                    q.pushed as f64 / RATE as f64,
+                    dbfs(rms),
+                    dbfs(f64::from(q.peak))
+                );
+            }
+            if q.dropped > 0 {
+                let _ = write!(text, ", descartou {} ms", ms(q.dropped));
+            }
+            (q.pushed, q.dropped, q.energy, q.peak) = (0, 0, 0.0, 0);
+        }
+        (text, self.tracks.len(), ms(queued))
     }
 
     fn track_gain(&self, name: &str) -> f32 {
@@ -102,8 +150,8 @@ impl Mixer {
         for track in self.tracks.values() {
             let track_gain = self.track_gain(&track.name);
             let mut queue = track.queue.0.lock().unwrap();
-            let available = queue.len().min(FRAME);
-            for (o, s) in out.iter_mut().zip(queue.drain(..available)) {
+            let available = queue.samples.len().min(FRAME);
+            for (o, s) in out.iter_mut().zip(queue.samples.drain(..available)) {
                 *o += s as f32 / 32768.0 * track_gain;
             }
         }
@@ -223,7 +271,7 @@ mod tests {
         q.push(&[10000; FRAME * 2]);
         m.deafened = true;
         assert_eq!(mix(&mut m), [0.0; FRAME]);
-        assert_eq!(q.0.lock().unwrap().len(), FRAME);
+        assert_eq!(q.0.lock().unwrap().samples.len(), FRAME);
         m.deafened = false;
         assert!(mix(&mut m)[0] > 0.0);
     }
@@ -255,20 +303,30 @@ mod tests {
         let q = VoiceQueue::default();
         let pcm: Vec<i16> = (0..MAX_QUEUED as i32 + 500).map(|i| i as i16).collect();
         q.push(&pcm);
-        let queue = q.0.lock().unwrap();
+        let queue = &q.0.lock().unwrap().samples;
         assert_eq!(queue.len(), 9600, "200 ms em 48 kHz");
         assert_eq!(queue.front(), Some(&500));
         assert_eq!(queue.back(), pcm.last());
     }
 
     #[test]
-    fn descarte_conta_uma_vez_por_faixa() {
+    fn relatorio_separa_nada_silencio_e_nivel_e_zera() {
         let mut m = mixer(71);
-        let q = voice(&mut m, "a", "ana");
-        voice(&mut m, "b", "bia").push(&[0; FRAME]);
-        q.push(&vec![0; MAX_QUEUED + RATE as usize / 10]);
-        assert_eq!(m.dropped(), [("ana", 100)]);
-        assert!(m.dropped().is_empty(), "zera depois de ler");
+        let ana = voice(&mut m, "a", "ana");
+        let bia = voice(&mut m, "b", "bia");
+        let _caio = voice(&mut m, "c", "caio");
+        // 300 ms em meia escala: -6 dBFS, e 100 ms passam da fila.
+        ana.push(&vec![16384; MAX_QUEUED + RATE as usize / 10]);
+        bia.push(&[0; FRAME]);
+        let (text, tracks, queued) = m.report();
+        assert_eq!(
+            text,
+            "ana 0.3 s a -6 dBFS (pico -6), descartou 100 ms; bia 0.0 s de silêncio; \
+             caio nada chegou"
+        );
+        assert_eq!((tracks, queued), (3, 210), "200 ms da ana e 10 ms da bia");
+        let (text, ..) = m.report();
+        assert_eq!(text, "ana nada chegou; bia nada chegou; caio nada chegou");
     }
 
     #[test]

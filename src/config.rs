@@ -1,6 +1,6 @@
 //! Config e preferências em `~/.config/concord/` ou `%APPDATA%\Concord\`.
 use std::collections::HashMap;
-use std::{env, fs, io, path::PathBuf};
+use std::{env, fs, io, path::PathBuf, sync::Mutex};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -96,16 +96,47 @@ impl Config {
             c.mic_gain = MicGain::Manual(c.manual_gain_db);
         }
         c.volumes.values_mut().for_each(|v| *v = (*v).min(100));
+        c.note();
         c
     }
 
     /// Escreve num temporário e renomeia, pra queda no meio não truncar o arquivo.
     pub fn save(&self) -> io::Result<()> {
+        self.note();
         let p = path().ok_or_else(|| io::Error::other("sem pasta de config"))?;
         fs::create_dir_all(p.parent().expect("config tem pasta"))?;
         let tmp = p.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
         fs::rename(tmp, p)
+    }
+
+    /// A config em uso vai pro log ao abrir e a cada mudança gravada. Fica de fora a
+    /// largura da barra, que muda arrastando e não explica bug nenhum.
+    pub fn note(&self) {
+        static LAST: Mutex<String> = Mutex::new(String::new());
+        let mut volumes: Vec<_> = self.volumes.iter().collect();
+        volumes.sort();
+        let text = format!(
+            "servidor {}, entrada {}, saída {}, ruído {:?}, sensibilidade {:?}, ganho {:?}, \
+             volume geral {}, volumes {volumes:?}, mic mudo {}, surdo {}, transmissão {:?} \
+             com áudio {}",
+            self.server.as_deref().unwrap_or("nenhum"),
+            self.input.as_deref().unwrap_or("padrão"),
+            self.output.as_deref().unwrap_or("padrão"),
+            self.noise,
+            self.sensitivity,
+            self.mic_gain,
+            self.master_volume,
+            self.mic_muted,
+            self.deafened,
+            self.share_quality,
+            self.share_audio,
+        );
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != text {
+            log!("config: {text}");
+            *last = text;
+        }
     }
 
     pub fn audio_prefs(&self) -> AudioPrefs {
@@ -227,8 +258,8 @@ fn path() -> Option<PathBuf> {
 }
 
 /// Ver `crate::log`.
-pub fn log_path() -> Option<PathBuf> {
-    Some(dir()?.join("concord.log"))
+pub fn log_dir() -> Option<PathBuf> {
+    Some(dir()?.join("logs"))
 }
 
 /// Ver `crate::update`.

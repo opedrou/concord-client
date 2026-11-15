@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-/// Uma linha no `concord.log`; ver `log::line`. Definido antes dos módulos pra valer em
-/// todos eles.
+/// Uma linha no log desta execução; ver `log::line`. Definido antes dos módulos pra valer
+/// em todos eles.
 macro_rules! log {
     ($($arg:tt)*) => {
         $crate::log::line(format_args!($($arg)*))
@@ -14,6 +14,7 @@ mod awake;
 mod call;
 mod chat;
 mod config;
+mod health;
 mod icon;
 mod log;
 mod session;
@@ -30,10 +31,12 @@ fn main() -> iced::Result {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    // Pânico numa tarefa da sala some calado: ao menos fica no log.
+    log::capture_crates();
+    // Pânico numa tarefa da sala some calado: ao menos fica no log, com o caminho até ele.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log!("pânico: {info}");
+        let trace = std::backtrace::Backtrace::force_capture();
+        log!("pânico: {info}\n{trace}");
         default_hook(info);
     }));
     // `--register` e `--uninstall` rodam sem janela e sem tocar no log.
@@ -41,7 +44,7 @@ fn main() -> iced::Result {
     if update::cli() {
         return Ok(());
     }
-    log!("Concord {} começou", env!("CARGO_PKG_VERSION"));
+    // Antes do cabeçalho: a cópia de fora que só abre a instalada não gasta um arquivo de log.
     #[cfg(windows)]
     if update::setup() {
         return Ok(());
@@ -49,6 +52,7 @@ fn main() -> iced::Result {
     if update::start() {
         return Ok(());
     }
+    health::start();
     #[cfg(target_os = "linux")]
     update::register();
     let window = window::Settings {

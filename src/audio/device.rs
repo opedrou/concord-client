@@ -7,9 +7,9 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use cpal::{
@@ -124,10 +124,37 @@ pub fn look(host: &Host) -> Option<(Seen, Seen)> {
     ))
 }
 
+/// Falhas do callback, contadas lá dentro sem trava e lidas no relatório da thread de áudio.
+#[derive(Default)]
+pub struct Glitches {
+    /// Amostras que faltaram (a saída tocou silêncio) ou sobraram (a entrada perdeu).
+    missed: AtomicUsize,
+    /// Maior intervalo entre dois callbacks, em µs: o sistema que atrasou o áudio.
+    gap_us: AtomicU64,
+}
+
+impl Glitches {
+    /// Marca a chamada do callback em `now`, depois da anterior em `last`.
+    fn called(&self, last: &mut Option<Instant>, now: Instant) {
+        if let Some(l) = last.replace(now) {
+            let gap = now.duration_since(l).as_micros() as u64;
+            self.gap_us.fetch_max(gap, Ordering::Relaxed);
+        }
+    }
+
+    /// Amostras perdidas e o maior intervalo, em ms, desde a última chamada.
+    pub fn take(&self) -> (usize, u64) {
+        let missed = self.missed.swap(0, Ordering::Relaxed);
+        let gap = self.gap_us.swap(0, Ordering::Relaxed);
+        (missed * 1000 / RATE as usize, gap / 1000)
+    }
+}
+
 /// Stream aberto, com o anel que liga o callback à thread de áudio.
 pub struct Opened<R> {
     _stream: Stream,
     pub ring: R,
+    pub glitches: Arc<Glitches>,
     lost: Arc<AtomicBool>,
     /// Nome e id do dispositivo de verdade, que pode não ser o pedido.
     pub name: String,
@@ -171,12 +198,23 @@ pub fn open_output(name: Option<&str>) -> Result<Opened<Producer<f32>>, String> 
         pick(list, host.default_output_device(), name).ok_or("sem dispositivo de saída")?;
     let (ring, mut samples) = RingBuffer::new(OUTPUT_RING);
     let (lost, errors) = on_error("saída");
+    let glitches = Arc::new(Glitches::default());
+    let counter = glitches.clone();
+    let mut last = None;
     let stream = device
         .build_output_stream(
             config(2),
             move |data: &mut [f32], _| {
+                counter.called(&mut last, Instant::now());
+                let mut missed = 0;
                 for frame in data.chunks_mut(2) {
-                    frame.fill(samples.pop().unwrap_or(0.0));
+                    frame.fill(samples.pop().unwrap_or_else(|_| {
+                        missed += 1;
+                        0.0
+                    }));
+                }
+                if missed > 0 {
+                    counter.missed.fetch_add(missed, Ordering::Relaxed);
                 }
             },
             errors,
@@ -187,6 +225,7 @@ pub fn open_output(name: Option<&str>) -> Result<Opened<Producer<f32>>, String> 
     Ok(Opened {
         _stream: stream,
         ring,
+        glitches,
         lost,
         name: name_of(&device).unwrap_or_default(),
         id: id_of(&device),
@@ -201,13 +240,18 @@ pub fn open_input(name: Option<&str>) -> Result<Opened<Consumer<f32>>, String> {
         pick(list, host.default_input_device(), name).ok_or("sem dispositivo de entrada")?;
     let (mut samples, ring) = RingBuffer::new(INPUT_RING);
     let (lost, errors) = on_error("entrada");
+    let glitches = Arc::new(Glitches::default());
+    let counter = glitches.clone();
+    let mut last = None;
     let stream = device
         .build_input_stream(
             config(1),
             move |data: &[f32], _| {
-                for sample in data {
-                    // Anel cheio perde o mais novo: só acontece com a thread parada.
-                    let _ = samples.push(*sample);
+                counter.called(&mut last, Instant::now());
+                // Anel cheio perde o mais novo: só acontece com a thread parada.
+                let missed = data.iter().filter(|s| samples.push(**s).is_err()).count();
+                if missed > 0 {
+                    counter.missed.fetch_add(missed, Ordering::Relaxed);
                 }
             },
             errors,
@@ -218,6 +262,7 @@ pub fn open_input(name: Option<&str>) -> Result<Opened<Consumer<f32>>, String> {
     Ok(Opened {
         _stream: stream,
         ring,
+        glitches,
         lost,
         name: name_of(&device).unwrap_or_default(),
         id: id_of(&device),

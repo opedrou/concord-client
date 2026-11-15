@@ -26,20 +26,28 @@ rtrb = "0.4"
 sha2 = "0.10"
 # Hora local das mensagens do chat: a std não sabe o fuso. Já vinha compilado pelo livekit.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Avisos do livekit, do wgpu e a GPU que o iced escolheu, no log do app (`log::Bridge`). Já vem
+# pelos dois.
+log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.18"
 # Áudio da transmissão: WASAPI process loopback, como no spike.
 wasapi = "0.26"
-# Atalhos, "Aplicativos instalados" e a pergunta do desinstalar (`update::win`). A mesma versão que o
-# `wasapi` já puxa.
+# Atalhos, "Aplicativos instalados" e a pergunta do desinstalar (`update::win`); RAM, threads,
+# handles e memória de vídeo no log (`health`). A mesma versão que o `wasapi` já puxa.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Power",
+    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

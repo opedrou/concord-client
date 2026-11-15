@@ -917,6 +917,7 @@ dependencies = [
  "image",
  "keyring",
  "livekit",
+ "log",
  "nnnoiseless",
  "reqwest",
  "rtrb 0.4.1",

@@ -7,6 +7,8 @@ use std::{
 
 use tokio::sync::mpsc::Sender;
 
+use crate::health::{self, Beat};
+
 use super::{
     AudioPrefs, FRAME, Meter, MicGain, NoiseLevel, Sensitivity,
     device::{self, Opened, Seen},
@@ -21,8 +23,8 @@ const LOOK: Duration = Duration::from_secs(1);
 /// Teto da espera pelo som de saída com o motor solto: os sons têm menos de 3 s. Saída
 /// travada não pode segurar a thread pra sempre.
 const LINGER: Duration = Duration::from_secs(3);
-/// De quanto em quanto as filas que descartaram aparecem no log.
-const REPORT: Duration = Duration::from_secs(5);
+/// De quanto em quanto o que chegou de cada pessoa e as falhas do callback vão pro log.
+const REPORT: Duration = Duration::from_secs(10);
 
 pub enum Command {
     Mute(bool),
@@ -47,6 +49,8 @@ struct Side<T> {
     stream: Option<T>,
     wanted: Option<String>,
     next_try: Instant,
+    /// Desde quando está sem stream por queda ou falha ao abrir.
+    down: Option<Instant>,
 }
 
 impl<T> Side<T> {
@@ -55,6 +59,7 @@ impl<T> Side<T> {
             stream: None,
             wanted,
             next_try: Instant::now(),
+            down: None,
         }
     }
 
@@ -63,20 +68,28 @@ impl<T> Side<T> {
     }
 
     /// Perdido reabre no salvo, que o `open` troca pelo padrão enquanto ele não existir.
+    /// Devolve quanto tempo ficou sem stream quando volta depois de uma queda ou falha.
     fn keep_open(
         &mut self,
         now: Instant,
         is_lost: impl FnOnce(&T) -> bool,
         open: impl FnOnce(Option<&str>) -> Result<T, String>,
-    ) {
+    ) -> Option<Duration> {
         if self.stream.as_ref().is_some_and(is_lost) {
             // `next_try` fica como está: stream que nasce morto não vira reabertura em laço.
             self.stream = None;
+            self.down.get_or_insert(now);
         }
         if self.stream.is_none() && now >= self.next_try {
             self.next_try = now + RETRY;
             self.stream = open(self.wanted.as_deref()).ok();
+            if self.stream.is_none() {
+                self.down.get_or_insert(now);
+            } else if let Some(since) = self.down.take() {
+                return Some(now - since);
+            }
         }
+        None
     }
 
     /// Fecha o stream se ele não está onde devia: padrão novo, ou o salvo que ligou ou
@@ -118,7 +131,7 @@ fn watch(seen: mpsc::Sender<(Seen, Seen)>) {
     }
 }
 
-/// Avisa no log quando a thread acaba, inclusive em pânico.
+/// Avisa no log quando a thread acaba, inclusive em pânico, e tira ela da vigia.
 struct Stopped;
 
 impl Drop for Stopped {
@@ -129,7 +142,24 @@ impl Drop for Stopped {
             ""
         };
         log!("áudio: motor parou{how}");
+        health::idle(Beat::Audio);
+        health::set("faixas_voz", 0);
+        health::set("fila_voz_ms", 0);
     }
+}
+
+/// Falhas de um lado do callback desde o último relatório, se ele está aberto.
+fn glitches<R>(what: &str, side: &Side<Opened<R>>) -> String {
+    let Some(stream) = &side.stream else {
+        return format!("{what} fechada");
+    };
+    let (missed, gap) = stream.glitches.take();
+    let verb = if what == "saída" {
+        "sem som"
+    } else {
+        "perdeu"
+    };
+    format!("{what} {verb} {missed} ms, maior intervalo {gap} ms")
 }
 
 /// A mesma falha repetida a cada [`RETRY`] entra no log uma vez só.
@@ -189,18 +219,28 @@ pub fn run(
     let _stopped = Stopped;
 
     let mut errors: [Option<String>; 2] = Default::default();
+    let back = |what: &str, down: Option<Duration>| {
+        if let Some(d) = down {
+            log!(
+                "áudio: {what} voltou depois de {:.1} s fora",
+                d.as_secs_f32()
+            );
+        }
+    };
     let mut keep_open = |output: &mut Side<_>, input: &mut Side<_>| {
         let now = Instant::now();
-        output.keep_open(
+        let down = output.keep_open(
             now,
             |s| lost("saída", s),
             |n| opened("saída", &mut errors[0], device::open_output(n)),
         );
-        input.keep_open(
+        back("saída", down);
+        let down = input.keep_open(
             now,
             |s| lost("entrada", s),
             |n| opened("entrada", &mut errors[1], device::open_input(n)),
         );
+        back("entrada", down);
     };
     keep_open(&mut output, &mut input);
     // Um lado só já dá call: quem está sem mic ainda ouve, e o mic entra quando aparecer.
@@ -209,8 +249,12 @@ pub fn run(
         return;
     }
     let _ = ready.send(Ok(()));
+    // Maior tempo gasto misturando e tratando o mic numa volta, desde o último relatório:
+    // passou de 10 ms, o áudio picota.
+    let mut busy = Duration::ZERO;
 
     loop {
+        health::beat(Beat::Audio);
         let mut next = match commands.recv_timeout(TICK) {
             Ok(command) => Some(command),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -278,11 +322,21 @@ pub fn run(
         }
         if Instant::now() >= report {
             report += REPORT;
-            for (name, ms) in mixer.dropped() {
-                log!("áudio: fila de {name} descartou {ms} ms por estar cheia");
-            }
+            let (heard, tracks, queued) = mixer.report();
+            health::set("faixas_voz", tracks as i64);
+            health::set("fila_voz_ms", queued as i64);
+            log!(
+                "áudio: em {} s: {} | {}; {}; processamento máx {:.1} ms",
+                REPORT.as_secs(),
+                if heard.is_empty() { "ninguém" } else { &heard },
+                glitches("saída", &output),
+                glitches("entrada", &input),
+                busy.as_secs_f32() * 1000.0
+            );
+            busy = Duration::ZERO;
         }
 
+        let started = Instant::now();
         // Reverse antes do forward: o APM precisa ver o som antes do eco dele.
         if let Some(stream) = &mut output.stream {
             while stream.ring.slots() >= FRAME {
@@ -305,6 +359,7 @@ pub fn run(
                 }
             }
         }
+        busy = busy.max(started.elapsed());
     }
 }
 
@@ -422,6 +477,34 @@ mod tests {
         assert_eq!(*tries.borrow(), 1);
         side.keep_open(now + RETRY, |_| false, fail);
         assert_eq!(*tries.borrow(), 2);
+    }
+
+    #[test]
+    fn volta_depois_de_queda_diz_quanto_ficou_fora() {
+        let mut side = Side::new(None);
+        let t0 = Instant::now();
+        assert_eq!(
+            side.keep_open(t0, |_| false, |_| Ok(())),
+            None,
+            "abriu de primeira"
+        );
+        let fail = |_: Option<&str>| Err::<(), _>("sumiu".to_string());
+        assert_eq!(side.keep_open(t0, |_| true, fail), None, "caiu e não abriu");
+        let t1 = t0 + RETRY * 3;
+        assert_eq!(side.keep_open(t0 + RETRY, |_| false, fail), None);
+        assert_eq!(
+            side.keep_open(t1, |_| false, |_| Ok(())),
+            Some(RETRY * 3),
+            "conta desde a queda"
+        );
+        let mut troca = aberto(None, "hdmi");
+        let mudou = seen("bluez", &[("Fone", "bluez")]);
+        follow(&mut troca, t1, &mudou);
+        assert_eq!(
+            troca.keep_open(t1, |_| false, |_| Ok("bluez".to_string())),
+            None,
+            "troca pelo follow não é queda"
+        );
     }
 
     #[test]
