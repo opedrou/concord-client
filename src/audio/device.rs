@@ -1,9 +1,10 @@
 //! Dispositivos e streams do cpal. Fixo em 48 kHz, f32 e buffer de 10 ms: com o buffer
 //! padrão o eco caiu só 3 dB, com 10 ms caiu de 28 a 39 dB.
 //!
-//! ponytail: sem rubato. O PulseAudio já reamostra e o WASAPI funcionou em 44,1 kHz na
-//! VM. Se um dispositivo no Windows recusar 48 kHz, o stream não abre: é onde o rubato
-//! entra, na borda, sem mexer no motor.
+//! O PulseAudio converte sozinho. O WASAPI só converte a saída: o cpal liga o
+//! `AUTOCONVERTPCM` só nela, e mic com formato próprio estéreo ou a 44,1 kHz recusa mono
+//! 48 kHz com `AUDCLNT_E_UNSUPPORTED_FORMAT`. Aí a entrada abre no formato dele e o
+//! [`ToMono`] converte na borda, sem mexer no motor.
 use std::{
     sync::{
         Arc,
@@ -167,11 +168,49 @@ impl<R> Opened<R> {
     }
 }
 
-fn config(channels: u16) -> StreamConfig {
+/// Buffer de 10 ms na taxa pedida.
+fn config(channels: u16, rate: u32) -> StreamConfig {
     StreamConfig {
         channels,
-        sample_rate: RATE,
-        buffer_size: BufferSize::Fixed(FRAME as u32),
+        sample_rate: rate,
+        buffer_size: BufferSize::Fixed(rate / 100),
+    }
+}
+
+/// Junta os canais em mono e leva a taxa do dispositivo a 48 kHz. Em mono a 48 kHz só
+/// atrasa uma amostra.
+///
+/// ponytail: interpolação linear sem filtro. Sobe 44,1 kHz bem; descer de 96 kHz dobra
+/// ruído acima de 24 kHz pra dentro da banda. Rubato aqui se alguém ouvir isso.
+struct ToMono {
+    channels: usize,
+    /// Amostras de entrada por amostra de saída.
+    step: f64,
+    /// Posição da próxima saída, contada da amostra anterior, em amostras de entrada.
+    pos: f64,
+    prev: f32,
+}
+
+impl ToMono {
+    fn new(channels: u16, rate: u32) -> Self {
+        ToMono {
+            channels: channels.max(1) as usize,
+            step: rate as f64 / RATE as f64,
+            pos: 0.0,
+            prev: 0.0,
+        }
+    }
+
+    fn push(&mut self, data: &[f32], mut out: impl FnMut(f32)) {
+        for frame in data.chunks(self.channels) {
+            let cur = frame.iter().sum::<f32>() / frame.len() as f32;
+            while self.pos < 1.0 {
+                out(self.prev + (cur - self.prev) * self.pos as f32);
+                self.pos += self.step;
+            }
+            self.pos -= 1.0;
+            self.prev = cur;
+        }
     }
 }
 
@@ -203,7 +242,7 @@ pub fn open_output(name: Option<&str>) -> Result<Opened<Producer<f32>>, String> 
     let mut last = None;
     let stream = device
         .build_output_stream(
-            config(2),
+            config(2, RATE),
             move |data: &mut [f32], _| {
                 counter.called(&mut last, Instant::now());
                 let mut missed = 0;
@@ -232,24 +271,44 @@ pub fn open_output(name: Option<&str>) -> Result<Opened<Producer<f32>>, String> 
     })
 }
 
-/// Sem o dispositivo salvo, usa o padrão do sistema.
+/// Sem o dispositivo salvo, usa o padrão do sistema. Mono a 48 kHz, senão no formato
+/// do próprio dispositivo, convertido pelo [`ToMono`].
 pub fn open_input(name: Option<&str>) -> Result<Opened<Consumer<f32>>, String> {
     let host = host()?;
     let list = host.input_devices().into_iter().flatten();
     let device =
         pick(list, host.default_input_device(), name).ok_or("sem dispositivo de entrada")?;
+    input_stream(&device, 1, RATE).or_else(|e| {
+        let own = device
+            .default_input_config()
+            .map_err(|own| format!("{e}; formato do dispositivo: {own}"))?;
+        let (channels, rate) = (own.channels(), own.sample_rate());
+        let opened = input_stream(&device, channels, rate)
+            .map_err(|own| format!("{e}; em {channels} canais a {rate} Hz: {own}"))?;
+        log!("áudio: entrada recusou mono 48 kHz, abriu em {channels} canais a {rate} Hz");
+        Ok(opened)
+    })
+}
+
+fn input_stream(
+    device: &Device,
+    channels: u16,
+    rate: u32,
+) -> Result<Opened<Consumer<f32>>, String> {
     let (mut samples, ring) = RingBuffer::new(INPUT_RING);
     let (lost, errors) = on_error("entrada");
     let glitches = Arc::new(Glitches::default());
     let counter = glitches.clone();
     let mut last = None;
+    let mut mono = ToMono::new(channels, rate);
     let stream = device
         .build_input_stream(
-            config(1),
+            config(channels, rate),
             move |data: &[f32], _| {
                 counter.called(&mut last, Instant::now());
                 // Anel cheio perde o mais novo: só acontece com a thread parada.
-                let missed = data.iter().filter(|s| samples.push(**s).is_err()).count();
+                let mut missed = 0;
+                mono.push(data, |s| missed += samples.push(s).is_err() as usize);
                 if missed > 0 {
                     counter.missed.fetch_add(missed, Ordering::Relaxed);
                 }
@@ -264,7 +323,51 @@ pub fn open_input(name: Option<&str>) -> Result<Opened<Consumer<f32>>, String> {
         ring,
         glitches,
         lost,
-        name: name_of(&device).unwrap_or_default(),
-        id: id_of(&device),
+        name: name_of(device).unwrap_or_default(),
+        id: id_of(device),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn convert(channels: u16, rate: u32, data: &[f32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut mono = ToMono::new(channels, rate);
+        // Em pedaços de 10 ms, como o callback entrega.
+        for chunk in data.chunks(rate as usize / 100 * channels as usize) {
+            mono.push(chunk, |s| out.push(s));
+        }
+        out
+    }
+
+    #[test]
+    fn mono_48k_passa_igual() {
+        let data: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.01).sin()).collect();
+        let out = convert(1, RATE, &data);
+        assert_eq!(out.len(), data.len());
+        assert_eq!(out[1..], data[..data.len() - 1]);
+    }
+
+    #[test]
+    fn estereo_44k_vira_mono_48k() {
+        // 1 s de estéreo constante, esquerda 1 e direita 0,5.
+        let data: Vec<f32> = (0..44_100).flat_map(|_| [1.0, 0.5]).collect();
+        let out = convert(2, 44_100, &data);
+        assert!(out.len().abs_diff(48_000) <= 1, "{} amostras", out.len());
+        assert!(out[100..].iter().all(|s| (s - 0.75).abs() < 1e-6));
+    }
+
+    #[test]
+    fn seno_sobrevive_a_reamostragem() {
+        // 440 Hz a 44,1 kHz sai 440 Hz a 48 kHz, atrasado uma amostra de entrada.
+        let tone = |t: f64| (std::f64::consts::TAU * 440.0 * t).sin() as f32;
+        let data: Vec<f32> = (0..44_100).map(|i| tone(i as f64 / 44_100.0)).collect();
+        let out = convert(1, 44_100, &data);
+        let worst = (100..47_000)
+            .map(|k| (out[k] - tone(k as f64 / 48_000.0 - 1.0 / 44_100.0)).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-3, "erro {worst}");
+    }
 }
