@@ -43,7 +43,7 @@ use crate::config::Config;
 use crate::health::{self, Alive};
 use crate::share::{self, Capturer, Choice, Quality};
 
-mod stats;
+pub(crate) mod stats;
 
 /// Máximo de tentativas de reconexão, como na web.
 pub const MAX_ATTEMPTS: u32 = 10;
@@ -990,7 +990,8 @@ impl Task {
         self.set_recording(s);
         self.refresh(s);
         let mut debounce: Option<Instant> = None;
-        let mut stats_tick = tokio::time::interval_at(Instant::now() + stats::EVERY, stats::EVERY);
+        let every = crate::log::every(stats::EVERY);
+        let mut stats_tick = tokio::time::interval_at(Instant::now() + every, every);
         loop {
             tokio::select! {
                 event = s.events.recv() => {

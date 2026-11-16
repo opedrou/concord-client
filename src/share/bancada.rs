@@ -14,7 +14,7 @@ use tokio::{
 use super::*;
 use crate::api::{Client, Secret};
 use crate::audio::{AudioPrefs, Engine, MicGain, NoiseLevel, Sensitivity};
-use crate::call::{Call, End, Event};
+use crate::call::{Call, End, Event, stats};
 
 /// Sufixo fixo da identity da bancada.
 const INSTALL: &str = "bancada-tela";
@@ -61,15 +61,39 @@ fn sintetica(fps: u32, stop: &AtomicBool, mut feed: Feed) {
     let tela = std::env::var(var).unwrap_or_else(|_| padrao_tela.into());
     let (w, h) = tela.split_once('x').expect("FONTE");
     let (w, h): (usize, usize) = (w.parse().unwrap(), h.parse().unwrap());
-    let image = padrao(w + FOLGA, h + 1);
+    let mut image = padrao(w + FOLGA, h + 1);
+    let stride = (w + FOLGA) * 4;
+    // `PARADA=1`: tela parada (slide, código). `TROCA=N`: volta a rolar aos N s.
+    // `CURSOR=1`: um quadrado de 24x24 andando por cima, como o mouse.
+    let parada = std::env::var_os("PARADA").is_some();
+    let volta = std::env::var("TROCA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs);
+    let cursor = std::env::var_os("CURSOR").is_some();
     let inicio = Instant::now();
     while inicio.elapsed() < SELETOR && !stop.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(10));
     }
     let mut n = 0;
+    let mut embaixo = Vec::with_capacity(24 * 24 * 4);
     pace(fps, || {
-        let start = (n * 8) % FOLGA * 4;
-        feed.frame(&image[start..], (w + FOLGA) as u32 * 4, w as u32, h as u32);
+        let rola = !parada || volta.is_some_and(|t| inicio.elapsed() >= t);
+        let start = if rola { (n * 8) % FOLGA * 4 } else { 0 };
+        // Pinta o cursor, entrega e devolve o que estava embaixo: a fonte segue sem cópia.
+        let canto = start + h / 2 * stride + n * 4 % (w - 24) * 4;
+        embaixo.clear();
+        if cursor {
+            for y in 0..24 {
+                let linha = &mut image[canto + y * stride..][..24 * 4];
+                embaixo.extend_from_slice(linha);
+                linha.fill(255);
+            }
+        }
+        feed.frame(&image[start..], stride as u32, w as u32, h as u32);
+        for (y, salvo) in embaixo.chunks(24 * 4).enumerate() {
+            image[canto + y * stride..][..24 * 4].copy_from_slice(salvo);
+        }
         n += 1;
         !stop.load(Ordering::SeqCst)
     });
@@ -272,10 +296,21 @@ async fn bancada_tela_qualidade() {
     banca.ao_vivo(&me, quality).await;
     println!("PUBLICADO {}", var("QUALIDADE"));
     let fim = Instant::now() + Duration::from_secs(segundos());
+    let passo = crate::log::every(Duration::from_secs(5));
+    let last = stats::Last::default();
     while Instant::now() < fim {
-        sleep(Duration::from_secs(5)).await;
+        sleep(passo).await;
         if let Some((_, linha)) = enviado(&me).await {
             println!("{linha}");
+        }
+        // A linha do log da call: taxa, alvo, perda e RTT da janela, keyframes, PLI, pacer.
+        if let Some(track) = tela(&me).and_then(|p| p.track()) {
+            let faixa = stats::Labeled {
+                label: "tela (eu)".into(),
+                track: stats::Track::Local(track),
+                drawn: None,
+            };
+            stats::log(vec![faixa], last.clone()).await;
         }
     }
     banca.parar(&me).await;
@@ -412,8 +447,10 @@ async fn evento(rx: &mut UnboundedReceiver<Event>) -> Event {
         .expect("a call acabou sem Ended")
 }
 
-/// Caminho inteiro por `Call`, com motor de áudio de verdade. Fora do `audio/bancada.sh`
-/// o motor abriria o mic da máquina.
+/// Caminho inteiro por `Call`, com motor de áudio de verdade e o mic aberto falando TTS (a
+/// voz de quem transmite disputa o upload com a tela). `QUALIDADE` escolhe a qualidade
+/// (Econômica sem ela) e `PASSO_MS` o intervalo das linhas de stats e de saúde. Fora do
+/// `audio/bancada.sh` o motor abriria o mic da máquina.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn bancada_tela_call() {
@@ -421,19 +458,16 @@ async fn bancada_tela_call() {
         std::env::var_os("BANCADA_RAIZ").is_some(),
         "rode por src/audio/bancada.sh, num PipeWire próprio"
     );
-    let _ = Command::new("pactl")
-        .args(["load-module", "module-null-sink", "sink_name=bancada"])
-        .output();
-    let prefs = AudioPrefs {
-        input: None,
-        output: None,
-        noise: NoiseLevel::Off,
-        sensitivity: Sensitivity::Auto,
-        mic_gain: MicGain::Auto,
-        master: 71,
-        volumes: HashMap::new(),
-    };
+    let qualidade = std::env::var("QUALIDADE").unwrap_or_else(|_| "economica".into());
+    let quality: Quality = serde_json::from_str(&format!("\"{qualidade}\"")).expect("QUALIDADE");
+    let _rig = crate::audio::bancada::Rig::new();
+    let falando = Arc::new(AtomicBool::new(false));
+    crate::audio::bancada::fala_em_laco(falando.clone());
+    // A linha de saúde traz a fila de voz e a memória.
+    crate::health::start();
+    let prefs = crate::audio::bancada::prefs(NoiseLevel::Off);
     let (engine, mic): (Engine, Receiver<Vec<i16>>) = Engine::start(prefs).expect("motor");
+    engine.set_mic_muted(false);
     let client = cliente().await;
     let (call, mut events) = Call::join_with(
         client,
@@ -441,7 +475,7 @@ async fn bancada_tela_call() {
         INSTALL.to_owned(),
         engine,
         mic,
-        true,
+        false,
         sintetica,
     );
 
@@ -450,7 +484,7 @@ async fn bancada_tela_call() {
             break;
         }
     }
-    call.start_share(Quality::Economica, false, None);
+    call.start_share(quality, false, None);
     let local_no_ar = |e: &Event| match e {
         Event::Participants(list) => list.iter().any(|p| p.is_local && p.screen_share),
         _ => false,
@@ -480,6 +514,7 @@ async fn bancada_tela_call() {
         }
     }
     assert!(viu_off, "sair não parou a transmissão");
+    falando.store(true, Ordering::SeqCst);
     solta().await;
     println!("FIM");
 }

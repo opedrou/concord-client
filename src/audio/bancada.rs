@@ -47,10 +47,10 @@ fn pactl(args: &[&str]) -> String {
 }
 
 /// Módulos carregados. Soltar descarrega, mesmo com o teste em pânico.
-struct Rig(Vec<String>);
+pub(crate) struct Rig(Vec<String>);
 
 impl Rig {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut rig = Rig(vec![]);
         rig.load(
             "module-null-sink sink_name=bancada_fone channels=2 rate=48000 \
@@ -100,7 +100,7 @@ impl Drop for Rig {
     }
 }
 
-fn prefs(noise: NoiseLevel) -> AudioPrefs {
+pub(crate) fn prefs(noise: NoiseLevel) -> AudioPrefs {
     AudioPrefs {
         input: Some(MIC.into()),
         output: Some(FONE.into()),
@@ -231,6 +231,23 @@ impl Drop for Capture {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Frases de TTS uma atrás da outra no mic falso, com 1 s de pausa, até `stop`. A frase que
+/// estiver tocando termina sozinha.
+pub(crate) fn fala_em_laco(stop: Arc<AtomicBool>) {
+    assert!(!VOZ_DIR.is_empty(), "compile com CONCORD_VOZES");
+    thread::spawn(move || {
+        for nome in VOZES.iter().cycle() {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let _ = Command::new("paplay")
+                .args(["--device=bancada_sala", &format!("{VOZ_DIR}/{nome}.wav")])
+                .status();
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
 }
 
 pub(crate) struct Killed(pub(crate) Child);

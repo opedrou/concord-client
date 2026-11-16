@@ -104,7 +104,7 @@ fn run() {
     let mut next = Instant::now();
     loop {
         if Instant::now() >= next {
-            next += SAMPLE;
+            next += crate::log::every(SAMPLE);
             let counters = gauges();
             let sep = if counters.is_empty() { "" } else { " | " };
             log!("saúde: {}{sep}{counters}", memory());
@@ -197,12 +197,32 @@ fn memory() -> String {
     let kb = |k| proc_field(&status, k) >> 10;
     let files = std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
     format!(
-        "ram {} MB (anônima {} MB), gpu {}, threads {}, arquivos abertos {files}",
+        "ram {} MB (anônima {} MB, arquivo {} MB, compartilhada {} MB, swap {} MB), \
+         pressão de memória {}%, gpu {}, threads {}, arquivos abertos {files}",
         kb("VmRSS:"),
         kb("RssAnon:"),
+        kb("RssFile:"),
+        kb("RssShmem:"),
+        kb("VmSwap:"),
+        pressure(),
         gpu(),
         proc_field(&status, "Threads:")
     )
+}
+
+/// `some avg10` da memória: % do tempo em que alguma tarefa esperou por memória nos últimos
+/// 10 s. Separa "o processo soltou RAM" de "o kernel tomou a RAM do processo".
+#[cfg(not(windows))]
+fn pressure() -> String {
+    std::fs::read_to_string("/proc/pressure/memory")
+        .ok()
+        .and_then(|t| {
+            let some = t.lines().next()?;
+            some.split_whitespace()
+                .find_map(|f| f.strip_prefix("avg10="))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "?".into())
 }
 
 /// Memória de vídeo deste processo pelo `fdinfo` do DRM (amdgpu, i915, xe, nouveau). Cada
@@ -213,7 +233,9 @@ fn gpu() -> String {
         return "?".into();
     };
     let mut seen = std::collections::HashSet::new();
-    let (mut vram, mut gtt) = (0u64, 0u64);
+    // Por cliente: a interface, o encoder e o decodificador abrem contextos separados, e
+    // saber qual segura a memória decide o conserto.
+    let mut clients = Vec::new();
     for entry in dir.flatten() {
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
@@ -225,13 +247,26 @@ fn gpu() -> String {
         if !seen.insert((get("drm-pdev:").map(String::from), client.to_owned())) {
             continue;
         }
-        vram += drm_kib(get("drm-total-vram:").or(get("drm-memory-vram:")));
-        gtt += drm_kib(get("drm-total-gtt:").or(get("drm-memory-gtt:")));
+        clients.push((
+            client.to_owned(),
+            drm_kib(get("drm-total-vram:").or(get("drm-memory-vram:"))),
+            drm_kib(get("drm-total-gtt:").or(get("drm-memory-gtt:"))),
+        ));
     }
-    if seen.is_empty() {
+    if clients.is_empty() {
         return "?".into();
     }
-    format!("{} MB vram, {} MB gtt", vram >> 10, gtt >> 10)
+    let vram: u64 = clients.iter().map(|c| c.1).sum();
+    let gtt: u64 = clients.iter().map(|c| c.2).sum();
+    let mut out = format!("{} MB vram, {} MB gtt", vram >> 10, gtt >> 10);
+    if clients.len() > 1 {
+        let each: Vec<String> = clients
+            .iter()
+            .map(|(id, v, g)| format!("{id}: {}/{}", v >> 10, g >> 10))
+            .collect();
+        out += &format!(" (por cliente, vram/gtt: {})", each.join(", "));
+    }
+    out
 }
 
 /// `677520 KiB` em KiB. Sem unidade é byte.

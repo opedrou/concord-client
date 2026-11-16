@@ -1,6 +1,7 @@
 #!/bin/bash
 # Roda os testes de bancada do áudio num PipeWire próprio, sem ALSA nem Bluetooth: daqui
 # não dá pra alcançar a caixa nem o mic de verdade. Uso: src/audio/bancada.sh [filtro]
+# `PERFIL=release` compila em release, pra CPU comparável com as medidas da tela.
 RAIZ=$(mktemp -d "$XDG_RUNTIME_DIR/concord-bancada.XXXXXX") || exit 1
 sobe() {
   # HOME próprio ignora a config do usuário; sem D-Bus não há como chegar no Bluetooth.
@@ -30,4 +31,4 @@ sleep 2
 # PIPEWIRE_RUNTIME_DIR leva `pw-dump`, `pw-link` e `pw-record` pro PipeWire daqui, não pro
 # da sessão.
 export PULSE_SERVER="unix:$RAIZ/pulse/native" BANCADA_RAIZ="$RAIZ" PIPEWIRE_RUNTIME_DIR="$RAIZ"
-cargo test "${1:-bancada}" -- --ignored --nocapture --test-threads=1
+cargo test $([ "$PERFIL" = release ] && echo --release) "${1:-bancada}" -- --ignored --nocapture --test-threads=1

@@ -32,6 +32,18 @@ struct Run {
 
 static RUN: Mutex<Option<Run>> = Mutex::new(None);
 
+/// Intervalo de uma linha periódica (stats, saúde). Nas bancadas, que rodam como teste,
+/// `PASSO_MS` troca o padrão: uma medida de 60 s com linha a cada 30 s não diz nada.
+pub fn every(default: Duration) -> Duration {
+    if !cfg!(test) {
+        return default;
+    }
+    std::env::var("PASSO_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(default, Duration::from_millis)
+}
+
 /// Use pelo `log!`. Nos testes vai pro stderr, pra não sujar o arquivo de verdade.
 pub fn line(args: fmt::Arguments) {
     write(&format_line(args), false);
