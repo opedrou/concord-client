@@ -1,6 +1,8 @@
 //! Estatísticas do WebRTC no log a cada [`EVERY`]: por faixa, a rede (taxa, perda, jitter,
 //! áudio ocultado) e o vídeo (resolução, fps, decodificador e fps desenhado). Separa bug do
-//! cliente de rede ruim, e "não chegou pacote" de "chegou e não tocou".
+//! cliente de rede ruim, e "não chegou pacote" de "chegou e não tocou". No envio, perda e RTT
+//! são da janela (acumulado do servidor), e o vídeo traz o alvo do encoder, keyframes, PLI e a
+//! espera no pacer: alvo acima do enviado com fps caindo é o encoder; alvo baixo é a rede.
 use std::{
     collections::HashMap,
     fmt::Write,
@@ -44,6 +46,16 @@ struct Counters {
     dropped: u32,
     freezes: u32,
     drawn: u64,
+    /// Envio: soma dos RTTs do servidor, em s, e quantos foram medidos.
+    rtt: f64,
+    rtts: u64,
+    keyframes: u32,
+    plis: u32,
+    nacks: u32,
+    /// Envio: espera somada no pacer e no encoder, em s, e quadros codificados.
+    send_delay: f64,
+    encode_time: f64,
+    encoded: u32,
 }
 
 impl Counters {
@@ -57,6 +69,14 @@ impl Counters {
             dropped: self.dropped.saturating_sub(p.dropped),
             freezes: self.freezes.saturating_sub(p.freezes),
             drawn: self.drawn.saturating_sub(p.drawn),
+            rtt: (self.rtt - p.rtt).max(0.0),
+            rtts: self.rtts.saturating_sub(p.rtts),
+            keyframes: self.keyframes.saturating_sub(p.keyframes),
+            plis: self.plis.saturating_sub(p.plis),
+            nacks: self.nacks.saturating_sub(p.nacks),
+            send_delay: (self.send_delay - p.send_delay).max(0.0),
+            encode_time: (self.encode_time - p.encode_time).max(0.0),
+            encoded: self.encoded.saturating_sub(p.encoded),
         }
     }
 }
@@ -174,6 +194,7 @@ fn lines(
                     dropped: r.frames_dropped,
                     freezes: r.freeze_count,
                     drawn: drawn.unwrap_or(0),
+                    ..Counters::default()
                 };
                 let (d, dt) = delta(&i.rtc.id, c);
                 let video = i.stream.kind == "video";
@@ -218,25 +239,35 @@ fn lines(
                 out.push(t);
             }
             RtcStats::OutboundRtp(o) if o.outbound.active || o.stream.kind == "audio" => {
-                let c = Counters {
-                    bytes: o.sent.bytes_sent,
-                    packets: o.sent.packets_sent,
-                    ..Counters::default()
-                };
-                let (d, dt) = delta(&o.rtc.id, c);
                 let remote = stats.iter().find_map(|s| match s {
                     RtcStats::RemoteInboundRtp(r) if r.remote_inbound.local_id == o.rtc.id => {
-                        Some(&r.remote_inbound)
+                        Some(r)
                     }
                     _ => None,
                 });
                 let w = &o.outbound;
+                let c = Counters {
+                    bytes: o.sent.bytes_sent,
+                    packets: o.sent.packets_sent,
+                    lost: remote.map_or(0, |r| r.received.packets_lost),
+                    rtt: remote.map_or(0.0, |r| r.remote_inbound.total_round_trip_time),
+                    rtts: remote.map_or(0, |r| r.remote_inbound.round_trip_time_measurements),
+                    keyframes: w.key_frames_encoded,
+                    plis: w.pli_count,
+                    nacks: w.nack_count,
+                    send_delay: w.total_packet_send_delay,
+                    encode_time: w.total_encode_time,
+                    encoded: w.frames_encoded,
+                    ..Counters::default()
+                };
+                let (d, dt) = delta(&o.rtc.id, c);
+                let video = o.stream.kind == "video";
                 let rid = if w.rid.is_empty() {
                     String::new()
                 } else {
                     format!(" ({})", w.rid)
                 };
-                let mut t = if o.stream.kind == "video" {
+                let mut t = if video {
                     format!(
                         "vídeo: {label}{rid}: {} {}x{} {:.0} fps, {}, limitada por {:?}",
                         codec(stats, &o.stream.codec_id),
@@ -252,13 +283,44 @@ fn lines(
                 if let Some(dt) = dt {
                     let _ = write!(t, ", {:.0} kb/s", d.bytes as f64 * 8.0 / dt / 1000.0);
                 }
-                if let Some(r) = remote {
+                if video {
+                    let _ = write!(t, ", alvo {:.0} kb/s", w.target_bitrate / 1000.0);
+                }
+                if dt.is_some() && d.packets == 0 {
+                    t.push_str(", nada enviado");
+                } else if remote.is_some() && d.rtts == 0 {
+                    // Perda e RTT vêm do mesmo relatório (RR); sem ele na janela, os dois são
+                    // desconhecidos, não zero.
+                    t.push_str(", sem relatório do servidor");
+                } else if remote.is_some() {
+                    let lost = d.lost as f64;
                     let _ = write!(
                         t,
                         ", perda no servidor {:.1}%, RTT {:.0} ms",
-                        r.fraction_lost * 100.0,
-                        r.round_trip_time * 1000.0
+                        pct(lost, lost + d.packets as f64),
+                        d.rtt / d.rtts as f64 * 1000.0
                     );
+                }
+                if video {
+                    let _ = write!(
+                        t,
+                        ", {} keyframes, {} PLI, {} NACK",
+                        d.keyframes, d.plis, d.nacks
+                    );
+                    if d.packets > 0 {
+                        let _ = write!(
+                            t,
+                            ", pacer {:.1} ms",
+                            d.send_delay / d.packets as f64 * 1000.0
+                        );
+                    }
+                    if d.encoded > 0 {
+                        let _ = write!(
+                            t,
+                            ", encode {:.1} ms",
+                            d.encode_time / d.encoded as f64 * 1000.0
+                        );
+                    }
                 }
                 out.push(t);
             }
@@ -270,7 +332,9 @@ fn lines(
 
 #[cfg(test)]
 mod tests {
-    use livekit::webrtc::stats::{CodecStats, InboundRtpStats};
+    use livekit::webrtc::stats::{
+        CodecStats, InboundRtpStats, OutboundRtpStats, RemoteInboundRtpStats,
+    };
 
     use super::*;
 
@@ -331,6 +395,129 @@ mod tests {
                 "vídeo: tela de bia: VP8 1920x1080 30 fps, libvpx (software), 0 kb/s, \
                  perda 0.0%, 0 quadros descartados, 0 congelamentos, 28 fps na tela"
             ]
+        );
+    }
+
+    fn outbound(kind: &str, bytes: u64, sent: u64) -> OutboundRtpStats {
+        let mut o = OutboundRtpStats::default();
+        o.rtc.id = "out".into();
+        o.stream.kind = kind.into();
+        o.stream.codec_id = "c".into();
+        o.sent.bytes_sent = bytes;
+        o.sent.packets_sent = sent;
+        o.outbound.active = true;
+        o
+    }
+
+    fn tela(bytes: u64, sent: u64) -> OutboundRtpStats {
+        let mut o = outbound("video", bytes, sent);
+        o.outbound.frame_width = 1920;
+        o.outbound.frame_height = 1080;
+        o.outbound.frames_per_second = 30.0;
+        o.outbound.encoder_implementation = "VaapiH264".into();
+        o.outbound.power_efficient_encoder = true;
+        o
+    }
+
+    /// O relatório do servidor (RR) sobre o envio "out": acumulados de perda e de RTT.
+    fn remote(lost: i64, rtt: f64, rtts: u64) -> RtcStats {
+        let mut r = RemoteInboundRtpStats::default();
+        r.remote_inbound.local_id = "out".into();
+        r.received.packets_lost = lost;
+        r.remote_inbound.total_round_trip_time = rtt;
+        r.remote_inbound.round_trip_time_measurements = rtts;
+        RtcStats::RemoteInboundRtp(r)
+    }
+
+    #[test]
+    fn envio_de_video_mostra_alvo_perda_da_janela_e_keyframes() {
+        let mut last = HashMap::new();
+        let t0 = Instant::now();
+        let mut v = tela(0, 1000);
+        v.outbound.target_bitrate = 5_000_000.0;
+        v.outbound.key_frames_encoded = 1;
+        v.outbound.total_packet_send_delay = 1.0;
+        v.outbound.total_encode_time = 0.5;
+        v.outbound.frames_encoded = 100;
+        let first = [
+            codec_stats("c", "video/H264"),
+            RtcStats::OutboundRtp(v),
+            remote(0, 2.0, 20),
+        ];
+        assert_eq!(
+            lines("tela (eu)", &first, &mut last, t0, None),
+            [
+                "vídeo: tela (eu): H264 1920x1080 30 fps, VaapiH264 (hardware), limitada por None, \
+                 alvo 5000 kb/s, perda no servidor 0.0%, RTT 100 ms, 1 keyframes, 0 PLI, 0 NACK, \
+                 pacer 1.0 ms, encode 5.0 ms"
+            ]
+        );
+        // Janela: +1000 pacotes, +50 perdidos, +10 RTTs somando 2 s, +3 s no pacer.
+        let mut v = tela(18_750_000, 2000);
+        v.outbound.target_bitrate = 2_000_000.0;
+        v.outbound.key_frames_encoded = 3;
+        v.outbound.pli_count = 2;
+        v.outbound.nack_count = 5;
+        v.outbound.total_packet_send_delay = 4.0;
+        v.outbound.total_encode_time = 0.92;
+        v.outbound.frames_encoded = 200;
+        let second = [
+            codec_stats("c", "video/H264"),
+            RtcStats::OutboundRtp(v),
+            remote(50, 4.0, 30),
+        ];
+        assert_eq!(
+            lines("tela (eu)", &second, &mut last, t0 + EVERY, None),
+            [
+                "vídeo: tela (eu): H264 1920x1080 30 fps, VaapiH264 (hardware), limitada por None, \
+                 5000 kb/s, alvo 2000 kb/s, perda no servidor 4.8%, RTT 200 ms, 2 keyframes, \
+                 2 PLI, 5 NACK, pacer 3.0 ms, encode 4.2 ms"
+            ]
+        );
+    }
+
+    #[test]
+    fn envio_de_audio_sem_relatorio_nao_inventa_zero_e_aguenta_contador_zerado() {
+        let mut last = HashMap::new();
+        let t0 = Instant::now();
+        let lap = |bytes, sent, (lost, rtt, rtts)| {
+            [
+                codec_stats("c", "audio/opus"),
+                RtcStats::OutboundRtp(outbound("audio", bytes, sent)),
+                remote(lost, rtt, rtts),
+            ]
+        };
+        assert_eq!(
+            lines(
+                "mic (eu)",
+                &lap(0, 1000, (10, 1.0, 10)),
+                &mut last,
+                t0,
+                None
+            ),
+            ["rede: mic (eu): opus, perda no servidor 1.0%, RTT 100 ms"]
+        );
+        // Nenhum RR novo na janela: perda e RTT desconhecidos.
+        assert_eq!(
+            lines(
+                "mic (eu)",
+                &lap(180_000, 2500, (10, 1.0, 10)),
+                &mut last,
+                t0 + EVERY,
+                None
+            ),
+            ["rede: mic (eu): opus, 48 kb/s, sem relatório do servidor"]
+        );
+        // Contadores recomeçaram (republicação): nada negativo.
+        assert_eq!(
+            lines(
+                "mic (eu)",
+                &lap(1000, 50, (0, 0.1, 1)),
+                &mut last,
+                t0 + EVERY * 2,
+                None
+            ),
+            ["rede: mic (eu): opus, 0 kb/s, nada enviado"]
         );
     }
 }
