@@ -322,7 +322,7 @@ pub fn start() -> bool {
         Ok(false) => false,
         Ok(true) => {
             log!("atualização: esta versão não ficou de pé, voltou pra anterior");
-            restart()
+            restart(rejoin().as_deref())
         }
         Err(e) => {
             log!("atualização: não deu pra conferir a versão em teste: {e}");
@@ -640,15 +640,54 @@ fn swap(exe: &Path, state: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Abre a versão nova e fecha esta. Só fora de call.
 /// Abre a versão nova pelo caminho instalado. `false` se não abriu: aí esta segue aberta.
-pub fn restart() -> bool {
-    installed().is_some_and(|exe| Command::new(exe).spawn().is_ok())
+/// Com `rejoin`, a nova entra direto nesse canal de voz.
+pub fn restart(rejoin: Option<&str>) -> bool {
+    installed().is_some_and(|exe| {
+        let mut cmd = Command::new(exe);
+        if let Some(slug) = rejoin {
+            cmd.args([REJOIN, slug]);
+        }
+        cmd.spawn().is_ok()
+    })
+}
+
+const REJOIN: &str = "--rejoin";
+
+/// Canal da call em que estava quem reiniciou pra atualizar. Vale uma vez por processo:
+/// sair da conta e entrar de novo não volta pra call.
+pub fn rejoin() -> Option<String> {
+    static USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if USED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    rejoin_of(std::env::args())
+}
+
+fn rejoin_of(mut args: impl Iterator<Item = String>) -> Option<String> {
+    args.find(|a| a == REJOIN)?;
+    args.next()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejoin_le_o_canal_depois_da_flag() {
+        let args = |v: &[&str]| {
+            v.iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        assert_eq!(
+            rejoin_of(args(&["concord", "--rejoin", "call-tete"])).as_deref(),
+            Some("call-tete")
+        );
+        assert_eq!(rejoin_of(args(&["concord"])), None);
+        assert_eq!(rejoin_of(args(&["concord", "--rejoin"])), None);
+    }
 
     #[test]
     fn compara_versoes_pelos_numeros() {

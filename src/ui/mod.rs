@@ -127,6 +127,9 @@ struct Main {
     check: Option<Check>,
     /// Canal de texto aberto no lugar do palco.
     chat: Option<chat::Chat>,
+    /// Canal de voz pra entrar quando a lista de canais chegar: a call de antes de
+    /// reiniciar pra atualizar.
+    rejoin: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -551,10 +554,17 @@ impl App {
                 Task::none()
             }
             Msg::Channels(Ok(channels)) => {
-                if let Screen::Main(m) = &mut self.screen {
-                    m.channels = channels;
+                let Screen::Main(m) = &mut self.screen else {
+                    return Task::none();
+                };
+                m.channels = channels;
+                match m.rejoin.take() {
+                    Some(slug) => {
+                        log!("atualização: volta pra call {slug}");
+                        self.join_channel(slug)
+                    }
+                    None => Task::none(),
                 }
-                Task::none()
             }
             Msg::Channels(Err(e)) => self.main_failed(e),
             Msg::Members(Ok(members)) => {
@@ -961,9 +971,13 @@ impl App {
                 }
                 Task::none()
             }
-            // Com call, sai pelo mesmo caminho de fechar a janela, que deixa a sala limpo.
+            // Com call, sai pelo mesmo caminho de fechar a janela, que deixa a sala limpo, e a
+            // versão nova volta pra ela.
             Msg::RestartForUpdate => match &self.screen {
-                Screen::Main(m) if m.update.is_some() && crate::update::restart() => {
+                Screen::Main(m)
+                    if m.update.is_some()
+                        && crate::update::restart(m.call.as_ref().map(|c| c.slug.as_str())) =>
+                {
                     window::latest().and_then(|id| Task::done(Msg::CloseRequested(id)))
                 }
                 _ => Task::none(),
@@ -1417,6 +1431,7 @@ impl App {
             update: None,
             check: None,
             chat: None,
+            rejoin: crate::update::rejoin(),
         };
         let avatars = main.fetch_avatars();
         self.screen = Screen::Main(Box::new(main));
@@ -1869,6 +1884,22 @@ mod tests {
         let list = names.iter().map(|n| voice::test_live(n, false)).collect();
         let _ = a.update(Msg::CallEvent(id, call::Event::Participants(list)));
         a
+    }
+
+    /// Reiniciou pra atualizar no meio da call: a versão nova entra nela quando os canais
+    /// chegam, uma vez só. Sem o `--rejoin`, abre fora de call.
+    #[test]
+    fn depois_de_atualizar_volta_pra_call() {
+        let canais = || vec![canal(2, "Call", ChannelKind::Voice)];
+        let mut a = main_app();
+        main_of(&mut a).rejoin = Some("call".into());
+        let _ = a.update(Msg::Channels(Ok(canais())));
+        assert_eq!(call_of(&mut a).slug, "call");
+        assert!(main_of(&mut a).rejoin.is_none());
+
+        let mut a = main_app();
+        let _ = a.update(Msg::Channels(Ok(canais())));
+        assert!(main_of(&mut a).call.is_none());
     }
 
     #[test]
