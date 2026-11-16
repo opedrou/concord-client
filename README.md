@@ -4,7 +4,7 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.14.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.15.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
@@ -66,19 +66,13 @@ o seletor de tela do sistema (xdg-desktop-portal).
 - No chat, selecionar e copiar funciona dentro de uma mensagem, não pegando várias de uma vez.
 - O chat manda a foto original; o site encolhe antes de enviar.
 
-## Novidades da v0.1.14
+## Novidades da v0.1.15
 
 ### Corrigido
-- **A memória da placa de vídeo enchia com a janela fora de vista também no Linux:** a v0.1.13
-  só resolvia a janela minimizada no Windows. No Linux, trocar de área de trabalho ou esconder a
-  janela enquanto assistia uma transmissão passava de 10 GB em pouco mais de um minuto, e o som da
-  call travava junto. Agora a transmissão, as câmeras e a prévia da sua tela só pegam quadro novo
-  depois que a janela mostra o anterior, em qualquer sistema.
-
-### Interno
-- O log mostra mais do vídeo que você envia: o alvo do codificador, quadros-chave, pedidos de
-  quadro novo e a perda e o atraso medidos nos últimos 30 s, em vez do último relatório.
-- A linha de memória do log no Linux traz swap, pressão de memória e a memória de vídeo.
+- **Microfone que não abria no Windows:** alguns microfones só aceitam o próprio formato, em
+  estéreo ou em outra taxa, e recusavam o que o app pedia. O mic ficava desligado a call inteira,
+  ninguém ouvia, e o log mostrava `AUDCLNT_E_UNSUPPORTED_FORMAT`. Agora o app abre o microfone no
+  formato dele e converte.
 
 ## Compilar
 
