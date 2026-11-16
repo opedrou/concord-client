@@ -4,7 +4,7 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.13.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.14.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
@@ -66,21 +66,19 @@ o seletor de tela do sistema (xdg-desktop-portal).
 - No chat, selecionar e copiar funciona dentro de uma mensagem, não pegando várias de uma vez.
 - O chat manda a foto original; o site encolhe antes de enviar.
 
-## Novidades da v0.1.13
-
-### Novo
-- **Atualizar no meio da call volta pra ela:** clicar na seta verde reinicia na versão nova e
-  entra direto na call em que você estava. Abrir o app de outro jeito continua abrindo fora de
-  call.
+## Novidades da v0.1.14
 
 ### Corrigido
-- **Assistir uma transmissão com a janela minimizada enchia a memória da placa de vídeo:** cada
-  quadro ficava guardado até a janela voltar, e em um minuto passava de 10 GB, até a tela travar.
-  Minimizada, a janela agora para de pegar quadros da transmissão e das câmeras.
+- **A memória da placa de vídeo enchia com a janela fora de vista também no Linux:** a v0.1.13
+  só resolvia a janela minimizada no Windows. No Linux, trocar de área de trabalho ou esconder a
+  janela enquanto assistia uma transmissão passava de 10 GB em pouco mais de um minuto, e o som da
+  call travava junto. Agora a transmissão, as câmeras e a prévia da sua tela só pegam quadro novo
+  depois que a janela mostra o anterior, em qualquer sistema.
 
-### Limites conhecidos
-- A volta pra call vale a partir da próxima atualização: quem atualiza da v0.1.12 pra esta ainda
-  abre fora de call.
+### Interno
+- O log mostra mais do vídeo que você envia: o alvo do codificador, quadros-chave, pedidos de
+  quadro novo e a perda e o atraso medidos nos últimos 30 s, em vez do último relatório.
+- A linha de memória do log no Linux traz swap, pressão de memória e a memória de vídeo.
 
 ## Compilar
 
