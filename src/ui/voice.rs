@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use iced::widget::image;
 use iced::{Point, Size};
 
+use super::drawn;
 use super::sounds::Cues;
 use crate::api::{self, Participant};
 use crate::audio::{Engine, Meter, MicFrames};
@@ -112,6 +113,9 @@ pub struct ActiveCall {
     pub own_pending: bool,
     /// Janela sem foco: a prévia própria para, a transmissão não.
     pub preview_paused: bool,
+    /// Desenho em que o último quadro (tela, câmera ou prévia) subiu: o próximo só sobe
+    /// depois de outro desenho, que solta o trocado. Ver [`drawn`].
+    uploaded_at: Option<u64>,
     /// Tamanho da transmissão assistida.
     pub view: View,
     /// Mouse perto do pé do palco: a barra de controles aparece.
@@ -166,6 +170,7 @@ impl ActiveCall {
             own: None,
             own_pending: false,
             preview_paused: false,
+            uploaded_at: None,
             view: View::Tile,
             bar_near: false,
             cursor: Point::ORIGIN,
@@ -299,7 +304,7 @@ impl ActiveCall {
 
     /// Prévia própria nova pra subir pra GPU, se chegou uma e a anterior já subiu.
     pub fn pull_own(&mut self) -> Option<image::Handle> {
-        if self.own_pending || self.share != share::State::Live {
+        if self.own_pending || self.share != share::State::Live || !self.can_upload() {
             return None;
         }
         let p = self.call.as_ref()?.preview().take()?;
@@ -312,6 +317,7 @@ impl ActiveCall {
         self.own_pending = false;
         if self.share == share::State::Live && allocation.is_some() {
             self.own = allocation;
+            self.uploaded_at = Some(drawn::count());
         }
     }
 
@@ -426,9 +432,14 @@ impl ActiveCall {
         self.watching = identity;
     }
 
+    /// Já houve desenho depois do último quadro que subiu, e ele soltou o trocado.
+    pub fn can_upload(&self) -> bool {
+        drawn::since(self.uploaded_at)
+    }
+
     /// Quadro novo pra subir pra GPU, se chegou um e o anterior já subiu.
     pub fn pull_screen(&mut self) -> Option<image::Handle> {
-        if self.screen_pending || self.watching.is_none() {
+        if self.screen_pending || self.watching.is_none() || !self.can_upload() {
             return None;
         }
         let p = self.call.as_ref()?.screen().take()?;
@@ -441,6 +452,7 @@ impl ActiveCall {
         self.screen_pending = false;
         if self.watching.is_some() && allocation.is_some() {
             self.screen = allocation;
+            self.uploaded_at = Some(drawn::count());
         }
     }
 
@@ -473,7 +485,7 @@ impl ActiveCall {
 
     /// Quadros novos de câmera pra subir pra GPU, um por pessoa, de quem não tem um subindo.
     pub fn pull_cameras(&mut self) -> Vec<(String, image::Handle)> {
-        let Some(call) = &self.call else {
+        let Some(call) = self.call.as_ref().filter(|_| self.can_upload()) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -500,6 +512,7 @@ impl ActiveCall {
             .any(|l| l.identity == identity && l.camera);
         if let (true, Some(a)) = (on, allocation) {
             self.cameras.insert(identity, a);
+            self.uploaded_at = Some(drawn::count());
         }
     }
 

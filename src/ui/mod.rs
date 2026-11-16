@@ -1,6 +1,7 @@
 //! Telas e estado do app. A rede roda em `Task`; o resto é síncrono.
 mod avatar;
 mod chat;
+mod drawn;
 mod screens;
 mod sidebar;
 mod sounds;
@@ -445,7 +446,12 @@ impl App {
         Subscription::batch(subs)
     }
 
+    /// A tela, com o contador de desenhos por cima: quadro só sobe pra GPU depois de um.
     pub fn view(&self) -> Element<'_, Msg> {
+        drawn::probe(self.page())
+    }
+
+    fn page(&self) -> Element<'_, Msg> {
         match &self.screen {
             Screen::Connecting => screens::connecting(),
             Screen::Server(f) => screens::server(f),
@@ -2339,6 +2345,21 @@ mod tests {
 
     /// Minimizada, o iced não desenha e não solta os quadros já na GPU: a log de um usuário
     /// mostrou 13 GB de VRAM em 1 min assistindo 1080p com a janela minimizada.
+    /// Quadro só sobe pra GPU depois de um desenho, que solta o trocado. Janela escondida não
+    /// desenha (minimizada no Windows, fora de vista no Wayland): a log mostrou 11 GB em 1 min.
+    #[test]
+    fn quadro_novo_espera_um_desenho() {
+        let mut a = in_call(&["Ana"]);
+        let _ = a.update(Msg::Watch(Some("Ana".into())));
+        assert!(call_of(&mut a).can_upload(), "nada subiu ainda");
+        let _ = a.update(Msg::ScreenReady(Some(alocada(64, 36))));
+        assert!(!call_of(&mut a).can_upload(), "sem desenho, nada sobe");
+        let _ = a.update(Msg::ScreenReady(Some(alocada(64, 36))));
+        assert!(!call_of(&mut a).can_upload());
+        drawn::draw_for_test();
+        assert!(call_of(&mut a).can_upload());
+    }
+
     #[test]
     fn janela_minimizada_nao_sobe_quadro() {
         let ev = |w, h| {
