@@ -4,7 +4,7 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.12.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.13.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
@@ -66,24 +66,21 @@ o seletor de tela do sistema (xdg-desktop-portal).
 - No chat, selecionar e copiar funciona dentro de uma mensagem, não pegando várias de uma vez.
 - O chat manda a foto original; o site encolhe antes de enviar.
 
-## Novidades da v0.1.12
+## Novidades da v0.1.13
 
 ### Novo
-- **Um log por abertura, pra relatar bug:** cada vez que o app abre, ele grava um arquivo novo em
-  `%APPDATA%\Concord\logs` no Windows ou `~/.config/concord/logs` no Linux, com a data e a hora
-  no nome. Ficam os 10 mais novos, com até 3 MB cada. Se algo der errado, mande o arquivo daquela
-  abertura.
-- **Log mais completo:** memória e threads do app a cada minuto, quanto som chegou de cada pessoa,
-  qualidade da rede e do vídeo a cada 30 s, quanto tempo um dispositivo ou a call ficou fora,
-  travamentos, os cliques e as configurações. Nunca senha nem texto do chat.
+- **Atualizar no meio da call volta pra ela:** clicar na seta verde reinicia na versão nova e
+  entra direto na call em que você estava. Abrir o app de outro jeito continua abrindo fora de
+  call.
 
-### Interno
-- Erros do Windows aparecem em hexadecimal e com o nome (`0x88890004 AUDCLNT_E_DEVICE_INVALIDATED`).
-- Avisos do LiveKit e da placa de vídeo, e a placa que o app escolheu, entram no mesmo log.
+### Corrigido
+- **Assistir uma transmissão com a janela minimizada enchia a memória da placa de vídeo:** cada
+  quadro ficava guardado até a janela voltar, e em um minuto passava de 10 GB, até a tela travar.
+  Minimizada, a janela agora para de pegar quadros da transmissão e das câmeras.
 
 ### Limites conhecidos
-- O `concord.log` das versões anteriores fica onde estava e pode ser apagado à mão.
-- No Windows, um erro grave aparece no log sem o nome das funções.
+- A volta pra call vale a partir da próxima atualização: quem atualiza da v0.1.12 pra esta ainda
+  abre fora de call.
 
 ## Compilar
 
