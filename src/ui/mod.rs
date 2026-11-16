@@ -61,6 +61,9 @@ const ID_USUARIO: &str = "campo-usuario";
 pub struct App {
     config: Config,
     screen: Screen,
+    /// Minimizada a janela fica 0x0 e o iced para de desenhar. Quadro que sobe pra GPU só é
+    /// solto no fim de um desenho, então nada sobe enquanto ela está minimizada.
+    minimized: bool,
 }
 
 enum Screen {
@@ -198,6 +201,8 @@ pub enum Msg {
     CameraReady(String, Option<image::Allocation>),
     /// A janela ganhou ou perdeu o foco.
     Focus(bool),
+    /// A janela mudou de tamanho: `true` quando foi a 0x0, minimizada.
+    Minimized(bool),
     /// Põe a transmissão assistida em tela cheia, pelo menu do botão direito.
     Fullscreen,
     /// Clique na transmissão assistida: alterna entre o tile e grande com as pessoas do lado.
@@ -376,6 +381,7 @@ impl App {
                 Self {
                     config,
                     screen: Screen::Connecting,
+                    minimized: false,
                 },
                 connect(server),
             ),
@@ -385,7 +391,14 @@ impl App {
                     error: None,
                     busy: false,
                 });
-                (Self { config, screen }, operation::focus(ID_SERVIDOR))
+                (
+                    Self {
+                        config,
+                        screen,
+                        minimized: false,
+                    },
+                    operation::focus(ID_SERVIDOR),
+                )
             }
         }
     }
@@ -406,13 +419,14 @@ impl App {
             if m.call.as_ref().is_some_and(ActiveCall::holding) {
                 subs.push(time::every(QUADRO).map(Msg::Frame));
             }
-            if m.call.as_ref().is_some_and(|c| c.watching.is_some()) {
+            let shown = !self.minimized;
+            if shown && m.call.as_ref().is_some_and(|c| c.watching.is_some()) {
                 subs.push(time::every(TELA).map(|_| Msg::ScreenTick));
             }
             if m.call.as_ref().is_some_and(ActiveCall::preview_clock) {
                 subs.push(time::every(PREVIA).map(|_| Msg::PreviewTick));
             }
-            if m.call.as_ref().is_some_and(ActiveCall::camera_clock) {
+            if shown && m.call.as_ref().is_some_and(ActiveCall::camera_clock) {
                 subs.push(time::every(CAMERA).map(|_| Msg::CameraTick));
             }
             if m.meter_clock() {
@@ -897,6 +911,20 @@ impl App {
             Msg::Focus(focused) => {
                 if let Some(call) = self.call_mut() {
                     call.set_focus(focused);
+                }
+                Task::none()
+            }
+            Msg::Minimized(minimized) => {
+                if self.minimized != minimized {
+                    self.minimized = minimized;
+                    log!(
+                        "ação: {}",
+                        if minimized {
+                            "minimizou a janela"
+                        } else {
+                            "restaurou a janela"
+                        }
+                    );
                 }
                 Task::none()
             }
@@ -1595,6 +1623,9 @@ fn focus(event: Event, _: event::Status, _: window::Id) -> Option<Msg> {
     match event {
         Event::Window(window::Event::Focused) => Some(Msg::Focus(true)),
         Event::Window(window::Event::Unfocused) => Some(Msg::Focus(false)),
+        Event::Window(window::Event::Resized(s)) => {
+            Some(Msg::Minimized(s.width == 0.0 || s.height == 0.0))
+        }
         _ => None,
     }
 }
@@ -1609,6 +1640,7 @@ mod tests {
         App {
             config: Config::default(),
             screen,
+            minimized: false,
         }
     }
 
@@ -2272,6 +2304,22 @@ mod tests {
         // SAFETY: renderer nenhum guarda memória por esta `Allocation`; ela só leva o handle,
         // que o tiny-skia carrega na hora de desenhar.
         unsafe { iced_test::core::image::allocate(&handle, iced::Size::new(w, h)) }
+    }
+
+    /// Minimizada, o iced não desenha e não solta os quadros já na GPU: a log de um usuário
+    /// mostrou 13 GB de VRAM em 1 min assistindo 1080p com a janela minimizada.
+    #[test]
+    fn janela_minimizada_nao_sobe_quadro() {
+        let ev = |w, h| {
+            let e = Event::Window(window::Event::Resized(iced::Size::new(w, h)));
+            focus(e, event::Status::Ignored, window::Id::unique())
+        };
+        let mut a = in_call(&["Ana"]);
+        assert!(matches!(ev(0.0, 0.0), Some(Msg::Minimized(true))));
+        let _ = a.update(ev(0.0, 0.0).unwrap());
+        assert!(a.minimized);
+        let _ = a.update(ev(1280.0, 720.0).unwrap());
+        assert!(!a.minimized);
     }
 
     #[test]

@@ -961,6 +961,7 @@ mod tests {
         let mut a = super::super::App {
             config: Config::default(),
             screen: Screen::Connecting,
+            minimized: false,
         };
         let user = User {
             id: 3,
