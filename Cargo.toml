@@ -79,3 +79,5 @@ winresource = "0.1"
 
 [dev-dependencies]
 iced_test = "0.14"
+# `Room::publisher_senders`, pro degrau de taxa da bancada da tela. Só entra nos testes.
+livekit = { version = "0.10", features = ["__lk-e2e-test"] }

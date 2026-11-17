@@ -283,6 +283,38 @@ async fn andando(me: &LocalParticipant) {
     }
 }
 
+/// `DEGRAU=25:800,40:2000`: aos 25 s do `PUBLICADO` o teto da tela vai a 800 kb/s, aos 40 s a
+/// 2000. Degrau de taxa sem `tc`: o alvo do encoder cai como cairia pelo BWE.
+fn degraus() -> Vec<(u64, u64)> {
+    let Ok(lista) = std::env::var("DEGRAU") else {
+        return vec![];
+    };
+    lista
+        .split(',')
+        .map(|d| {
+            let (s, kbps) = d.split_once(':').expect("DEGRAU=segundos:kbps,...");
+            (s.parse().expect("segundos"), kbps.parse().expect("kbps"))
+        })
+        .collect()
+}
+
+/// Muda o `max_bitrate` do sender de vídeo, o único publicado na `bancada_tela_qualidade`.
+fn teto(room: &Room, kbps: u64) {
+    use livekit::webrtc::media_stream_track::MediaStreamTrack;
+    for sender in room.publisher_senders() {
+        if !matches!(sender.track(), Some(MediaStreamTrack::Video(_))) {
+            continue;
+        }
+        let mut params = sender.parameters();
+        for e in &mut params.encodings {
+            e.max_bitrate = Some(kbps * 1000);
+        }
+        sender.set_parameters(params).expect("set_parameters");
+        let hora = chrono::Local::now().format("%H:%M:%S%.3f");
+        println!("DEGRAU {kbps} kb/s às {hora}");
+    }
+}
+
 /// Publica pelo tempo de `SEGUNDOS`, pra medir de fora. `bancada.sh` espera o `PUBLICADO`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -295,11 +327,16 @@ async fn bancada_tela_qualidade() {
     let mut banca = Banca::new(me.clone());
     banca.ao_vivo(&me, quality).await;
     println!("PUBLICADO {}", var("QUALIDADE"));
-    let fim = Instant::now() + Duration::from_secs(segundos());
+    let inicio = Instant::now();
+    let fim = inicio + Duration::from_secs(segundos());
     let passo = crate::log::every(Duration::from_secs(5));
     let last = stats::Last::default();
+    let mut degraus = degraus().into_iter().peekable();
     while Instant::now() < fim {
         sleep(passo).await;
+        while let Some((_, kbps)) = degraus.next_if(|&(s, _)| inicio.elapsed().as_secs() >= s) {
+            teto(&room, kbps);
+        }
         if let Some((_, linha)) = enviado(&me).await {
             println!("{linha}");
         }
