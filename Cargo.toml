@@ -68,6 +68,8 @@ zbus = "5"
 # "Concord:"). Até o 0.11.0 o crate não manda. Subir o livekit exige copiar de novo.
 [patch.crates-io]
 livekit = { path = "vendor/livekit" }
+# Cópia do webrtc-sys 0.3.53, a versão que o livekit 0.10 fixa, ainda sem mudança.
+webrtc-sys = { path = "vendor/webrtc-sys" }
 
 [build-dependencies]
 # Ícone embutido no .exe do Windows (`build.rs`).
