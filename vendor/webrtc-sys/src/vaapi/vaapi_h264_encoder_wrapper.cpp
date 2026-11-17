@@ -4,7 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>  // Concord: hora do log.
 
+#include <chrono>  // Concord: relógio da histerese da taxa.
+#include <cstdarg>  // Concord: ConcordVaapiLog.
 #include <map>
 
 #include "rtc_base/checks.h"
@@ -1255,11 +1258,103 @@ static void release_frame_param_bufs(VA264Context* context) {
   context->num_frame_param_bufs = 0;
 }
 
-static int render_sequence(VA264Context* context) {
-  VABufferID seq_param_buf, rc_param_buf, misc_param_tmpbuf, render_id[2];
+namespace livekit_ffi {
+
+// Concord: ver o .h.
+void ConcordVaapiLog(const char* format, ...) {
+  static const bool on = getenv("CONCORD_VAAPI_LOG") != nullptr;
+  if (!on) {
+    return;
+  }
+  auto now = std::chrono::system_clock::now();
+  time_t secs = std::chrono::system_clock::to_time_t(now);
+  int ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+               now.time_since_epoch())
+               .count() %
+           1000;
+  struct tm local;
+  localtime_r(&secs, &local);
+  char line[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  fprintf(stderr, "%02d:%02d:%02d.%03d vaapi: %s\n", local.tm_hour,
+          local.tm_min, local.tm_sec, ms, line);
+}
+
+}  // namespace livekit_ffi
+
+// Concord: relógio da histerese da taxa.
+static int64_t now_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Concord: a taxa pedida mudou o bastante pra ir ao driver num quadro P. Mais de 10% vai no
+// quadro seguinte; menos espera 500 ms desde o último envio. O SetRates chega a cada mudança
+// de alocação, e sem isso quase todo quadro levaria um buffer de taxa.
+static bool rate_changed(const VA264Context* context) {
+  const uint32_t wanted = context->config.bitrate;
+  const uint32_t sent = context->sent_bitrate;
+  if (wanted == sent) {
+    return false;
+  }
+  const uint64_t diff = wanted > sent ? wanted - sent : sent - wanted;
+  return diff * 10 > sent || now_ms() - context->sent_ms >= 500;
+}
+
+// Concord: o buffer de taxa que era do render_sequence, agora também mandado em quadro P.
+static int render_rate_control(VA264Context* context) {
+  VABufferID rc_param_buf;
   VAStatus va_status;
-  VAEncMiscParameterBuffer *misc_param, *misc_param_tmp;
+  VAEncMiscParameterBuffer* misc_param;
   VAEncMiscParameterRateControl* misc_rate_ctrl;
+
+  va_status = vaCreateBuffer(
+      context->va_dpy, context->context_id, VAEncMiscParameterBufferType,
+      sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl),
+      1, NULL, &rc_param_buf);
+  if (va_status != VA_STATUS_SUCCESS) {
+    RTC_LOG(LS_ERROR) << "vaCreateBuffer failed va_status = " << va_status;
+    return -1;
+  }
+  track_frame_param_buf(context, rc_param_buf);
+
+  vaMapBuffer(context->va_dpy, rc_param_buf, (void**)&misc_param);
+  misc_param->type = VAEncMiscParameterTypeRateControl;
+  misc_rate_ctrl = (VAEncMiscParameterRateControl*)misc_param->data;
+  memset(misc_rate_ctrl, 0, sizeof(*misc_rate_ctrl));
+  misc_rate_ctrl->bits_per_second = context->config.bitrate;
+  misc_rate_ctrl->target_percentage = 66;
+  misc_rate_ctrl->window_size = 1000;
+  misc_rate_ctrl->initial_qp = context->config.initial_qp;
+  misc_rate_ctrl->min_qp = context->config.minimal_qp;
+  misc_rate_ctrl->basic_unit_size = 0;
+  vaUnmapBuffer(context->va_dpy, rc_param_buf);
+
+  va_status =
+      vaRenderPicture(context->va_dpy, context->context_id, &rc_param_buf, 1);
+
+  if (va_status != VA_STATUS_SUCCESS) {
+    RTC_LOG(LS_ERROR) << "vaRenderPicture failed va_status = " << va_status;
+    return -1;
+  }
+
+  context->sent_bitrate = context->config.bitrate;
+  context->sent_ms = now_ms();
+  livekit_ffi::ConcordVaapiLog("driver bits_per_second %u (%s, quadro %llu)",
+                               context->config.bitrate,
+                               context->current_frame_type == FRAME_IDR ? "IDR" : "P",
+                               (unsigned long long)context->current_frame_encoding);
+  return 0;
+}
+
+static int render_sequence(VA264Context* context) {
+  // Concord: o buffer de taxa e as variáveis dele foram pro render_rate_control.
+  VABufferID seq_param_buf;
+  VAStatus va_status;
 
   context->seq_param.level_idc = 41 /*SH_LEVEL_3*/;
   context->seq_param.picture_width_in_mbs = context->frame_width_mbaligned / 16;
@@ -1305,40 +1400,15 @@ static int render_sequence(VA264Context* context) {
   }
   track_frame_param_buf(context, seq_param_buf);
 
-  va_status = vaCreateBuffer(
-      context->va_dpy, context->context_id, VAEncMiscParameterBufferType,
-      sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl),
-      1, NULL, &rc_param_buf);
-  if (va_status != VA_STATUS_SUCCESS) {
-    RTC_LOG(LS_ERROR) << "vaCreateBuffer failed va_status = " << va_status;
-    return -1;
-  }
-  track_frame_param_buf(context, rc_param_buf);
-
-  vaMapBuffer(context->va_dpy, rc_param_buf, (void**)&misc_param);
-  misc_param->type = VAEncMiscParameterTypeRateControl;
-  misc_rate_ctrl = (VAEncMiscParameterRateControl*)misc_param->data;
-  memset(misc_rate_ctrl, 0, sizeof(*misc_rate_ctrl));
-  misc_rate_ctrl->bits_per_second = context->config.bitrate;
-  misc_rate_ctrl->target_percentage = 66;
-  misc_rate_ctrl->window_size = 1000;
-  misc_rate_ctrl->initial_qp = context->config.initial_qp;
-  misc_rate_ctrl->min_qp = context->config.minimal_qp;
-  misc_rate_ctrl->basic_unit_size = 0;
-  vaUnmapBuffer(context->va_dpy, rc_param_buf);
-
-  render_id[0] = seq_param_buf;
-  render_id[1] = rc_param_buf;
-
+  // Concord: o buffer de taxa saiu daqui pro render_rate_control, que também vai em quadro P.
+  // O de sequência vai sozinho, e o de taxa logo depois.
   va_status =
-      vaRenderPicture(context->va_dpy, context->context_id, &render_id[0], 2);
-
+      vaRenderPicture(context->va_dpy, context->context_id, &seq_param_buf, 1);
   if (va_status != VA_STATUS_SUCCESS) {
     RTC_LOG(LS_ERROR) << "vaRenderPicture failed va_status = " << va_status;
     return -1;
   }
-
-  return 0;
+  return render_rate_control(context);
 }
 
 std::map<int, std::string> frame_type_map = {{FRAME_P, "P"},
@@ -1877,6 +1947,10 @@ bool VaapiH264EncoderWrapper::Encode(int fourcc,
     }
   } else {
     render_picture(context_.get());
+    // Concord: a taxa nova vai ao driver já neste quadro P, sem esperar o próximo IDR.
+    if (rate_changed(context_.get())) {
+      render_rate_control(context_.get());
+    }
   }
   render_slice(context_.get());
 

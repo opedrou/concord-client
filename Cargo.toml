@@ -68,7 +68,9 @@ zbus = "5"
 # "Concord:"). Até o 0.11.0 o crate não manda. Subir o livekit exige copiar de novo.
 [patch.crates-io]
 livekit = { path = "vendor/livekit" }
-# Cópia do webrtc-sys 0.3.53, a versão que o livekit 0.10 fixa, ainda sem mudança.
+# Cópia do webrtc-sys 0.3.53, a versão que o livekit 0.10 fixa, com o encoder VA-API mexido
+# (`vendor/webrtc-sys/src/vaapi`, procurar "Concord:"). Subir o livekit exige copiar de novo
+# e reaplicar.
 webrtc-sys = { path = "vendor/webrtc-sys" }
 
 [build-dependencies]

@@ -288,6 +288,11 @@ void VAAPIH264EncoderWrapper::SetRates(
     return;
   }
 
+  // Concord: alvo que o libwebrtc pede, pra comparar com o que chega ao driver.
+  livekit_ffi::ConcordVaapiLog("SetRates alvo %u kb/s, %.1f fps",
+                               parameters.bitrate.GetSpatialLayerSum(0) / 1000,
+                               parameters.framerate_fps);
+
   if (parameters.bitrate.get_sum_bps() == 0) {
     configuration_.SetStreamState(false);
     return;

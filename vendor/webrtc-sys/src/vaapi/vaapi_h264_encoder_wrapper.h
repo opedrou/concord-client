@@ -83,9 +83,17 @@ typedef struct {
 
   uint8_t* encoded_buffer;
   VA264Config config;
+
+  // Concord: última taxa entregue ao driver e quando, pra histerese do envio em quadro P.
+  uint32_t sent_bitrate;
+  int64_t sent_ms;
 } VA264Context;
 
 namespace livekit_ffi {
+
+// Concord: linha com hora no stderr, só com CONCORD_VAAPI_LOG definida. Mede a taxa que chega
+// ao driver.
+void ConcordVaapiLog(const char* format, ...);
 
 class VaapiH264EncoderWrapper {
  public:
