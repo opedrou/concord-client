@@ -1296,16 +1296,18 @@ static int64_t now_ms() {
 }
 
 // Concord: a taxa pedida mudou o bastante pra ir ao driver num quadro P. Mais de 10% vai no
-// quadro seguinte; menos espera 500 ms desde o último envio. O SetRates chega a cada mudança
-// de alocação, e sem isso quase todo quadro levaria um buffer de taxa.
+// quadro seguinte; de 2% a 10%, no máximo uma vez a cada 5 s; menos de 2% não vai (o
+// libwebrtc oscila entre 1999 e 2000 kb/s). Cada envio reconfigura o controle de taxa do
+// driver, e no radeonsi (VCE) uma parte deles sai com rajada: com um envio a cada 500 ms, o
+// fps caía e o BWE baixava o alvo, o que gerava outro envio.
 static bool rate_changed(const VA264Context* context) {
   const uint32_t wanted = context->config.bitrate;
   const uint32_t sent = context->sent_bitrate;
-  if (wanted == sent) {
-    return false;
-  }
   const uint64_t diff = wanted > sent ? wanted - sent : sent - wanted;
-  return diff * 10 > sent || now_ms() - context->sent_ms >= 500;
+  if (diff * 10 > sent) {
+    return true;
+  }
+  return diff * 50 > sent && now_ms() - context->sent_ms >= 5000;
 }
 
 // Concord: o buffer de taxa que era do render_sequence, agora também mandado em quadro P.
