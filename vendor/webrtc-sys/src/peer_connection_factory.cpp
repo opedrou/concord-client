@@ -154,6 +154,14 @@ class StringFieldTrials final : public webrtc::FieldTrialsView {
   std::string trials_;
 };
 
+// Concord: sem a subida por padding do BWE de perda (LossBasedBweV2 no estado
+// kIncreaseUsingPadding). Com perda aleatória ela enchia o envio até a estimativa
+// (até ~10 Mb/s com o vídeo em 5) com padding no RTX. O SFU (LiveKit 1.13.5) descarta o
+// RTCP que monta ao tratar um pacote RTX (Buffer.writeRTX ignora o retorno do calc), e
+// nessas rajadas os NACKs e o RR não saíam: o pacote perdido ficava faltando de vez.
+constexpr char kConcordFieldTrials[] =
+    "WebRTC-Bwe-LossBasedBweV2/PaddingDuration:0ms/";
+
 // zero_playout_delay and enable_warp are independent and may both be enabled;
 // their field-trial views are composed into one.
 webrtc::Environment CreateEnvironment(bool zero_playout_delay,
@@ -165,6 +173,7 @@ webrtc::Environment CreateEnvironment(bool zero_playout_delay,
     RTC_LOG(LS_INFO) << "Concord: field trials de CONCORD_FIELD_TRIALS: " << env;
     views.push_back(std::make_unique<StringFieldTrials>(env));
   }
+  views.push_back(std::make_unique<StringFieldTrials>(kConcordFieldTrials));
   if (zero_playout_delay) {
     views.push_back(std::make_unique<ZeroPlayoutDelayFieldTrials>());
   }

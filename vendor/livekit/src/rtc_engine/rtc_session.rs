@@ -2084,9 +2084,17 @@ impl SessionInner {
             let mut matched = Vec::new();
             let mut partial_matched = Vec::new();
             let mut producible_codecs = Vec::new();
+            let mut rtx = Vec::new();
 
             for codec in pc_factory.get_rtp_sender_capabilities(MediaType::Video).codecs {
                 let mime_type = codec.mime_type.to_lowercase();
+                // Concord: o RTX vai junto, como no livekit-client. Sem ele, o padding do
+                // BWE sai no SSRC do vídeo e não tem reenvio: um padding perdido deixa um
+                // buraco na sequência, e o H.264 de quem assiste para até o PLI, ~3 s depois.
+                if mime_type == "video/rtx" {
+                    rtx.push(codec);
+                    continue;
+                }
                 if mime_type == requested_mime_type {
                     if let Some(sdp_fmtp_line) = codec.sdp_fmtp_line.as_ref() {
                         // for h264 codecs that have sdpFmtpLine available, use only if the
@@ -2109,6 +2117,7 @@ impl SessionInner {
                 );
                 matched = producible_codecs;
             }
+            matched.append(&mut rtx);
 
             transceiver.set_codec_preferences(matched)?;
         }
