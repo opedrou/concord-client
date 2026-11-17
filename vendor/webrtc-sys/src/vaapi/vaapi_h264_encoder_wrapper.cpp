@@ -1909,6 +1909,16 @@ bool VaapiH264EncoderWrapper::Encode(int fourcc,
                                      const uint8_t* v,
                                      bool forceIDR,
                                      std::vector<uint8_t>& encoded) {
+  // Concord: IDR no lugar do quadro em que o frame_num daria a volta. O update_RefPicList
+  // ordena a lista de referência do P pelo frame_idx cru, e o decodificador ordena por
+  // FrameNumWrap (H.264 8.2.4.1). Com ref_pic_list_reordering_flag_l0 = 0, depois da volta
+  // os dois escolhem referências diferentes, e a imagem fica corrompida até o próximo IDR, sem
+  // erro de decodificação que gere PLI. O IDR a cada 5 s zerava o frame_num antes de chegar
+  // lá; sem ele a volta vem a cada MaxFrameNum quadros (~36 min a 30 fps). Upgrade: ordenar
+  // por FrameNumWrap no update_RefPicList e tirar este IDR.
+  if (context_->current_frame_num == 0 && context_->current_frame_encoding != 0) {
+    forceIDR = true;
+  }
   if (forceIDR) {
     // reset the sequence to start with a new IDR regardless of layout
     context_->current_frame_num = context_->current_frame_display =
