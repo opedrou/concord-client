@@ -130,6 +130,9 @@ class VaapiH264EncoderWrapper {
     return initialized_;
   }
 
+  // Concord: o último Encode saiu IDR, pedido ou não.
+  bool LastFrameIsIDR() const;
+
   // Release resources.
   void Destroy();
 

@@ -136,10 +136,11 @@ int32_t VAAPIH264EncoderWrapper::InitEncode(
 
   if (!encoder_->IsInitialized()) {
     // Initialize encoder.
-    int keyFrameInterval = 60;
-    if (codec_.maxFramerate > 0) {
-      keyFrameInterval = codec_.maxFramerate * 5;
-    }
+    // Concord: sem IDR periódico (era um a cada maxFramerate * 5 quadros). Ele saía marcado
+    // como quadro comum e, em CBR, era uma rajada que congelava quem assiste no Chrome. IDR
+    // agora só no primeiro quadro e quando o libwebrtc pede (PLI). A taxa nova não depende
+    // mais do IDR: vai ao driver em quadro P (render_rate_control).
+    int keyFrameInterval = 0;
     auto va_profile = GetVAProfile();
     if (va_profile == VAProfileNone) {
       RTC_LOG(LS_ERROR) << "Unsupported H264 profile: "
@@ -252,14 +253,16 @@ int32_t VAAPIH264EncoderWrapper::Encode(
   encoded_image_._encodedHeight = configuration_.height;
   encoded_image_.SetRtpTimestamp(input_frame.rtp_timestamp());
   encoded_image_.SetColorSpace(input_frame.color_space());
-  encoded_image_._frameType = send_key_frame ? VideoFrameType::kVideoFrameKey
-                                             : VideoFrameType::kVideoFrameDelta;
+  // Concord: marca pelo que o encoder fez, não pelo pedido: todo IDR conta como keyframe.
+  const bool idr = encoder_->LastFrameIsIDR();
+  encoded_image_._frameType =
+      idr ? VideoFrameType::kVideoFrameKey : VideoFrameType::kVideoFrameDelta;
   CodecSpecificInfo codec_specific;
   codec_specific.codecType = kVideoCodecH264;
   codec_specific.codecSpecific.H264.packetization_mode = packetization_mode_;
   codec_specific.codecSpecific.H264.temporal_idx = kNoTemporalIdx;
   codec_specific.codecSpecific.H264.base_layer_sync = false;
-  codec_specific.codecSpecific.H264.idr_frame = send_key_frame;
+  codec_specific.codecSpecific.H264.idr_frame = idr;  // Concord: idem.
   encoded_image_callback_->OnEncodedImage(encoded_image_, &codec_specific);
 
   return WEBRTC_VIDEO_CODEC_OK;

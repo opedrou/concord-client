@@ -40,8 +40,11 @@
 
 #define BITSTREAM_ALLOCATE_STEPPING 4096
 
-static const uint32_t MaxFrameNum = (2 << 16);
-static const uint32_t MaxPicOrderCntLsb = (2 << 8);
+// Concord: os dois máximos eram 2 << 16 e 2 << 8, o dobro do que cabe nos bits que o SPS
+// declara logo abaixo. Com IDR a cada 5 s não passava disso a 30 fps; sem IDR periódico o
+// pic_order_cnt_lsb passa de 255 a cada 256 quadros e invadia o campo vizinho no cabeçalho.
+static const uint32_t MaxFrameNum = (1 << 16);
+static const uint32_t MaxPicOrderCntLsb = (1 << 8);
 static const uint32_t Log2MaxFrameNum = 16;
 static const uint32_t Log2MaxPicOrderCntLsb = 8;
 static const uint32_t num_ref_frames = 2;
@@ -1138,7 +1141,7 @@ static int update_ReferenceFrames(VA264Context* context) {
 
   if (context->current_frame_type != FRAME_B)
     context->current_frame_num++;
-  if (context->current_frame_num > MaxFrameNum)
+  if (context->current_frame_num >= MaxFrameNum)  // Concord: era >, e o 65536 não cabe.
     context->current_frame_num = 0;
 
   return 0;
@@ -1891,6 +1894,11 @@ bool VaapiH264EncoderWrapper::Initialize(int width,
 
   initialized_ = true;
   return true;
+}
+
+// Concord: ver o .h.
+bool VaapiH264EncoderWrapper::LastFrameIsIDR() const {
+  return context_->current_frame_type == FRAME_IDR;
 }
 
 bool VaapiH264EncoderWrapper::Encode(int fourcc,
