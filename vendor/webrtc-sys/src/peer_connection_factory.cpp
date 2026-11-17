@@ -16,7 +16,9 @@
 
 #include "livekit/peer_connection_factory.h"
 
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -119,11 +121,50 @@ class CompositeFieldTrials final : public webrtc::FieldTrialsView {
   std::vector<std::unique_ptr<webrtc::FieldTrialsView>> views_;
 };
 
+// Concord: field trials de uma string no formato do --force-fieldtrials do Chrome
+// ("Chave/Valor/Chave2/Valor2/").
+class StringFieldTrials final : public webrtc::FieldTrialsView {
+ public:
+  explicit StringFieldTrials(std::string trials) : trials_(std::move(trials)) {}
+
+  std::string Lookup(absl::string_view key) const override {
+    absl::string_view rest(trials_);
+    while (true) {
+      size_t name_end = rest.find('/');
+      if (name_end == absl::string_view::npos) {
+        return "";
+      }
+      size_t value_end = rest.find('/', name_end + 1);
+      absl::string_view value = rest.substr(name_end + 1, value_end - name_end - 1);
+      if (rest.substr(0, name_end) == key) {
+        return std::string(value);
+      }
+      if (value_end == absl::string_view::npos) {
+        return "";
+      }
+      rest.remove_prefix(value_end + 1);
+    }
+  }
+
+  std::unique_ptr<webrtc::FieldTrialsView> CreateCopy() const override {
+    return std::make_unique<StringFieldTrials>(trials_);
+  }
+
+ private:
+  std::string trials_;
+};
+
 // zero_playout_delay and enable_warp are independent and may both be enabled;
 // their field-trial views are composed into one.
 webrtc::Environment CreateEnvironment(bool zero_playout_delay,
                                       bool enable_warp) {
   std::vector<std::unique_ptr<webrtc::FieldTrialsView>> views;
+  // Concord: CONCORD_FIELD_TRIALS deixa uma bancada medir o libwebrtc com outros
+  // trials sem recompilar. Vem antes, pra poder trocar o valor de um trial fixo.
+  if (const char* env = std::getenv("CONCORD_FIELD_TRIALS"); env && *env) {
+    RTC_LOG(LS_INFO) << "Concord: field trials de CONCORD_FIELD_TRIALS: " << env;
+    views.push_back(std::make_unique<StringFieldTrials>(env));
+  }
   if (zero_playout_delay) {
     views.push_back(std::make_unique<ZeroPlayoutDelayFieldTrials>());
   }

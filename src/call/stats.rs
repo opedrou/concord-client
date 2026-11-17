@@ -52,6 +52,8 @@ struct Counters {
     keyframes: u32,
     plis: u32,
     nacks: u32,
+    /// Envio: pacotes reenviados por NACK.
+    resent: u64,
     /// Envio: espera somada no pacer e no encoder, em s, e quadros codificados.
     send_delay: f64,
     encode_time: f64,
@@ -74,6 +76,7 @@ impl Counters {
             keyframes: self.keyframes.saturating_sub(p.keyframes),
             plis: self.plis.saturating_sub(p.plis),
             nacks: self.nacks.saturating_sub(p.nacks),
+            resent: self.resent.saturating_sub(p.resent),
             send_delay: (self.send_delay - p.send_delay).max(0.0),
             encode_time: (self.encode_time - p.encode_time).max(0.0),
             encoded: self.encoded.saturating_sub(p.encoded),
@@ -255,6 +258,7 @@ fn lines(
                     keyframes: w.key_frames_encoded,
                     plis: w.pli_count,
                     nacks: w.nack_count,
+                    resent: w.retransmitted_packets_sent,
                     send_delay: w.total_packet_send_delay,
                     encode_time: w.total_encode_time,
                     encoded: w.frames_encoded,
@@ -300,12 +304,20 @@ fn lines(
                         pct(lost, lost + d.packets as f64),
                         d.rtt / d.rtts as f64 * 1000.0
                     );
+                    // O acumulado do RR desce quando o reenvio chega: é o que falta lá agora.
+                    if video {
+                        let _ = write!(t, ", {} faltando no servidor", c.lost);
+                    }
                 }
                 if video {
                     let _ = write!(
                         t,
-                        ", {} keyframes, {} PLI, {} NACK",
-                        d.keyframes, d.plis, d.nacks
+                        ", {} keyframes, {} PLI, {} NACK, {} reenviados{}",
+                        d.keyframes,
+                        d.plis,
+                        d.nacks,
+                        d.resent,
+                        if w.rtx_ssrc == 0 { " sem RTX" } else { "" }
                     );
                     if d.packets > 0 {
                         let _ = write!(
@@ -448,8 +460,8 @@ mod tests {
             lines("tela (eu)", &first, &mut last, t0, None),
             [
                 "vídeo: tela (eu): H264 1920x1080 30 fps, VaapiH264 (hardware), limitada por None, \
-                 alvo 5000 kb/s, perda no servidor 0.0%, RTT 100 ms, 1 keyframes, 0 PLI, 0 NACK, \
-                 pacer 1.0 ms, encode 5.0 ms"
+                 alvo 5000 kb/s, perda no servidor 0.0%, RTT 100 ms, 0 faltando no servidor, \
+                 1 keyframes, 0 PLI, 0 NACK, 0 reenviados sem RTX, pacer 1.0 ms, encode 5.0 ms"
             ]
         );
         // Janela: +1000 pacotes, +50 perdidos, +10 RTTs somando 2 s, +3 s no pacer.
@@ -458,6 +470,8 @@ mod tests {
         v.outbound.key_frames_encoded = 3;
         v.outbound.pli_count = 2;
         v.outbound.nack_count = 5;
+        v.outbound.retransmitted_packets_sent = 4;
+        v.outbound.rtx_ssrc = 7;
         v.outbound.total_packet_send_delay = 4.0;
         v.outbound.total_encode_time = 0.92;
         v.outbound.frames_encoded = 200;
@@ -470,8 +484,8 @@ mod tests {
             lines("tela (eu)", &second, &mut last, t0 + EVERY, None),
             [
                 "vídeo: tela (eu): H264 1920x1080 30 fps, VaapiH264 (hardware), limitada por None, \
-                 5000 kb/s, alvo 2000 kb/s, perda no servidor 4.8%, RTT 200 ms, 2 keyframes, \
-                 2 PLI, 5 NACK, pacer 3.0 ms, encode 4.2 ms"
+                 5000 kb/s, alvo 2000 kb/s, perda no servidor 4.8%, RTT 200 ms, 50 faltando no \
+                 servidor, 2 keyframes, 2 PLI, 5 NACK, 4 reenviados, pacer 3.0 ms, encode 4.2 ms"
             ]
         );
     }
