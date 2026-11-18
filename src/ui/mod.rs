@@ -10,6 +10,7 @@ pub mod theme;
 mod voice;
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, Key, key::Named};
@@ -18,7 +19,8 @@ use iced::{Color, Element, Event, Subscription, Task, Theme, event, mouse, time,
 use voice::{ActiveCall, Boot, Probe};
 
 use crate::api::{
-    self, AddressError, Channel, ChannelKind, Client, Error, Member, Presence, Secret, User,
+    self, AddressError, Channel, ChannelKind, Client, Error, Member, NotifyEvent, Presence, Secret,
+    User,
 };
 use crate::audio::{self, Devices, Effect, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
 use crate::call::{self, Call, End};
@@ -26,6 +28,8 @@ use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
 use crate::health::{self, Beat};
 use crate::session;
 use crate::share::{Quality, Source, Thumb};
+use crate::sse::Live;
+use crate::tray::TrayEvent;
 use crate::update::Check;
 
 const POLL: Duration = Duration::from_secs(4);
@@ -53,10 +57,11 @@ const PREVIA: Duration = Duration::from_millis(200);
 /// Relógio das câmeras: 30 por segundo, o ritmo de uma câmera.
 const CAMERA: Duration = Duration::from_millis(33);
 
-// Quantas vezes `persist` rodou nesta thread de teste.
+// Quantas vezes `persist` rodou nesta thread de teste, e os sons que `chime` tocaria.
 #[cfg(test)]
 thread_local! {
     static SAVES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static CHIMES: std::cell::RefCell<Vec<Effect>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 const ID_SERVIDOR: &str = "campo-servidor";
@@ -72,6 +77,16 @@ pub struct App {
     news: bool,
     /// A janela, se está aberta. Fechada, o processo segue em segundo plano.
     window: Option<window::Id>,
+}
+
+/// O que fazer quando a lista de canais chegar, ou já, com a janela aberta: o clique numa
+/// notificação, ou a call de antes de reiniciar pra atualizar (`--rejoin`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pending {
+    /// Entra na call do canal, pelo slug.
+    Join(String),
+    /// Abre o chat do canal de texto, pelo id.
+    Chat(i64),
 }
 
 /// O que espera a call terminar pra acontecer.
@@ -144,9 +159,13 @@ struct Main {
     check: Option<Check>,
     /// Canal de texto aberto no lugar do palco.
     chat: Option<chat::Chat>,
-    /// Canal de voz pra entrar quando a lista de canais chegar: a call de antes de
-    /// reiniciar pra atualizar.
-    rejoin: Option<String>,
+    /// Ver [`Pending`].
+    pending: Option<Pending>,
+    /// A janela está com o foco: `@` no chat aberto nela não vira notificação.
+    focused: bool,
+    /// A bandeja está na tela. Ela só existe logado, que é quando o segundo plano serve pra
+    /// algo; sem ela não tem de onde reabrir, e o X sai do app.
+    tray: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -154,6 +173,7 @@ pub enum Tab {
     Server,
     Account,
     Voice,
+    Notifications,
     About,
 }
 
@@ -280,6 +300,15 @@ pub enum Msg {
     Escape,
     /// Canal de texto, pelo id: respostas de outro canal caem fora.
     Chat(i64, chat::Msg),
+    /// Tempo real das notificações: chamado pra call e `@`.
+    Notified(Live<NotifyEvent>),
+    /// A notificação fechou, e `true` se foi com clique: aí faz o que ela pedia.
+    NotifyClosed(Pending, bool),
+    Tray(TrayEvent),
+    /// Interruptor "Mostrar notificações".
+    Notifications(bool),
+    /// Interruptor "Iniciar com o computador".
+    Autostart(bool),
 }
 
 /// O que a pessoa fez, pro log: cliques e escolhas, nunca texto digitado nem título de
@@ -334,6 +363,15 @@ fn action(msg: &Msg) -> Option<String> {
         Msg::Show => "abriu o Concord de novo".into(),
         Msg::Quit => "saiu do Concord".into(),
         Msg::Chat(channel, chat::Msg::Open) => format!("abriu o chat do canal {channel}"),
+        Msg::NotifyClosed(_, true) => "clicou na notificação".into(),
+        Msg::Tray(TrayEvent::Open) => "abriu pela bandeja".into(),
+        Msg::Tray(TrayEvent::Quit) => "saiu pela bandeja".into(),
+        Msg::Notifications(b) => on(*b, "ligou as notificações", "desligou as notificações"),
+        Msg::Autostart(b) => on(
+            *b,
+            "ligou iniciar com o computador",
+            "desligou iniciar com o computador",
+        ),
         _ => return None,
     })
 }
@@ -384,6 +422,25 @@ fn command(cmd: crate::instance::Command) -> Msg {
         crate::instance::Command::Show => Msg::Show,
         crate::instance::Command::Quit => Msg::Quit,
     }
+}
+
+/// Chave da assinatura das notificações: servidor e conta. O cliente vai junto, mas não muda
+/// enquanto os dois não mudam.
+struct Inbox(Client, String, i64);
+
+impl Hash for Inbox {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (&self.1, self.2).hash(state);
+    }
+}
+
+fn inbox(Inbox(client, ..): &Inbox) -> impl futures_util::Stream<Item = Live<NotifyEvent>> + use<> {
+    crate::notify::live(client.clone())
+}
+
+/// Som de abertura: a data local de hoje é outra que a do último.
+fn should_greet(last: Option<&str>, today: &str) -> bool {
+    last != Some(today)
 }
 
 fn connect(server: String) -> Task<Msg> {
@@ -488,6 +545,12 @@ impl App {
             subs.push(time::every(TENTA_DE_NOVO).map(|_| Msg::Retry));
         }
         if let Screen::Main(m) = &self.screen {
+            subs.push(Subscription::run(crate::tray::run).map(Msg::Tray));
+            // Com ou sem janela: é pra isso que o processo fica em segundo plano.
+            if self.config.notifications {
+                let key = Inbox(m.client.clone(), m.server.clone(), m.user.id);
+                subs.push(Subscription::run_with(key, inbox).map(Msg::Notified));
+            }
             // Sem janela não tem o que mostrar: nem presença nem os contadores da tela.
             if self.window.is_some() {
                 subs.push(time::every(POLL).map(|_| Msg::Tick));
@@ -638,13 +701,8 @@ impl App {
                     return Task::none();
                 };
                 m.channels = channels;
-                match m.rejoin.take() {
-                    Some(slug) => {
-                        log!("atualização: volta pra call {slug}");
-                        self.join_channel(slug)
-                    }
-                    None => Task::none(),
-                }
+                self.greet();
+                self.run_pending()
             }
             Msg::Channels(Err(e)) => self.main_failed(e),
             Msg::Members(Ok(members)) => {
@@ -906,7 +964,11 @@ impl App {
                 }
                 Task::none()
             }
-            Msg::CloseRequested(id) => self.close(Closing::Window(id)),
+            // Sem bandeja não tem de onde reabrir: o X sai do app.
+            Msg::CloseRequested(id) => match &self.screen {
+                Screen::Main(m) if m.tray => self.close(Closing::Window(id)),
+                _ => self.close(Closing::Quit),
+            },
             Msg::Quit => self.close(Closing::Quit),
             Msg::CloseNow(closing) => match &mut self.screen {
                 // O `Ended` chegou antes e já fechou, ou é de um pedido anterior.
@@ -919,23 +981,7 @@ impl App {
                 _ => self.finish(closing),
             },
             Msg::WindowClosed(id) => self.window_closed(id),
-            Msg::Show => match self.window {
-                // O Wayland nem informa nem desfaz o minimizar: só pede quando sabe.
-                Some(id) if self.minimized => {
-                    window::minimize(id, false).chain(window::gain_focus(id))
-                }
-                Some(id) => window::gain_focus(id),
-                None => {
-                    log!("janela aberta de novo");
-                    let open = self.open_window();
-                    // Canais, membros e presença podem ter horas.
-                    let fresh = match &mut self.screen {
-                        Screen::Main(m) => m.refresh(),
-                        _ => Task::none(),
-                    };
-                    Task::batch([open, fresh])
-                }
-            },
+            Msg::Show => self.show(),
             Msg::DragStart => {
                 if let Screen::Main(m) = &mut self.screen {
                     m.resizing = true;
@@ -1032,6 +1078,9 @@ impl App {
                 Task::none()
             }
             Msg::Focus(focused) => {
+                if let Screen::Main(m) = &mut self.screen {
+                    m.focused = focused;
+                }
                 if let Some(call) = self.call_mut() {
                     call.set_focus(focused);
                 }
@@ -1120,6 +1169,158 @@ impl App {
             Msg::FocusNext => operation::focus_next(),
             Msg::FocusPrevious => operation::focus_previous(),
             Msg::Chat(channel, msg) => self.chat(channel, msg),
+            Msg::Notified(live) => self.notified(live),
+            Msg::NotifyClosed(_, false) => {
+                log!("notificação: fechou sem clique");
+                Task::none()
+            }
+            Msg::NotifyClosed(pending, true) => self.open_pending(pending),
+            Msg::Tray(event) => self.tray(event),
+            Msg::Notifications(on) => {
+                self.config.notifications = on;
+                self.persist();
+                Task::none()
+            }
+            Msg::Autostart(on) => {
+                self.config.autostart = on;
+                self.persist();
+                crate::autostart::set(on);
+                Task::none()
+            }
+        }
+    }
+
+    /// Mostra a janela, ou abre de novo e busca o que pode ter envelhecido.
+    fn show(&mut self) -> Task<Msg> {
+        match self.window {
+            // O Wayland nem informa nem desfaz o minimizar: só pede quando sabe.
+            Some(id) if self.minimized => window::minimize(id, false).chain(window::gain_focus(id)),
+            Some(id) => window::gain_focus(id),
+            None => {
+                log!("janela aberta de novo");
+                let open = self.open_window();
+                // Canais, membros e presença podem ter horas.
+                let fresh = match &mut self.screen {
+                    Screen::Main(m) => m.refresh(),
+                    _ => Task::none(),
+                };
+                Task::batch([open, fresh])
+            }
+        }
+    }
+
+    /// Bandeja: aparecer ou sumir muda o que o X faz; o menu abre ou sai.
+    fn tray(&mut self, event: TrayEvent) -> Task<Msg> {
+        match event {
+            TrayEvent::Shown | TrayEvent::Missing => {
+                let Screen::Main(m) = &mut self.screen else {
+                    return Task::none();
+                };
+                m.tray = event == TrayEvent::Shown;
+                log!(
+                    "bandeja: {}",
+                    if m.tray {
+                        "na tela, fechar a janela deixa o app nela"
+                    } else {
+                        "fora da tela, fechar a janela sai do app"
+                    }
+                );
+                Task::none()
+            }
+            TrayEvent::Open => self.show(),
+            TrayEvent::Quit => self.close(Closing::Quit),
+        }
+    }
+
+    /// Chamado ou `@`: som e notificação do sistema, menos quando a pessoa já está vendo.
+    fn notified(&mut self, live: Live<NotifyEvent>) -> Task<Msg> {
+        let event = match live {
+            Live::Event(event) => event,
+            Live::Connected => {
+                log!("notificação: conectou no servidor");
+                return Task::none();
+            }
+            Live::Lost => return Task::none(),
+            Live::Unauthorized => return self.session_expired(),
+        };
+        let Screen::Main(m) = &self.screen else {
+            return Task::none();
+        };
+        let (kind, pending) = match &event {
+            NotifyEvent::Call { channel, .. } => ("chamado", Pending::Join(channel.clone())),
+            NotifyEvent::Mention { channel_id, .. } => ("menção", Pending::Chat(*channel_id)),
+        };
+        log!("notificação: chegou {kind}");
+        let call = m.call.as_ref().map(|c| c.slug.as_str());
+        let seen = self.window.is_some() && m.focused;
+        let chat = m.chat.as_ref().filter(|_| seen).map(|c| c.channel);
+        if let Some(why) = crate::notify::skip(&event, call, chat) {
+            log!("notificação: pulou {kind}, {why}");
+            return Task::none();
+        }
+        let (title, body) = crate::notify::text(&event, &m.channels);
+        self.chime(Effect::Notify);
+        log!("notificação: mostrou {kind}");
+        Task::future(async move {
+            let clicked = crate::notify::show(title, body).await;
+            Msg::NotifyClosed(pending, clicked)
+        })
+    }
+
+    /// Clique na notificação: mostra a janela e faz o que ela pedia. Janela fechada abre de
+    /// novo e busca os canais, e o pedido espera eles chegarem (`Msg::Channels`).
+    fn open_pending(&mut self, pending: Pending) -> Task<Msg> {
+        let Screen::Main(m) = &mut self.screen else {
+            return Task::none();
+        };
+        m.pending = Some(pending);
+        let reopen = self.window.is_none();
+        let show = self.show();
+        if reopen {
+            return show;
+        }
+        Task::batch([show, self.run_pending()])
+    }
+
+    /// Faz o [`Pending`], se tem. As configurações abertas saem da frente.
+    fn run_pending(&mut self) -> Task<Msg> {
+        let Screen::Main(m) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(pending) = m.pending.take() else {
+            return Task::none();
+        };
+        log!("pendente: {pending:?}");
+        self.close_settings();
+        match pending {
+            Pending::Join(slug) => self.join_channel(slug),
+            Pending::Chat(channel) => self.chat(channel, chat::Msg::Open),
+        }
+    }
+
+    /// Som de abertura, na primeira vez do dia que a janela abre. O boot em segundo plano não
+    /// toca: abrir a janela depois busca os canais de novo, e toca aí.
+    fn greet(&mut self) {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        if self.window.is_none() || !should_greet(self.config.greeted_on.as_deref(), &today) {
+            return;
+        }
+        log!("som de abertura, primeira janela do dia");
+        self.chime(Effect::Hello);
+        self.config.greeted_on = Some(today);
+        self.persist();
+    }
+
+    /// Som fora da call: pelo motor aberto (call ou teste da aba Voz), senão abre só a saída.
+    fn chime(&self, effect: Effect) {
+        if cfg!(test) {
+            #[cfg(test)]
+            CHIMES.with(|c| c.borrow_mut().push(effect));
+            return;
+        }
+        match self.engine() {
+            Some(engine) => engine.play(effect),
+            None => audio::play_once(effect, self.config.output.as_deref()),
         }
     }
 
@@ -1420,6 +1621,7 @@ impl App {
         self.window = None;
         self.minimized = false;
         if let Screen::Main(m) = &mut self.screen {
+            m.focused = false;
             m.full_window = false;
             m.chat = None;
             m.settings = None;
@@ -1602,7 +1804,10 @@ impl App {
             update: None,
             check: None,
             chat: None,
-            rejoin: crate::update::rejoin(),
+            pending: crate::update::rejoin().map(Pending::Join),
+            // O foco chegou antes, na tela de entrar; muda no próximo evento.
+            focused: self.window.is_some(),
+            tray: false,
         };
         let avatars = main.fetch_avatars();
         let fresh = main.refresh();
@@ -1876,9 +2081,11 @@ mod tests {
         }
     }
 
+    /// Logado, com a bandeja na tela.
     fn main_app() -> App {
         let mut a = app(login());
         let _ = a.enter_main("https://a.b".into(), None, user(), true);
+        main_of(&mut a).tray = true;
         a
     }
 
@@ -2088,14 +2295,134 @@ mod tests {
     fn depois_de_atualizar_volta_pra_call() {
         let canais = || vec![canal(2, "Call", ChannelKind::Voice)];
         let mut a = main_app();
-        main_of(&mut a).rejoin = Some("call".into());
+        main_of(&mut a).pending = Some(Pending::Join("call".into()));
         let _ = a.update(Msg::Channels(Ok(canais())));
         assert_eq!(call_of(&mut a).slug, "call");
-        assert!(main_of(&mut a).rejoin.is_none());
+        assert!(main_of(&mut a).pending.is_none());
 
         let mut a = main_app();
         let _ = a.update(Msg::Channels(Ok(canais())));
         assert!(main_of(&mut a).call.is_none());
+    }
+
+    fn chimes() -> Vec<Effect> {
+        CHIMES.with(|c| c.take())
+    }
+
+    #[test]
+    fn som_de_abertura_so_na_primeira_janela_do_dia() {
+        assert!(should_greet(None, "2026-11-18"));
+        assert!(should_greet(Some("2026-11-17"), "2026-11-18"));
+        assert!(!should_greet(Some("2026-11-18"), "2026-11-18"));
+
+        // Boot em segundo plano: os canais chegam sem janela e não toca.
+        let mut a = main_app();
+        a.window = None;
+        chimes();
+        let _ = a.update(Msg::Channels(Ok(Vec::new())));
+        assert!(chimes().is_empty() && a.config.greeted_on.is_none());
+
+        // Abre a janela: busca os canais de novo e toca, uma vez no dia.
+        let _ = a.update(Msg::Show);
+        let antes = saves();
+        let _ = a.update(Msg::Channels(Ok(Vec::new())));
+        assert_eq!(chimes(), [Effect::Hello]);
+        assert_eq!(saves(), antes + 1);
+        let hoje = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(a.config.greeted_on.as_deref(), Some(hoje.as_str()));
+        let _ = a.update(Msg::Channels(Ok(Vec::new())));
+        assert!(chimes().is_empty());
+    }
+
+    fn chamado(channel: &str) -> Msg {
+        Msg::Notified(Live::Event(NotifyEvent::Call {
+            caller: "Ana".into(),
+            channel: channel.into(),
+            at: String::new(),
+        }))
+    }
+
+    fn mencao(channel_id: i64) -> Msg {
+        Msg::Notified(Live::Event(NotifyEvent::Mention {
+            author: "Bia".into(),
+            channel_id,
+            channel_name: "Geral".into(),
+            excerpt: "oi @Opedro".into(),
+            at: String::new(),
+        }))
+    }
+
+    #[test]
+    fn notificacao_toca_e_pula_o_que_ja_esta_na_tela() {
+        let mut a = in_call(&["Ana"]);
+        chimes();
+        let _ = a.update(chamado("call"));
+        assert!(chimes().is_empty(), "já está nessa call");
+        let _ = a.update(chamado("jogando"));
+        assert_eq!(chimes(), [Effect::Notify]);
+
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        let _ = a.update(mencao(1));
+        assert!(chimes().is_empty(), "chat aberto com foco");
+        let _ = a.update(Msg::Focus(false));
+        let _ = a.update(mencao(1));
+        assert_eq!(chimes(), [Effect::Notify], "janela sem foco");
+        let _ = a.update(Msg::Focus(true));
+        let _ = a.update(mencao(7));
+        assert_eq!(chimes(), [Effect::Notify], "outro canal");
+    }
+
+    #[test]
+    fn clique_na_notificacao_entra_na_call_ou_abre_o_chat() {
+        // Janela aberta: faz na hora, e as configurações saem da frente.
+        let mut a = voice_app();
+        main_of(&mut a).settings = Some(Tab::About);
+        let _ = a.update(Msg::NotifyClosed(Pending::Join("call".into()), true));
+        assert_eq!(call_of(&mut a).slug, "call");
+        assert!(main_of(&mut a).settings.is_none());
+        let _ = a.update(Msg::NotifyClosed(Pending::Chat(1), true));
+        assert_eq!(main_of(&mut a).chat.as_ref().map(|c| c.channel), Some(1));
+
+        // Fechou sem clique: nada.
+        let mut a = voice_app();
+        let _ = a.update(Msg::NotifyClosed(Pending::Join("call".into()), false));
+        assert!(main_of(&mut a).call.is_none());
+
+        // Sem janela: abre ela e espera a lista nova de canais.
+        let mut a = voice_app();
+        a.window = None;
+        let _ = a.update(Msg::NotifyClosed(Pending::Join("jogando".into()), true));
+        assert!(a.window.is_some());
+        assert!(main_of(&mut a).call.is_none());
+        let canais = main_of(&mut a).channels.clone();
+        let _ = a.update(Msg::Channels(Ok(canais)));
+        assert_eq!(call_of(&mut a).slug, "jogando");
+    }
+
+    #[test]
+    fn sem_bandeja_o_x_sai_do_app() {
+        let mut a = in_call(&["Ana"]);
+        let id = a.window.expect("teste com janela");
+        let _ = a.update(Msg::Tray(TrayEvent::Missing));
+        assert!(!main_of(&mut a).tray);
+        // Sai do processo (`iced::exit`): não passa pelo fechar só a janela, que tira a call.
+        let _ = a.update(Msg::CloseRequested(id));
+        assert!(main_of(&mut a).call.is_some());
+
+        let _ = a.update(Msg::Tray(TrayEvent::Shown));
+        assert!(main_of(&mut a).tray);
+        let _ = a.update(Msg::CloseRequested(id));
+        assert!(main_of(&mut a).call.is_none(), "fecha só a janela");
+    }
+
+    #[test]
+    fn interruptores_de_notificacao_e_autostart_gravam() {
+        let mut a = main_app();
+        let antes = saves();
+        let _ = a.update(Msg::Notifications(false));
+        let _ = a.update(Msg::Autostart(false));
+        assert!(!a.config.notifications && !a.config.autostart);
+        assert_eq!(saves(), antes + 2);
     }
 
     #[test]
@@ -3046,6 +3373,7 @@ mod tests {
             (Tab::Server, "config-servidor"),
             (Tab::Account, "config-conta"),
             (Tab::Voice, "config-voz"),
+            (Tab::Notifications, "config-notificacoes"),
             (Tab::About, "config-sobre"),
         ] {
             main_of(&mut a).settings = Some(tab);

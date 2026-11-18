@@ -152,8 +152,6 @@ pub fn devices() -> Devices {
 /// -3,5 dBFS, RMS -19 dBFS):
 /// `ffmpeg -i X.wav -af "pan=mono|c0=FL,volume=8dB" -f s16le -ar 48000 assets/sounds/notify.pcm`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-// `Notify`, `Hello` e o `play_once` ligam na interface na próxima etapa; aí os `allow` saem.
-#[allow(dead_code)]
 pub enum Effect {
     Join,
     Leave,
@@ -185,7 +183,6 @@ const ONCE_SLACK: Duration = Duration::from_secs(2);
 /// Toca um som sem o motor da call e sem abrir o mic: abre só a saída, toca e fecha. Não
 /// bloqueia. Sem o dispositivo salvo, toca no padrão do sistema. Saída travada desiste
 /// depois da duração do som mais [`ONCE_SLACK`]. Na call, o som vai pelo [`Engine::play`].
-#[allow(dead_code)]
 pub fn play_once(effect: Effect, output: Option<&str>) {
     let output = output.map(String::from);
     let spawned = thread::Builder::new()

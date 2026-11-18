@@ -1,20 +1,12 @@
 //! Notificação nativa do sistema e o tempo real que diz o que notificar: chamado pra call e
 //! `@`. O som é do próprio app (`audio::play_once`), então a notificação vai muda.
-// Ligado na interface na próxima etapa; aí este `allow` sai.
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::Stream;
 use notify_rust::{Notification, NotificationResponse};
 
-use crate::api::{Client, NotifyEvent};
+use crate::api::{Channel, Client, NotifyEvent};
 use crate::sse::Live;
-
-/// AUMID do Windows: o mesmo do atalho do Menu Iniciar, senão o toast sai sem o nome e o
-/// ícone do Concord.
-#[cfg(windows)]
-pub const APP_ID: &str = "Concord.Desktop";
 
 /// Notificações esperando clique ao mesmo tempo. Cada uma segura uma thread até o clique ou o
 /// fechamento, e o GNOME guarda as antigas na lista de notificações sem avisar que fecharam.
@@ -29,6 +21,44 @@ pub fn live(client: Client) -> impl Stream<Item = Live<NotifyEvent>> {
         let client = client.clone();
         async move { client.notification_stream().await }
     })
+}
+
+/// Por que não mostrar: a pessoa já está vendo. `call` é o slug da call em que ela está;
+/// `chat`, o canal de texto aberto na janela com foco.
+pub fn skip(event: &NotifyEvent, call: Option<&str>, chat: Option<i64>) -> Option<&'static str> {
+    match event {
+        NotifyEvent::Call { channel, .. } if call == Some(channel.as_str()) => {
+            Some("já está nessa call")
+        }
+        NotifyEvent::Mention { channel_id, .. } if chat == Some(*channel_id) => {
+            Some("o chat está aberto na tela")
+        }
+        _ => None,
+    }
+}
+
+/// Título e corpo. O chamado traz o slug: o nome vem da lista de canais, ou fica o slug.
+pub fn text(event: &NotifyEvent, channels: &[Channel]) -> (String, String) {
+    match event {
+        NotifyEvent::Call {
+            caller, channel, ..
+        } => {
+            let name = channels
+                .iter()
+                .find(|c| &c.slug == channel)
+                .map_or(channel, |c| &c.name);
+            (format!("{caller} te chamou"), format!("Canal {name}"))
+        }
+        NotifyEvent::Mention {
+            author,
+            channel_name,
+            excerpt,
+            ..
+        } => (
+            format!("{author} te marcou em #{channel_name}"),
+            excerpt.clone(),
+        ),
+    }
 }
 
 /// Mostra a notificação e espera ela fechar. `true`: a pessoa clicou nela. Sem servidor de
@@ -50,9 +80,10 @@ fn show_blocking(title: &str, body: &str) -> bool {
         ))
         .hint(notify_rust::Hint::SuppressSound(true))
         .action("default", "Abrir");
-    // Sem `sound_name`, o toast sai com `<audio silent="true"/>`.
+    // Sem `sound_name`, o toast sai com `<audio silent="true"/>`. O AUMID é o do atalho do
+    // Menu Iniciar, senão o toast sai sem o nome e o ícone do Concord.
     #[cfg(windows)]
-    n.app_id(APP_ID);
+    n.app_id(crate::update::win::AUMID);
     let handle = match n.show() {
         Ok(handle) => handle,
         Err(e) => {
@@ -83,6 +114,63 @@ struct Esperando;
 impl Drop for Esperando {
     fn drop(&mut self) {
         ESPERANDO.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod texto {
+    use super::*;
+    use crate::api::ChannelKind;
+
+    fn chamado(channel: &str) -> NotifyEvent {
+        NotifyEvent::Call {
+            caller: "ana".into(),
+            channel: channel.into(),
+            at: String::new(),
+        }
+    }
+
+    fn mencao(channel_id: i64) -> NotifyEvent {
+        NotifyEvent::Mention {
+            author: "bia".into(),
+            channel_id,
+            channel_name: "geral".into(),
+            excerpt: "oi @ana, bora?".into(),
+            at: String::new(),
+        }
+    }
+
+    #[test]
+    fn titulo_e_corpo_com_o_nome_do_canal() {
+        let canais = [Channel {
+            id: 2,
+            name: "Call Tetê".into(),
+            slug: "call-tete".into(),
+            kind: ChannelKind::Voice,
+        }];
+        assert_eq!(
+            text(&chamado("call-tete"), &canais),
+            ("ana te chamou".into(), "Canal Call Tetê".into())
+        );
+        assert_eq!(
+            text(&chamado("sumiu"), &canais).1,
+            "Canal sumiu",
+            "canal fora da lista fica com o slug"
+        );
+        assert_eq!(
+            text(&mencao(4), &canais),
+            ("bia te marcou em #geral".into(), "oi @ana, bora?".into())
+        );
+    }
+
+    #[test]
+    fn pula_so_o_que_a_pessoa_ja_esta_vendo() {
+        assert!(skip(&chamado("call-tete"), Some("call-tete"), None).is_some());
+        assert!(skip(&chamado("call-tete"), Some("outra"), Some(4)).is_none());
+        assert!(skip(&chamado("call-tete"), None, None).is_none());
+        assert!(skip(&mencao(4), Some("call-tete"), Some(4)).is_some());
+        assert!(skip(&mencao(4), None, Some(5)).is_none());
+        assert!(skip(&mencao(4), None, None).is_none());
     }
 }
 

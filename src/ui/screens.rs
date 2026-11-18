@@ -187,6 +187,7 @@ pub fn settings<'a>(m: &'a Main, config: &'a Config, tab: Tab) -> Element<'a, Ms
             item("Servidor", Tab::Server),
             item("Conta", Tab::Account),
             item("Voz", Tab::Voice),
+            item("Notificações", Tab::Notifications),
             item("Sobre", Tab::About)
         ]
         .spacing(4),
@@ -199,6 +200,7 @@ pub fn settings<'a>(m: &'a Main, config: &'a Config, tab: Tab) -> Element<'a, Ms
         Tab::Server => server_panel(m),
         Tab::Account => account_panel(m),
         Tab::Voice => voice_panel(m, config),
+        Tab::Notifications => notifications_panel(config),
         Tab::About => about_panel(m),
     };
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(32))
@@ -529,6 +531,37 @@ fn mic_gain(config: &Config) -> Element<'_, Msg> {
         .into(),
     };
     labeled("Ganho de entrada", column![toggle, body].spacing(8))
+}
+
+fn notifications_panel(config: &Config) -> Element<'_, Msg> {
+    let option = |label, on, msg: fn(bool) -> Msg, help| {
+        column![
+            toggler(on)
+                .label(label)
+                .on_toggle(msg)
+                .size(20)
+                .text_size(14.4),
+            text(help).size(13).color(FG2),
+        ]
+        .spacing(8)
+    };
+    column![
+        title("Notificações"),
+        option(
+            "Mostrar notificações",
+            config.notifications,
+            Msg::Notifications,
+            "Avisa quando alguém te chama pra call ou te marca com @, com a janela fechada também.",
+        ),
+        option(
+            "Iniciar com o computador",
+            config.autostart,
+            Msg::Autostart,
+            "Abre em segundo plano quando você entra no sistema, pra receber os avisos.",
+        ),
+    ]
+    .spacing(16)
+    .into()
 }
 
 fn about_panel(m: &Main) -> Element<'_, Msg> {

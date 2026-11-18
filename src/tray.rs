@@ -1,8 +1,6 @@
 //! Ícone na bandeja, com "Abrir Concord" e "Sair". Clique esquerdo abre. No Linux pelo
 //! StatusNotifierItem (`ksni`); no Windows pelo `tray-icon`, numa thread com o laço de
 //! mensagens do Win32.
-// Ligado na interface na próxima etapa; aí este `allow` sai.
-#![allow(dead_code)]
 
 use futures_util::{SinkExt, Stream};
 use tokio::sync::mpsc::UnboundedSender;
