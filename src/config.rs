@@ -46,6 +46,8 @@ pub struct Config {
     pub share_quality: Quality,
     /// Interruptor "Transmitir áudio". Só no Linux por enquanto.
     pub share_audio: bool,
+    /// Versão cujas novidades já foram vistas, ou a instalada do zero.
+    pub seen_version: Option<String>,
 }
 
 impl Default for Config {
@@ -68,6 +70,7 @@ impl Default for Config {
             volumes: HashMap::new(),
             share_quality: Quality::default(),
             share_audio: true,
+            seen_version: None,
         }
     }
 }

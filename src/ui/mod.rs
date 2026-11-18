@@ -65,6 +65,8 @@ pub struct App {
     /// Minimizada a janela fica 0x0 e o iced para de desenhar. Quadro que sobe pra GPU só é
     /// solto no fim de um desenho, então nada sobe enquanto ela está minimizada.
     minimized: bool,
+    /// Janela "o que tem de novo", decidida ao abrir: ver [`crate::update::news_pending`].
+    news: bool,
 }
 
 enum Screen {
@@ -249,6 +251,8 @@ pub enum Msg {
     DragEnd,
     OpenSettings(Tab),
     CloseSettings,
+    /// OK da janela de novidades.
+    CloseNews,
     Logout,
     FocusNext,
     FocusPrevious,
@@ -304,6 +308,7 @@ fn action(msg: &Msg) -> Option<String> {
         ),
         Msg::OpenSettings(tab) => format!("abriu as configurações em {tab:?}"),
         Msg::CloseSettings => "fechou as configurações".into(),
+        Msg::CloseNews => "fechou as novidades da versão".into(),
         Msg::CloseRequested(_) => "fechou a janela".into(),
         Msg::Chat(channel, chat::Msg::Open) => format!("abriu o chat do canal {channel}"),
         _ => return None,
@@ -379,13 +384,20 @@ fn login_error(e: Error) -> String {
 
 impl App {
     pub fn boot() -> (Self, Task<Msg>) {
-        let config = Config::load();
+        let mut config = Config::load();
+        let news =
+            crate::update::news_pending(config.server.is_some(), config.seen_version.as_deref());
+        if !news {
+            // Grava junto com a próxima mudança: a próxima versão compara com esta.
+            config.seen_version = Some(env!("CARGO_PKG_VERSION").into());
+        }
         match config.server.clone() {
             Some(server) => (
                 Self {
                     config,
                     screen: Screen::Connecting,
                     minimized: false,
+                    news,
                 },
                 connect(server),
             ),
@@ -400,6 +412,7 @@ impl App {
                         config,
                         screen,
                         minimized: false,
+                        news,
                     },
                     operation::focus(ID_SERVIDOR),
                 )
@@ -472,6 +485,7 @@ impl App {
                     content,
                 ];
                 match m.settings {
+                    _ if self.news => stack![base, screens::news()].into(),
                     Some(tab) => stack![base, screens::settings(m, &self.config, tab)].into(),
                     None => base.into(),
                 }
@@ -870,8 +884,13 @@ impl App {
                 self.close_settings();
                 Task::none()
             }
+            Msg::CloseNews => {
+                self.close_news();
+                Task::none()
+            }
             Msg::Escape => {
                 match &mut self.screen {
+                    Screen::Main(_) if self.news => self.close_news(),
                     Screen::Main(m) if m.settings.is_some() => self.close_settings(),
                     Screen::Main(m) if m.call.as_ref().is_some_and(ActiveCall::fullscreen) => {
                         if let Some(c) = &mut m.call {
@@ -1522,6 +1541,12 @@ impl App {
         }
     }
 
+    fn close_news(&mut self) {
+        self.news = false;
+        self.config.seen_version = Some(env!("CARGO_PKG_VERSION").into());
+        self.persist();
+    }
+
     fn persist(&self) {
         if cfg!(test) {
             #[cfg(test)]
@@ -1662,6 +1687,7 @@ mod tests {
             config: Config::default(),
             screen,
             minimized: false,
+            news: false,
         }
     }
 
@@ -2495,6 +2521,27 @@ mod tests {
     }
 
     #[test]
+    fn novidades_fecham_no_ok_e_no_esc_e_gravam_a_versao() {
+        for msg in [Msg::CloseNews, Msg::Escape] {
+            let mut a = main_app();
+            a.news = true;
+            main_of(&mut a).settings = Some(Tab::Voice);
+            let antes = saves();
+            let _ = a.update(msg);
+            assert!(!a.news);
+            assert_eq!(
+                a.config.seen_version.as_deref(),
+                Some(env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(saves(), antes + 1);
+            assert!(
+                main_of(&mut a).settings.is_some(),
+                "o Esc fecha só as novidades"
+            );
+        }
+    }
+
+    #[test]
     fn automatico_e_manual_guardam_o_valor() {
         use crate::audio::{MANUAL_DEFAULT_DB, Sensitivity};
         let mut a = voice_tab();
@@ -2776,6 +2823,9 @@ mod tests {
             ],
         )]);
         print(&a, "principal");
+        a.news = true;
+        print(&a, "novidades");
+        a.news = false;
 
         a.config.toggle_deafen();
         main_of(&mut a).failures = FALHAS_ATE_AVISAR;

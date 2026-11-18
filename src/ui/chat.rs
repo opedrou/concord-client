@@ -962,6 +962,7 @@ mod tests {
             config: Config::default(),
             screen: Screen::Connecting,
             minimized: false,
+            news: false,
         };
         let user = User {
             id: 3,

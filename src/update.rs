@@ -35,6 +35,27 @@ const ASSET: &str = "concord-client-windows-x86_64.exe";
 #[cfg(not(windows))]
 const ASSET: &str = "concord-client-linux-x86_64";
 
+/// Novidades mostradas uma vez, na primeira abertura depois de atualizar. Só aparecem se a
+/// versão daqui for a do `Cargo.toml`: texto esquecido de uma versão velha não volta como novo.
+pub const NEWS: (&str, &[&str]) = (
+    "0.1.16",
+    &[
+        "Transmissão de tela mais estável em redes com perda de pacotes: o pacote perdido agora é \
+         reenviado, e a imagem não congela mais por alguns segundos.",
+        "Linux: o codificador de vídeo parou de mandar um quadro-chave a cada 5 segundos, que \
+         fazia a imagem parar por um instante.",
+        "A taxa de bits da transmissão se ajusta à rede já no quadro seguinte, em vez de esperar \
+         até 5 segundos.",
+    ],
+);
+
+/// Novidades desta versão que a pessoa ainda não viu. Instalação nova (sem servidor salvo)
+/// não vê: não atualizou de nada.
+pub fn news_pending(server_saved: bool, seen: Option<&str>) -> bool {
+    let v = env!("CARGO_PKG_VERSION");
+    server_saved && NEWS.0 == v && seen != Some(v)
+}
+
 #[derive(Deserialize)]
 struct Release {
     tag_name: String,
@@ -672,6 +693,21 @@ fn rejoin_of(mut args: impl Iterator<Item = String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn novidades_sao_desta_versao() {
+        // Falhou: a versão subiu e o texto de `NEWS` ainda é o da anterior.
+        assert_eq!(NEWS.0, env!("CARGO_PKG_VERSION"));
+        assert!(!NEWS.1.is_empty());
+        let v = env!("CARGO_PKG_VERSION");
+        assert!(
+            news_pending(true, None),
+            "quem veio de versão sem o campo vê"
+        );
+        assert!(news_pending(true, Some("0.0.1")));
+        assert!(!news_pending(true, Some(v)), "já viu");
+        assert!(!news_pending(false, None), "instalação nova não vê");
+    }
 
     #[test]
     fn rejoin_le_o_canal_depois_da_flag() {

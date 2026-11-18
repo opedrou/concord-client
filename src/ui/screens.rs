@@ -242,6 +242,47 @@ pub fn settings<'a>(m: &'a Main, config: &'a Config, tab: Tab) -> Element<'a, Ms
     .into()
 }
 
+/// "O que tem de novo", uma vez depois de atualizar. Texto em [`crate::update::NEWS`].
+pub fn news<'a>() -> Element<'a, Msg> {
+    let (version, items) = crate::update::NEWS;
+    let items = items.iter().fold(column![].spacing(12), |list, item| {
+        list.push(
+            row![
+                text("•").size(14).color(FG2),
+                text(*item).size(14).color(FG)
+            ]
+            .spacing(10),
+        )
+    });
+    let window = container(
+        column![
+            text(format!("Atualização v{version}: o que tem de novo?"))
+                .size(20)
+                .font(theme::DISPLAY),
+            items,
+            row![
+                space::horizontal(),
+                action("OK", Msg::CloseNews, theme::primary)
+            ],
+        ]
+        .spacing(20),
+    )
+    .padding(28)
+    .width(520)
+    .style(theme::card);
+
+    stack![
+        opaque(
+            container(space())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(theme::backdrop)
+        ),
+        center(opaque(window)),
+    ]
+    .into()
+}
+
 fn title<'a>(content: &'a str) -> Element<'a, Msg> {
     text(content).size(20).font(theme::DISPLAY).into()
 }
