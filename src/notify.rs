@@ -295,3 +295,95 @@ mod tests {
         assert_eq!(ESPERANDO.load(Ordering::Relaxed), 0);
     }
 }
+
+/// Ponta a ponta contra o site local: uma conta chama e marca a outra, e o tempo real da outra
+/// tem de trazer os dois avisos. Sem janela, notificação de verdade nem som. Uso:
+/// `CONCORD_URL=http://localhost:3000 CONCORD_USER=.. CONCORD_PASS=.. CONCORD_ALVO=..
+/// CONCORD_ALVO_PASS=.. CONCORD_VOZ=<slug> CONCORD_CANAL=<slug de texto>
+/// cargo test bancada_notificacao -- --ignored --nocapture`
+#[cfg(test)]
+mod bancada {
+    use std::time::Duration;
+
+    use futures_util::StreamExt;
+
+    use super::*;
+    use crate::api::{ChannelKind, Secret};
+
+    fn var(nome: &str) -> String {
+        std::env::var(nome).unwrap_or_else(|_| panic!("falta {nome}"))
+    }
+
+    async fn entra(base: &str, user: &str, pass: &str) -> Client {
+        let cookie = Client::new(base, None)
+            .login(user, &Secret(pass.into()))
+            .await
+            .expect("login");
+        Client::new(base, Some(cookie))
+    }
+
+    async fn proximo(
+        live: &mut (impl Stream<Item = Live<NotifyEvent>> + Unpin),
+    ) -> Live<NotifyEvent> {
+        tokio::time::timeout(Duration::from_secs(10), live.next())
+            .await
+            .expect("nada chegou em 10 s")
+            .expect("o tempo real acabou")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bancada_notificacao() {
+        let base = var("CONCORD_URL");
+        let (quem, alvo) = (var("CONCORD_USER"), var("CONCORD_ALVO"));
+        let chama = entra(&base, &quem, &var("CONCORD_PASS")).await;
+        let recebe = entra(&base, &alvo, &var("CONCORD_ALVO_PASS")).await;
+        let mut live = Box::pin(live(recebe));
+        assert_eq!(proximo(&mut live).await, Live::Connected);
+
+        let id = chama
+            .members()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.username == alvo)
+            .expect("alvo na lista de membros")
+            .id;
+        let voz = var("CONCORD_VOZ");
+        assert_eq!(chama.call_people(&[id], &voz).await.unwrap(), (1, 1));
+        match proximo(&mut live).await {
+            Live::Event(NotifyEvent::Call {
+                caller, channel, ..
+            }) => assert_eq!((caller, channel), (quem.clone(), voz)),
+            outro => panic!("esperava o chamado, veio {outro:?}"),
+        }
+
+        let slug = var("CONCORD_CANAL");
+        let canal = chama
+            .channels()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.slug == slug && c.kind == ChannelKind::Text)
+            .expect("canal de texto")
+            .id;
+        let run = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
+        chama
+            .send_message(canal, &format!("oi @{alvo} {run}"), None)
+            .await
+            .unwrap();
+        match proximo(&mut live).await {
+            Live::Event(NotifyEvent::Mention {
+                author,
+                channel_id,
+                excerpt,
+                ..
+            }) => {
+                assert_eq!((author, channel_id), (quem, canal));
+                assert!(excerpt.contains(&run), "{excerpt}");
+            }
+            outro => panic!("esperava a menção, veio {outro:?}"),
+        }
+        println!("chamado e menção chegaram pelo tempo real");
+    }
+}
