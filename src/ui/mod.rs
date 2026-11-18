@@ -2,6 +2,7 @@
 mod avatar;
 mod chat;
 mod drawn;
+mod people;
 mod screens;
 mod sidebar;
 mod sounds;
@@ -166,6 +167,8 @@ struct Main {
     /// A bandeja está na tela. Ela só existe logado, que é quando o segundo plano serve pra
     /// algo; sem ela não tem de onde reabrir, e o X sai do app.
     tray: bool,
+    /// Quem tem conta no servidor, pra chamar pra call e pro `@` do chat.
+    members: Vec<Member>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -309,6 +312,8 @@ pub enum Msg {
     Notifications(bool),
     /// Interruptor "Iniciar com o computador".
     Autostart(bool),
+    // Chamar pessoas pra call.
+    People(people::Msg),
 }
 
 /// O que a pessoa fez, pro log: cliques e escolhas, nunca texto digitado nem título de
@@ -372,6 +377,7 @@ fn action(msg: &Msg) -> Option<String> {
             "ligou iniciar com o computador",
             "desligou iniciar com o computador",
         ),
+        Msg::People(msg) => return people::action(msg),
         _ => return None,
     })
 }
@@ -595,7 +601,7 @@ impl App {
             Screen::Offline(server) => screens::offline(server),
             Screen::Main(m) => {
                 if let Some(call) = m.call.as_ref().filter(|c| c.fullscreen()) {
-                    return stage::full(call, &self.config);
+                    return stage::full(m, call, &self.config);
                 }
                 let content = match (&m.chat, &m.call) {
                     (Some(open), _) => chat::view(m, open),
@@ -711,9 +717,13 @@ impl App {
                 };
                 m.avatar_paths.extend(
                     members
-                        .into_iter()
-                        .filter_map(|p| Some((p.username, p.avatar_url?))),
+                        .iter()
+                        .filter_map(|p| Some((p.username.clone(), p.avatar_url.clone()?))),
                 );
+                m.members = members;
+                if let Some(open) = &mut m.chat {
+                    open.set_members(&m.members, &m.user.username);
+                }
                 m.fetch_avatars()
             }
             // Sem a lista, os avatares caem nas iniciais.
@@ -1187,6 +1197,10 @@ impl App {
                 crate::autostart::set(on);
                 Task::none()
             }
+            Msg::People(msg) => match &mut self.screen {
+                Screen::Main(m) => people::update(m, msg),
+                _ => Task::none(),
+            },
         }
     }
 
@@ -1338,7 +1352,8 @@ impl App {
                 if m.chat.as_ref().is_some_and(|open| open.channel == channel) {
                     return Task::none();
                 }
-                let (open, task) = chat::Chat::open(&m.client, c);
+                let (mut open, task) = chat::Chat::open(&m.client, c);
+                open.set_members(&m.members, &m.user.username);
                 m.chat = Some(open);
                 task
             }
@@ -1438,6 +1453,7 @@ impl App {
             call.volume_panel = None;
             call.share_panel = false;
             call.share_menu = false;
+            call.people = None;
         }
     }
 
@@ -1808,6 +1824,7 @@ impl App {
             // O foco chegou antes, na tela de entrar; muda no próximo evento.
             focused: self.window.is_some(),
             tray: false,
+            members: Vec::new(),
         };
         let avatars = main.fetch_avatars();
         let fresh = main.refresh();
@@ -1983,6 +2000,13 @@ impl Main {
             .flatten()
             .map(|p| p.display_name())
             .chain(self.chat.iter().flat_map(chat::Chat::authors))
+            .chain(
+                // Com o painel de chamar aberto, todos aparecem na lista.
+                self.call
+                    .iter()
+                    .filter(|c| c.people.is_some())
+                    .flat_map(|_| self.members.iter().map(|p| p.username.as_str())),
+            )
             .chain([self.user.username.as_str()])
             .filter_map(|name| self.avatar_paths.get(name))
             .filter(|path| !self.requested.contains(*path))
@@ -3278,6 +3302,73 @@ mod tests {
         assert!(!call_of(&mut a).recording);
     }
 
+    fn com_membros(a: &mut App) {
+        main_of(a).members = [(1, "Opedro"), (2, "Ana"), (3, "Bruno")]
+            .map(|(id, username)| Member {
+                id,
+                username: username.into(),
+                avatar_url: None,
+            })
+            .to_vec();
+    }
+
+    #[test]
+    fn chamar_pessoas_abre_manda_fecha_e_ignora_resposta_velha() {
+        let mut a = in_call(&["Ana"]);
+        com_membros(&mut a);
+        let id = call_id(&mut a);
+        let pessoas = Msg::People;
+
+        let _ = a.update(pessoas(people::Msg::Open));
+        assert!(call_of(&mut a).people.is_some());
+        assert!(call_of(&mut a).menu_open(), "o fundo pega o clique de fora");
+        assert!(
+            call_of(&mut a).bar_visible(),
+            "a barra não some com o painel"
+        );
+        // Sem ninguém marcado, Chamar não faz nada.
+        let _ = a.update(pessoas(people::Msg::Send));
+        let estado = |a: &mut App| format!("{:?}", call_of(a).people);
+        assert!(estado(&mut a).contains("Idle"), "{}", estado(&mut a));
+
+        let _ = a.update(pessoas(people::Msg::Pick(2)));
+        let _ = a.update(pessoas(people::Msg::Send));
+        assert!(estado(&mut a).contains("Sending"));
+        // Enquanto manda, marcar e mandar de novo não mexe.
+        let _ = a.update(pessoas(people::Msg::Pick(3)));
+        let _ = a.update(pessoas(people::Msg::Send));
+        assert!(estado(&mut a).contains("picked: [2]"), "{}", estado(&mut a));
+        // Resposta de outra call, ou de antes, cai fora.
+        let _ = a.update(pessoas(people::Msg::Sent(id + 1, Ok((1, 1)))));
+        assert!(estado(&mut a).contains("Sending"));
+        let _ = a.update(pessoas(people::Msg::Sent(id, Ok((1, 1)))));
+        assert!(estado(&mut a).contains("Chamado enviado: 1 de 1 com o Concord aberto"));
+        let _ = a.update(pessoas(people::Msg::Finish(id + 1)));
+        assert!(call_of(&mut a).people.is_some());
+        let _ = a.update(pessoas(people::Msg::Finish(id)));
+        assert!(call_of(&mut a).people.is_none());
+
+        // Esc e clique fora (CloseVolume) fecham; o botão da barra alterna.
+        let _ = a.update(pessoas(people::Msg::Open));
+        let _ = a.update(Msg::Escape);
+        assert!(call_of(&mut a).people.is_none());
+        let _ = a.update(pessoas(people::Msg::Open));
+        let _ = a.update(Msg::CloseVolume);
+        assert!(call_of(&mut a).people.is_none());
+        let _ = a.update(pessoas(people::Msg::Open));
+        let _ = a.update(pessoas(people::Msg::Open));
+        assert!(call_of(&mut a).people.is_none());
+
+        // Erro: o painel fica aberto, com a lista liberada pra tentar de novo.
+        let _ = a.update(pessoas(people::Msg::Open));
+        let _ = a.update(pessoas(people::Msg::Pick(2)));
+        let _ = a.update(pessoas(people::Msg::Send));
+        let _ = a.update(pessoas(people::Msg::Sent(id, Err(Error::Offline))));
+        assert!(estado(&mut a).contains("Failed"));
+        let _ = a.update(pessoas(people::Msg::Pick(3)));
+        assert!(estado(&mut a).contains("Idle") && estado(&mut a).contains("picked: [2, 3]"));
+    }
+
     /// Gera `snapshots/*.png` sem abrir janela: `cargo test -- --ignored prints`.
     #[test]
     #[ignore]
@@ -3549,6 +3640,55 @@ mod tests {
         let _ = a.update(Msg::CallEvent(id, call::Event::Recording(true)));
         let _ = a.update(Msg::CallEvent(id, call::Event::Unstable(true)));
         print(&a, "palco-avisos");
+
+        // Chamar pessoas: com duas marcadas, no limite de 10, enviando, enviado e com erro.
+        let (mut a, id) = palco(4);
+        let todos = [
+            "Opedro",
+            "Ana",
+            "Bruno",
+            "Carla",
+            "Duda",
+            "Edu",
+            "Fabi",
+            "Gabi",
+            "Hugo",
+            "Iara",
+            "Jota",
+            "Zé da Silva com nome bem comprido demais",
+        ];
+        main_of(&mut a).members = todos
+            .iter()
+            .zip(1..)
+            .map(|(username, id)| Member {
+                id,
+                username: (*username).into(),
+                avatar_url: None,
+            })
+            .collect();
+        let _ = a.update(Msg::People(people::Msg::Open));
+        for quem in [2, 4] {
+            let _ = a.update(Msg::People(people::Msg::Pick(quem)));
+        }
+        print(&a, "chamar-marcados");
+        print_at(&a, "chamar-janela-minima", Size::new(860.0, 560.0));
+        // Desmarca as duas e marca as 10 últimas: a Ana, de fora, fica travada.
+        for quem in [2, 4].into_iter().chain(3..13) {
+            let _ = a.update(Msg::People(people::Msg::Pick(quem)));
+        }
+        print(&a, "chamar-limite");
+        let _ = a.update(Msg::People(people::Msg::Send));
+        print(&a, "chamar-enviando");
+        let _ = a.update(Msg::People(people::Msg::Sent(id, Ok((10, 7)))));
+        print(&a, "chamar-enviado");
+        let _ = a.update(Msg::People(people::Msg::Finish(id)));
+        assert!(call_of(&mut a).people.is_none(), "o aviso fecha o painel");
+        let _ = a.update(Msg::People(people::Msg::Open));
+        let _ = a.update(Msg::People(people::Msg::Pick(2)));
+        let _ = a.update(Msg::People(people::Msg::Send));
+        let espera = Err(Error::TooManyAttempts(1500));
+        let _ = a.update(Msg::People(people::Msg::Sent(id, espera)));
+        print(&a, "chamar-limite-de-chamados");
 
         // Transmissão: painel de qualidade, seletor do sistema, no ar e falha.
         let (mut a, id) = palco(4);

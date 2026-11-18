@@ -3,13 +3,15 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, Stream, StreamExt};
 
 use iced::keyboard::{Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
-use iced::widget::text_editor::{Action, Binding, KeyPress, Motion};
+use iced::widget::text::Wrapping;
+use iced::widget::text_editor::{Action, Binding, Cursor, Edit, KeyPress, Motion, Position};
 use iced::widget::{
     Column, button, column, container, image, mouse_area, progress_bar, row, scrollable, space,
     text, text_editor,
@@ -24,7 +26,7 @@ use super::theme::{
     self, BG, BG2, BORDER, BORDER2, DANGER, DANGER_SOFT, FG, FG2, FG3, HOVER, IDLE,
 };
 use super::{Main, Msg as App, avatar};
-use crate::api::{Attachment, Channel, Client, Error, Kind, Message, Page, Uploaded, User};
+use crate::api::{Attachment, Channel, Client, Error, Kind, Member, Message, Page, Uploaded, User};
 use crate::chat::{self as logic, Live, Timeline, Window};
 
 const LISTA: &str = "chat-lista";
@@ -37,7 +39,12 @@ const MAX_IMAGEM: u64 = 20 * 1024 * 1024;
 /// Maior imagem na mensagem, em pixels lógicos.
 const IMAGEM: (f32, f32) = (400.0, 300.0);
 const TEXTO: f32 = 14.8;
+/// Largura da lista do `@`.
+const MENU: f32 = 280.0;
 /// Seleção bem visível no fundo escuro: o `SOFT` do tema some aqui.
+/// Sugestões do `@` na lista, e o maior começo de nome que ainda procura.
+const SUGESTOES: usize = 6;
+const MAX_PREFIXO: usize = 32;
 const SELECAO: Color = Color::from_rgba8(157, 78, 221, 0.45);
 
 #[derive(Clone, Debug)]
@@ -79,6 +86,18 @@ pub enum Msg {
     Deleted(i64, Result<(), Error>),
     /// Sessão vencida no meio: volta pro login.
     Expired,
+    /// Lista de `@` aberta no campo: setas, aceitar, fechar e clique.
+    Mention(Suggest),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Suggest {
+    Prev,
+    Next,
+    Accept,
+    Dismiss,
+    /// Clique numa linha da lista.
+    At(usize),
 }
 
 pub struct Chat {
@@ -103,6 +122,21 @@ pub struct Chat {
     opening: HashSet<i64>,
     /// Mensagem com a confirmação de apagar aberta.
     confirm: Option<i64>,
+    /// Nomes pra sugerir no `@`: todos menos a própria pessoa.
+    members: Vec<String>,
+    /// Linha marcada na lista do `@`.
+    pick: usize,
+    /// Esc fechou a lista deste `@` (linha e coluna dele): só volta com texto novo.
+    dismissed: Option<(usize, usize)>,
+}
+
+/// O `@nome` que está sendo digitado, logo antes do cursor.
+struct Mention {
+    line: usize,
+    /// Onde está o `@` na linha e onde o cursor está, em bytes.
+    at: usize,
+    end: usize,
+    prefix: String,
 }
 
 enum Upload {
@@ -142,6 +176,9 @@ impl Chat {
             images: HashMap::new(),
             opening: HashSet::new(),
             confirm: None,
+            members: Vec::new(),
+            pick: 0,
+            dismissed: None,
         };
         let task = Task::batch([chat.recover(client), operation::focus(COMPOSER)]);
         (chat, task)
@@ -154,10 +191,79 @@ impl Chat {
 
     /// Quem aparece na tela, pra baixar as fotos.
     pub fn authors(&self) -> impl Iterator<Item = &str> {
+        let listed = self.suggestions().into_iter().flat_map(|(_, names)| names);
         self.timeline
             .messages
             .iter()
             .map(|m| m.author_name.as_str())
+            .chain(listed)
+    }
+
+    pub fn set_members(&mut self, members: &[Member], me: &str) {
+        self.members = members
+            .iter()
+            .filter(|p| p.username != me)
+            .map(|p| p.username.clone())
+            .collect();
+    }
+
+    /// O `@` antes do cursor. Sem seleção, e não enquanto envia.
+    fn mention(&self) -> Option<Mention> {
+        let cursor = self.draft.cursor();
+        if cursor.selection.is_some() || self.sending {
+            return None;
+        }
+        let Position { line, column } = cursor.position;
+        let text = self.draft.line(line)?.text;
+        let (at, prefix) = find_mention(&text, column)?;
+        Some(Mention {
+            line,
+            at,
+            end: column,
+            prefix: prefix.to_owned(),
+        })
+    }
+
+    /// A lista do `@`, se tem o que mostrar.
+    fn suggestions(&self) -> Option<(Mention, Vec<&str>)> {
+        let mention = self.mention()?;
+        if self.dismissed == Some((mention.line, mention.at)) {
+            return None;
+        }
+        let names = rank(&self.members, &mention.prefix);
+        (!names.is_empty()).then_some((mention, names))
+    }
+
+    fn suggest(&mut self, step: Suggest) -> Task<App> {
+        let Some((mention, names)) = self.suggestions() else {
+            return Task::none();
+        };
+        let (count, anchor) = (names.len(), (mention.line, mention.at));
+        let current = self.pick.min(count - 1);
+        let chosen = match step {
+            Suggest::Accept => names.get(current),
+            Suggest::At(i) => names.get(i),
+            _ => None,
+        }
+        .map(|name| (*name).to_owned());
+        match (step, chosen) {
+            (Suggest::Prev, _) => self.pick = (current + count - 1) % count,
+            (Suggest::Next, _) => self.pick = (current + 1) % count,
+            (Suggest::Dismiss, _) => self.dismissed = Some(anchor),
+            (_, Some(name)) => {
+                // Troca do `@` até o cursor pelo nome exato, que o servidor confere com
+                // maiúscula e minúscula, e deixa o espaço pra seguir escrevendo.
+                let (line, from, to) = (mention.line, mention.at, mention.end);
+                self.draft.move_to(Cursor {
+                    position: Position { line, column: to },
+                    selection: Some(Position { line, column: from }),
+                });
+                self.edit(Action::Edit(Edit::Paste(Arc::new(format!("@{name} ")))));
+                return operation::focus(COMPOSER);
+            }
+            _ => {}
+        }
+        Task::none()
     }
 
     /// Primeira carga, ou o que perdeu depois da mais nova da tela.
@@ -322,6 +428,7 @@ impl Chat {
                 }
             }
             Msg::Draft(action) => self.edit(action),
+            Msg::Mention(step) => return self.suggest(step),
             Msg::Select(id, action) => {
                 if let Some(content) = self.texts.get_mut(&id).filter(|_| !action.is_edit()) {
                     content.perform(action);
@@ -370,7 +477,7 @@ impl Chat {
         if !edit {
             return;
         }
-        self.error = None;
+        (self.error, self.pick, self.dismissed) = (None, 0, None);
         let text = self.draft.text();
         if !logic::fits(&text) {
             // Colou demais: corta no limite, como o `maxLength` da web.
@@ -549,7 +656,7 @@ pub fn view<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
         .width(Length::Fill)
         .height(1)
         .style(theme::fill(BORDER));
-    container(column![header, divider, body, composer(chat)])
+    container(column![header, divider, body, composer(m, chat)])
         .width(Length::Fill)
         .height(Length::Fill)
         .style(theme::fill(BG))
@@ -762,13 +869,15 @@ fn attachment_view<'a>(chat: &'a Chat, id: i64, attachment: &'a Attachment) -> E
         .into()
 }
 
-fn composer(chat: &Chat) -> Element<'_, App> {
+fn composer<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
     let channel = chat.channel;
+    let suggestions = chat.suggestions();
+    let listed = suggestions.is_some();
     let editor = text_editor(&chat.draft)
         .id(COMPOSER)
         .placeholder(format!("Conversar em #{}", chat.name))
         .on_action(move |action| App::Chat(channel, Msg::Draft(action)))
-        .key_binding(move |key| enter_sends(key, channel))
+        .key_binding(move |key| editor_keys(key, channel, listed))
         .size(TEXTO)
         .padding([9, 0])
         .max_height(140)
@@ -860,9 +969,11 @@ fn composer(chat: &Chat) -> Element<'_, App> {
             )
         }
     };
+    let mentions = suggestions.map(|(_, names)| mention_list(m, chat, &names));
     column![]
         .push(error)
         .push(upload)
+        .push(mentions)
         .push(card)
         .spacing(6)
         .padding(Padding {
@@ -872,6 +983,99 @@ fn composer(chat: &Chat) -> Element<'_, App> {
             left: 16.0,
         })
         .into()
+}
+
+/// Lista do `@` sobre o campo, com a linha marcada em destaque.
+fn mention_list<'a>(m: &'a Main, chat: &Chat, names: &[&'a str]) -> Element<'a, App> {
+    let channel = chat.channel;
+    let current = chat.pick.min(names.len().saturating_sub(1));
+    let rows = names.iter().enumerate().map(|(i, name)| {
+        let line = row![
+            avatar::view(name, m.avatar(name), 22.0),
+            text(*name)
+                .size(14)
+                .font(theme::MEDIUM)
+                .wrapping(Wrapping::None),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        button(line)
+            .padding([5, 10])
+            .width(Length::Fill)
+            .style(theme::nav_item(i == current))
+            .on_press(App::Chat(channel, Msg::Mention(Suggest::At(i))))
+            .into()
+    });
+    container(Column::with_children(rows).spacing(2))
+        .padding(4)
+        .width(MENU)
+        .style(|_| container::Style {
+            background: Some(BG2.into()),
+            border: Border {
+                color: BORDER2,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Com a lista do `@` aberta, setas, Tab e Enter são dela, e Esc fecha: Enter não envia.
+fn editor_keys(key: KeyPress, channel: i64, listed: bool) -> Option<Binding<App>> {
+    let focused = matches!(key.status, text_editor::Status::Focused { .. });
+    if listed && focused && key.modifiers.is_empty() {
+        let step = match key.key.as_ref() {
+            Key::Named(Named::ArrowUp) => Some(Suggest::Prev),
+            Key::Named(Named::ArrowDown) => Some(Suggest::Next),
+            Key::Named(Named::Enter | Named::Tab) => Some(Suggest::Accept),
+            Key::Named(Named::Escape) => Some(Suggest::Dismiss),
+            _ => None,
+        };
+        if let Some(step) = step {
+            return Some(Binding::Custom(App::Chat(channel, Msg::Mention(step))));
+        }
+    }
+    enter_sends(key, channel)
+}
+
+/// `@` com começo de nome logo antes da coluna `column` (em bytes) da linha: devolve onde o
+/// `@` está e o que vem depois dele. O `@` tem de abrir a linha ou vir depois de espaço
+/// (`a@b` é e-mail), e o começo não pode terminar em espaço: quem digitou "@Ana " já seguiu
+/// escrevendo, e a lista não pode tomar o Enter dela.
+fn find_mention(line: &str, column: usize) -> Option<(usize, &str)> {
+    let before = line.get(..column)?;
+    let at = before.rfind('@')?;
+    if !before[..at]
+        .chars()
+        .next_back()
+        .is_none_or(char::is_whitespace)
+    {
+        return None;
+    }
+    let prefix = &before[at + 1..];
+    if prefix.ends_with(char::is_whitespace) || prefix.chars().count() > MAX_PREFIXO {
+        return None;
+    }
+    Some((at, prefix))
+}
+
+/// Quem combina com o começo digitado, sem ligar pra maiúscula: primeiro os que começam
+/// assim, depois os que só contêm. Na ordem da lista do servidor dentro de cada grupo.
+fn rank<'a>(names: &'a [String], prefix: &str) -> Vec<&'a str> {
+    let wanted = prefix.to_lowercase();
+    let (mut starts, mut contains) = (Vec::new(), Vec::new());
+    for name in names {
+        let lower = name.to_lowercase();
+        if lower.starts_with(&wanted) {
+            starts.push(name.as_str());
+        } else if lower.contains(&wanted) {
+            contains.push(name.as_str());
+        }
+    }
+    starts.extend(contains);
+    starts.truncate(SUGESTOES);
+    starts
 }
 
 /// Enter envia; Shift+Enter quebra a linha, como na web.
@@ -1068,6 +1272,188 @@ mod tests {
     }
 
     #[test]
+    fn arroba_so_vale_no_comeco_ou_depois_de_espaco() {
+        let ok = |line, col| find_mention(line, col);
+        assert_eq!(ok("@an", 3), Some((0, "an")));
+        assert_eq!(ok("@", 1), Some((0, "")));
+        assert_eq!(ok("oi @an", 6), Some((3, "an")));
+        assert_eq!(ok("oi\t@an", 6), Some((3, "an")));
+        // Só conta até o cursor: o resto da linha não entra.
+        assert_eq!(ok("oi @ana tchau", 6), Some((3, "an")));
+        // E-mail, arroba colado, e começo que já terminou em espaço.
+        assert_eq!(ok("a@b", 3), None);
+        assert_eq!(ok("fulano@dominio.com", 18), None);
+        assert_eq!(ok("@@an", 4), None);
+        assert_eq!(ok("@Ana ", 5), None);
+        assert_eq!(ok("sem nada", 8), None);
+        // Vale o último `@` antes do cursor.
+        assert_eq!(ok("@ana @bi", 8), Some((5, "bi")));
+        // Acento: a coluna é em bytes, e no meio de um caractere não acha nada.
+        assert_eq!(ok("ação @zé", "ação @zé".len()), Some((7, "zé")));
+        assert_eq!(ok("@zé", 3), None);
+        assert_eq!(ok("@zé", 100), None);
+        let longo = format!("@{}", "a".repeat(40));
+        assert_eq!(find_mention(&longo, longo.len()), None);
+    }
+
+    #[test]
+    fn lista_do_arroba_poe_quem_comeca_primeiro_e_corta_em_seis() {
+        let nomes: Vec<String> = [
+            "Mariana",
+            "Ana Maria",
+            "Joana",
+            "Bruno",
+            "ANA",
+            "Hugo",
+            "Dana",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            rank(&nomes, "ana"),
+            ["Ana Maria", "ANA", "Mariana", "Joana", "Dana"]
+        );
+        assert_eq!(rank(&nomes, "ANA M"), ["Ana Maria"]);
+        assert_eq!(rank(&nomes, "zzz"), Vec::<&str>::new());
+        // Sem começo nenhum, os seis primeiros.
+        assert_eq!(rank(&nomes, "").len(), SUGESTOES);
+        assert_eq!(rank(&nomes, "")[0], "Mariana");
+    }
+
+    fn membro(id: i64, username: &str) -> Member {
+        Member {
+            id,
+            username: username.into(),
+            avatar_url: None,
+        }
+    }
+
+    fn digita(c: &mut Chat, texto: &str) {
+        for ch in texto.chars() {
+            c.edit(Action::Edit(text_editor::Edit::Insert(ch)));
+        }
+    }
+
+    fn tecla(key: Named, modifiers: iced::keyboard::Modifiers) -> KeyPress {
+        KeyPress {
+            key: Key::Named(key),
+            modified_key: Key::Named(key),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    #[test]
+    fn aceitar_troca_pelo_nome_exato_e_enter_nao_envia_com_a_lista_aberta() {
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let c = chat(&mut a);
+        let todos = [
+            membro(1, "Opedro"),
+            membro(2, "Ana Maria"),
+            membro(3, "Zé da Silva"),
+            membro(4, "Bruno"),
+        ];
+        c.set_members(&todos, "Opedro");
+        assert_eq!(
+            c.members,
+            ["Ana Maria", "Zé da Silva", "Bruno"],
+            "sem a própria pessoa"
+        );
+        let cliente = Client::new("https://a.b", None);
+
+        digita(c, "oi @an");
+        let (mention, nomes) = c.suggestions().expect("lista aberta");
+        assert_eq!((mention.at, mention.prefix.as_str()), (3, "an"));
+        assert_eq!(nomes, ["Ana Maria"]);
+        let vazio = iced::keyboard::Modifiers::empty();
+        let custom = |k| editor_keys(tecla(k, vazio), 1, true);
+        assert!(matches!(
+            custom(Named::Enter),
+            Some(Binding::Custom(App::Chat(1, Msg::Mention(Suggest::Accept))))
+        ));
+        assert!(matches!(
+            custom(Named::Tab),
+            Some(Binding::Custom(App::Chat(1, Msg::Mention(Suggest::Accept))))
+        ));
+        assert!(matches!(
+            custom(Named::ArrowDown),
+            Some(Binding::Custom(App::Chat(1, Msg::Mention(Suggest::Next))))
+        ));
+        assert!(matches!(
+            custom(Named::Escape),
+            Some(Binding::Custom(App::Chat(
+                1,
+                Msg::Mention(Suggest::Dismiss)
+            )))
+        ));
+        // Sem lista, ou com Shift, o Enter segue como era.
+        assert!(matches!(
+            editor_keys(tecla(Named::Enter, vazio), 1, false),
+            Some(Binding::Custom(App::Chat(1, Msg::Send)))
+        ));
+        assert!(matches!(
+            editor_keys(
+                tecla(Named::Enter, iced::keyboard::Modifiers::SHIFT),
+                1,
+                true
+            ),
+            Some(Binding::Enter)
+        ));
+
+        let _ = c.update(Msg::Mention(Suggest::Accept), &cliente);
+        assert_eq!(c.draft.text(), "oi @Ana Maria ");
+        assert!(c.suggestions().is_none(), "terminou em espaço: fechou");
+        assert_eq!(c.draft.cursor().position.column, "oi @Ana Maria ".len());
+
+        // Acento e maiúscula: entra o nome do servidor, não o que foi digitado.
+        digita(c, "e @zé");
+        let _ = c.update(Msg::Mention(Suggest::At(0)), &cliente);
+        assert_eq!(c.draft.text(), "oi @Ana Maria e @Zé da Silva ");
+    }
+
+    #[test]
+    fn setas_dao_a_volta_esc_fecha_e_texto_novo_reabre() {
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let c = chat(&mut a);
+        let todos = ["Ana", "Ari", "Bruno"].map(|n| membro(9, n));
+        c.set_members(&todos, "Opedro");
+        let cliente = Client::new("https://a.b", None);
+        digita(c, "@a");
+        assert_eq!(c.suggestions().unwrap().1, ["Ana", "Ari"]);
+        let _ = c.update(Msg::Mention(Suggest::Next), &cliente);
+        assert_eq!(c.pick, 1);
+        let _ = c.update(Msg::Mention(Suggest::Next), &cliente);
+        assert_eq!(c.pick, 0, "dá a volta");
+        let _ = c.update(Msg::Mention(Suggest::Prev), &cliente);
+        assert_eq!(c.pick, 1);
+        let _ = c.update(Msg::Mention(Suggest::Accept), &cliente);
+        assert_eq!(c.draft.text(), "@Ari ");
+
+        // Apaga o espaço e o `i`: "@Ar" volta a listar; Esc fecha até haver texto novo.
+        for _ in 0..2 {
+            c.edit(Action::Edit(text_editor::Edit::Backspace));
+        }
+        assert_eq!(c.suggestions().unwrap().1, ["Ari"]);
+        let _ = c.update(Msg::Mention(Suggest::Dismiss), &cliente);
+        assert!(c.suggestions().is_none());
+        c.edit(Action::Edit(text_editor::Edit::Backspace));
+        assert_eq!(c.draft.text(), "@A");
+        assert!(c.suggestions().is_some(), "texto novo reabre");
+
+        // Com seleção, ou enquanto envia, nada abre.
+        c.edit(Action::SelectAll);
+        assert!(c.suggestions().is_none());
+        c.edit(Action::Move(Motion::DocumentEnd));
+        assert!(c.suggestions().is_some());
+        c.sending = true;
+        assert!(c.suggestions().is_none());
+    }
+
+    #[test]
     fn tempo_real_entra_sai_e_avisa_a_queda() {
         use crate::api::ChatEvent;
         let mut a = app();
@@ -1260,6 +1646,26 @@ mod tests {
             size: 31_000_000,
         });
         print(&a, "anexo-pronto");
+
+        // `@` com a lista aberta: quem começa com o texto primeiro, a segunda linha marcada.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let page = Page {
+            messages: conversa(),
+            has_more: false,
+        };
+        let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
+        let c = chat(&mut a);
+        let todos = ["Opedro", "Ana", "Mariana", "Joana", "Bruno", "Zé da Silva"];
+        let todos: Vec<Member> = todos.iter().zip(1..).map(|(n, i)| membro(i, n)).collect();
+        c.set_members(&todos, "Opedro");
+        digita(c, "oi @an");
+        c.pick = 1;
+        print(&a, "arroba");
+        let c = chat(&mut a);
+        c.draft = text_editor::Content::new();
+        digita(c, "falou @");
+        print(&a, "arroba-todos");
     }
 
     /// Anexo como o servidor manda.

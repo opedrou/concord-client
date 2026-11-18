@@ -32,6 +32,7 @@ pub const CLOSE: &[u8] = icon!("close");
 pub const CHEVRON_UP: &[u8] = icon!("chevron-up");
 pub const MARK: &[u8] = icon!("mark");
 pub const DOWNLOAD: &[u8] = icon!("download");
+pub const USER_PLUS: &[u8] = icon!("user-plus");
 
 pub fn icon<'a>(bytes: &'static [u8], size: f32, color: Color) -> Element<'a, Msg> {
     svg(svg::Handle::from_memory(bytes))

@@ -123,6 +123,8 @@ pub struct ActiveCall {
     /// Último ponto do mouse no palco, e onde o painel de volume foi aberto.
     pub cursor: Point,
     pub volume_at: Point,
+    /// Painel "Chamar pessoas" aberto.
+    pub people: Option<super::people::Panel>,
 }
 
 /// Como a transmissão assistida aparece, como no site.
@@ -175,6 +177,7 @@ impl ActiveCall {
             bar_near: false,
             cursor: Point::ORIGIN,
             volume_at: Point::ORIGIN,
+            people: None,
         }
     }
 
@@ -187,12 +190,13 @@ impl ActiveCall {
         self.bar_near
             || self.share_panel
             || self.share_menu
+            || self.people.is_some()
             || matches!(self.share, share::State::Choosing | share::State::Failed)
     }
 
     /// Algum painel solto sobre o palco aberto: o fundo pega o clique de fora.
     pub fn menu_open(&self) -> bool {
-        self.volume_panel.is_some() || self.share_panel || self.share_menu
+        self.volume_panel.is_some() || self.share_panel || self.share_menu || self.people.is_some()
     }
 
     pub fn attach(&mut self, call: Call, engine: Engine) {

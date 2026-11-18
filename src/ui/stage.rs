@@ -6,9 +6,10 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, ContentFit, Element, Length, Padding, Size, Theme, border};
 
+use super::people;
 use super::sidebar::{
-    CHEVRON_UP, CLOSE, HEADPHONES, HEADPHONES_OFF, MIC, MIC_OFF, SCREEN, VOLUME, VOLUME_X, icon,
-    live_badge, tipped,
+    CHEVRON_UP, CLOSE, HEADPHONES, HEADPHONES_OFF, MIC, MIC_OFF, SCREEN, USER_PLUS, VOLUME,
+    VOLUME_X, icon, live_badge, tipped,
 };
 use super::theme::{self, ACCENT, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, FG, FG2, GREEN, IDLE};
 use super::voice::{self, ActiveCall, GAP, Status};
@@ -63,13 +64,18 @@ pub fn view<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Elemen
     if call.recording {
         layers.push(recording());
     }
-    overlays(call, config, &mut layers);
+    overlays(m, call, config, &mut layers);
     stack(layers).into()
 }
 
 /// Painéis soltos sobre o palco e a barra. Com algum aberto, um fundo pega o clique de fora,
 /// de qualquer botão: fecha o painel e não chega em mais nada.
-fn overlays<'a>(call: &'a ActiveCall, config: &'a Config, layers: &mut Vec<Element<'a, Msg>>) {
+fn overlays<'a>(
+    m: &'a Main,
+    call: &'a ActiveCall,
+    config: &'a Config,
+    layers: &mut Vec<Element<'a, Msg>>,
+) {
     if call.menu_open() {
         let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
             .on_press(Msg::CloseVolume)
@@ -90,6 +96,13 @@ fn overlays<'a>(call: &'a ActiveCall, config: &'a Config, layers: &mut Vec<Eleme
         );
     }
     layers.extend(share_overlay(call, config));
+    layers.extend(people::card(m, call).map(|card| {
+        container(opaque(card))
+            .center_x(Length::Fill)
+            .align_bottom(Length::Fill)
+            .padding(Padding::ZERO.bottom(ABOVE_BAR))
+            .into()
+    }));
 }
 
 /// Palco com a barra de controles por cima, só com o mouse perto do pé.
@@ -444,10 +457,10 @@ fn own_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> E
 
 /// Transmissão assistida em tela cheia, sem a barra lateral. A barra de controles aparece
 /// com o mouse perto do pé, com "Fechar transmissão" no lugar de sair; Esc volta.
-pub fn full<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
+pub fn full<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     let base = with_bar(call, config, move |_| screen_image(call, 15.0));
     let mut layers = vec![container(base).style(theme::fill(theme::STAGE)).into()];
-    overlays(call, config, &mut layers);
+    overlays(m, call, config, &mut layers);
     stack(layers).into()
 }
 
@@ -514,6 +527,13 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
         .push(arrow)
         .spacing(2)
         .align_y(Alignment::Center);
+    let inviting = call.people.is_some();
+    let invite =
+        button(container(icon(USER_PLUS, 20.0, if inviting { ACCENT2 } else { FG2 })).center(46))
+            .padding(0)
+            .style(theme::bar_toggle(inviting))
+            .on_press(Msg::People(people::Msg::Open));
+    let invite = tipped(invite.into(), "Chamar pessoas");
     let separator = container(space())
         .width(1)
         .height(28)
@@ -538,7 +558,7 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     .on_press(msg);
 
     container(
-        row![mic, ears, screen, separator, leave]
+        row![mic, ears, screen, invite, separator, leave]
             .spacing(8)
             .align_y(Alignment::Center),
     )
@@ -906,7 +926,7 @@ fn share_menu(call: &ActiveCall) -> Element<'_, Msg> {
 }
 
 /// Painel solto sobre o palco.
-fn floating(ring: Color) -> impl Fn(&Theme) -> container::Style {
+pub(super) fn floating(ring: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
         background: Some(BG2.into()),
         text_color: Some(FG),

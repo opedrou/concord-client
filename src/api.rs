@@ -477,8 +477,6 @@ impl Client {
     /// Chama pessoas pra call do canal: o servidor avisa cada uma no app dela. Devolve
     /// quantas foram chamadas e quantas estavam com o app conectado. 429 é o limite de
     /// chamadas, com o tempo de espera; 400 é lista ou canal que não existe mais.
-    // Ligado na interface na próxima etapa; aí este `allow` sai.
-    #[allow(dead_code)]
     pub async fn call_people(
         &self,
         user_ids: &[i64],
