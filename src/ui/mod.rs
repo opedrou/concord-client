@@ -39,6 +39,9 @@ const FALHAS_ATE_AVISAR: u8 = 3;
 
 /// Tempo que a saída espera o `Ended` antes de fechar a janela mesmo assim.
 const ESPERA_AO_FECHAR: Duration = Duration::from_secs(2);
+/// Na tela de sem conexão, de quanto em quanto tempo tenta de novo sozinho: o autostart
+/// pode abrir antes de a rede subir.
+const TENTA_DE_NOVO: Duration = Duration::from_secs(30);
 /// Relógio do anel de fala: o hold é de 400 ms, então 100 ms apaga sem atraso visível.
 const QUADRO: Duration = Duration::from_millis(100);
 /// Relógio do medidor de entrada: uns 30 quadros por segundo.
@@ -67,6 +70,17 @@ pub struct App {
     minimized: bool,
     /// Janela "o que tem de novo", decidida ao abrir: ver [`crate::update::news_pending`].
     news: bool,
+    /// A janela, se está aberta. Fechada, o processo segue em segundo plano.
+    window: Option<window::Id>,
+}
+
+/// O que espera a call terminar pra acontecer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Closing {
+    /// Fechar a janela, e o processo segue.
+    Window(window::Id),
+    /// Sair do app.
+    Quit,
 }
 
 enum Screen {
@@ -120,8 +134,8 @@ struct Main {
     /// Última leitura do mic, em dBFS, e se o limitador está aberto.
     level: f32,
     open: bool,
-    /// Janela que pediu pra fechar e espera a call terminar.
-    closing: Option<window::Id>,
+    /// Janela que pediu pra fechar, ou saída do app, esperando a call terminar.
+    closing: Option<Closing>,
     /// Modo em que a janela está de verdade: segue a tela cheia da transmissão assistida.
     full_window: bool,
     /// Versão nova já baixada e instalada, que vale na próxima abertura.
@@ -245,7 +259,14 @@ pub enum Msg {
     ProbeStarted(u64, Result<Boot, String>),
     Devices(Devices),
     CloseRequested(window::Id),
-    CloseNow(window::Id),
+    /// Passou a espera pelo `Ended`: fecha mesmo assim.
+    CloseNow(Closing),
+    /// A janela fechou, por qualquer caminho.
+    WindowClosed(window::Id),
+    /// Outra abertura do Concord: mostra a janela, ou abre se não tem.
+    Show,
+    /// Sai do app: deixa a call e encerra o processo.
+    Quit,
     DragStart,
     DragMove(f32),
     DragEnd,
@@ -310,6 +331,8 @@ fn action(msg: &Msg) -> Option<String> {
         Msg::CloseSettings => "fechou as configurações".into(),
         Msg::CloseNews => "fechou as novidades da versão".into(),
         Msg::CloseRequested(_) => "fechou a janela".into(),
+        Msg::Show => "abriu o Concord de novo".into(),
+        Msg::Quit => "saiu do Concord".into(),
         Msg::Chat(channel, chat::Msg::Open) => format!("abriu o chat do canal {channel}"),
         _ => return None,
     })
@@ -338,6 +361,29 @@ fn check_update() -> Task<Msg> {
         }),
         Msg::Updated,
     )
+}
+
+/// Janela do app. Fechar não encerra: a saída espera o `Ended` da call e o processo segue.
+pub fn window_settings() -> window::Settings {
+    window::Settings {
+        size: iced::Size::new(1200.0, 760.0),
+        min_size: Some(iced::Size::new(860.0, 560.0)),
+        icon: crate::icon::window(),
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: crate::update::APP_ID.into(),
+            ..Default::default()
+        },
+        exit_on_close_request: false,
+        ..window::Settings::default()
+    }
+}
+
+fn command(cmd: crate::instance::Command) -> Msg {
+    match cmd {
+        crate::instance::Command::Show => Msg::Show,
+        crate::instance::Command::Quit => Msg::Quit,
+    }
 }
 
 fn connect(server: String) -> Task<Msg> {
@@ -383,41 +429,47 @@ fn login_error(e: Error) -> String {
 }
 
 impl App {
+    /// Abre a janela, menos com `--background` (o autostart), que só escuta o servidor.
     pub fn boot() -> (Self, Task<Msg>) {
         let mut config = Config::load();
+        crate::autostart::set(config.autostart);
         let news =
             crate::update::news_pending(config.server.is_some(), config.seen_version.as_deref());
         if !news {
             // Grava junto com a próxima mudança: a próxima versão compara com esta.
             config.seen_version = Some(env!("CARGO_PKG_VERSION").into());
         }
-        match config.server.clone() {
-            Some(server) => (
-                Self {
-                    config,
-                    screen: Screen::Connecting,
-                    minimized: false,
-                    news,
-                },
-                connect(server),
-            ),
-            None => {
-                let screen = Screen::Server(ServerForm {
+        let (screen, task) = match config.server.clone() {
+            Some(server) => (Screen::Connecting, connect(server)),
+            None => (
+                Screen::Server(ServerForm {
                     input: String::new(),
                     error: None,
                     busy: false,
-                });
-                (
-                    Self {
-                        config,
-                        screen,
-                        minimized: false,
-                        news,
-                    },
-                    operation::focus(ID_SERVIDOR),
-                )
-            }
+                }),
+                operation::focus(ID_SERVIDOR),
+            ),
+        };
+        let mut app = Self {
+            config,
+            screen,
+            minimized: false,
+            news,
+            window: None,
+        };
+        if crate::autostart::background() {
+            log!("abriu em segundo plano");
+            return (app, task);
         }
+        // O foco no campo só pega com a janela já aberta.
+        let open = app.open_window();
+        (app, open.chain(task))
+    }
+
+    fn open_window(&mut self) -> Task<Msg> {
+        let (id, open) = window::open(window_settings());
+        self.window = Some(id);
+        open.then(window::gain_focus)
     }
 
     pub fn theme(&self) -> Theme {
@@ -428,10 +480,18 @@ impl App {
         let mut subs = vec![
             keyboard::listen().filter_map(keys),
             window::close_requests().map(Msg::CloseRequested),
+            window::close_events().map(Msg::WindowClosed),
             event::listen_with(focus),
+            Subscription::run(crate::instance::commands).map(command),
         ];
+        if let Screen::Offline(_) = &self.screen {
+            subs.push(time::every(TENTA_DE_NOVO).map(|_| Msg::Retry));
+        }
         if let Screen::Main(m) = &self.screen {
-            subs.push(time::every(POLL).map(|_| Msg::Tick));
+            // Sem janela não tem o que mostrar: nem presença nem os contadores da tela.
+            if self.window.is_some() {
+                subs.push(time::every(POLL).map(|_| Msg::Tick));
+            }
             subs.push(time::every(CONFERE_UPDATE).map(|_| Msg::CheckUpdate));
             if m.call.as_ref().is_some_and(ActiveCall::holding) {
                 subs.push(time::every(QUADRO).map(Msg::Frame));
@@ -498,10 +558,10 @@ impl App {
             log!("ação: {what}");
         }
         let task = self.handle(msg);
-        // Na tela principal o relógio de 4 s garante uma mensagem: mais de 10 s sem nenhuma é
-        // a interface travada.
+        // Na tela principal com janela o relógio de 4 s garante uma mensagem: mais de 10 s sem
+        // nenhuma é a interface travada.
         match &self.screen {
-            Screen::Main(_) => health::beat(Beat::Ui),
+            Screen::Main(_) if self.window.is_some() => health::beat(Beat::Ui),
             _ => health::idle(Beat::Ui),
         }
         Task::batch([task, self.sync_window()])
@@ -846,8 +906,36 @@ impl App {
                 }
                 Task::none()
             }
-            Msg::CloseRequested(id) => self.close_requested(id),
-            Msg::CloseNow(id) => window::close(id),
+            Msg::CloseRequested(id) => self.close(Closing::Window(id)),
+            Msg::Quit => self.close(Closing::Quit),
+            Msg::CloseNow(closing) => match &mut self.screen {
+                // O `Ended` chegou antes e já fechou, ou é de um pedido anterior.
+                Screen::Main(m) if m.closing != Some(closing) => Task::none(),
+                Screen::Main(m) => {
+                    m.closing = None;
+                    self.finish(closing)
+                }
+                // A tela mudou no meio (sessão vencida): fechar de novo não faz mal.
+                _ => self.finish(closing),
+            },
+            Msg::WindowClosed(id) => self.window_closed(id),
+            Msg::Show => match self.window {
+                // O Wayland nem informa nem desfaz o minimizar: só pede quando sabe.
+                Some(id) if self.minimized => {
+                    window::minimize(id, false).chain(window::gain_focus(id))
+                }
+                Some(id) => window::gain_focus(id),
+                None => {
+                    log!("janela aberta de novo");
+                    let open = self.open_window();
+                    // Canais, membros e presença podem ter horas.
+                    let fresh = match &mut self.screen {
+                        Screen::Main(m) => m.refresh(),
+                        _ => Task::none(),
+                    };
+                    Task::batch([open, fresh])
+                }
+            },
             Msg::DragStart => {
                 if let Screen::Main(m) = &mut self.screen {
                     m.resizing = true;
@@ -994,16 +1082,19 @@ impl App {
                     }
                     m.check = Some(check);
                 }
-                Task::none()
+                self.restart_unseen()
             }
-            // Com call, sai pelo mesmo caminho de fechar a janela, que deixa a sala limpo, e a
+            // Com call, sai pelo mesmo caminho de sair do app, que deixa a sala limpa, e a
             // versão nova volta pra ela.
             Msg::RestartForUpdate => match &self.screen {
                 Screen::Main(m)
                     if m.update.is_some()
-                        && crate::update::restart(m.call.as_ref().map(|c| c.slug.as_str())) =>
+                        && crate::update::restart(
+                            m.call.as_ref().map(|c| c.slug.as_str()),
+                            false,
+                        ) =>
                 {
-                    window::latest().and_then(|id| Task::done(Msg::CloseRequested(id)))
+                    Task::done(Msg::Quit)
                 }
                 _ => Task::none(),
             },
@@ -1267,11 +1358,8 @@ impl App {
             // Configurações abertas na aba Voz voltam a medir o mic.
             _ => (Task::none(), self.start_probe()),
         };
-        Task::batch([
-            expired,
-            probe,
-            closing.map_or_else(Task::none, window::close),
-        ])
+        let close = closing.map_or_else(Task::none, |c| self.finish(c));
+        Task::batch([expired, probe, close])
     }
 
     /// Sair da call deixa a tela na home na hora; o `Ended(Left)` que vem depois é
@@ -1287,20 +1375,74 @@ impl App {
         }
     }
 
-    fn close_requested(&mut self, id: window::Id) -> Task<Msg> {
+    /// Fechar a janela ou sair. Com call no ar, sai dela e espera o `Ended` (até
+    /// [`ESPERA_AO_FECHAR`]) pra deixar a sala limpa. Segundo pedido no meio da espera faz
+    /// na hora.
+    fn close(&mut self, closing: Closing) -> Task<Msg> {
         self.stop_probe();
         if let Screen::Main(m) = &mut self.screen
-            && m.closing.is_none()
+            && m.closing.take().is_none()
             && let Some(call) = m.call.as_ref().and_then(|c| c.call.as_ref())
         {
             call.leave();
-            m.closing = Some(id);
+            m.closing = Some(closing);
             return Task::future(async move {
                 tokio::time::sleep(ESPERA_AO_FECHAR).await;
-                Msg::CloseNow(id)
+                Msg::CloseNow(closing)
             });
         }
-        window::close(id)
+        self.finish(closing)
+    }
+
+    fn finish(&mut self, closing: Closing) -> Task<Msg> {
+        match closing {
+            // Pelo `iced::exit`, o `main` volta e marca que fechou direito.
+            Closing::Quit => iced::exit(),
+            Closing::Window(id) => {
+                // Call que não respondeu a tempo, ou que ainda abria o áudio, não fica sem
+                // janela: o `Ended` dela, se vier, cai fora.
+                if let Screen::Main(m) = &mut self.screen
+                    && let Some(active) = m.call.take()
+                {
+                    active.leave();
+                }
+                window::close(id)
+            }
+        }
+    }
+
+    /// A janela fechou: o processo segue em segundo plano, sem nada que só serve à tela.
+    fn window_closed(&mut self, id: window::Id) -> Task<Msg> {
+        if self.window != Some(id) {
+            return Task::none();
+        }
+        log!("janela fechada, segue em segundo plano");
+        self.window = None;
+        self.minimized = false;
+        if let Screen::Main(m) = &mut self.screen {
+            m.full_window = false;
+            m.chat = None;
+            m.settings = None;
+            m.resizing = false;
+        }
+        self.restart_unseen()
+    }
+
+    /// Versão nova pronta, sem janela e sem call: ninguém vê a troca, então reinicia já,
+    /// em segundo plano.
+    fn restart_unseen(&mut self) -> Task<Msg> {
+        match &self.screen {
+            Screen::Main(m)
+                if self.window.is_none()
+                    && m.call.is_none()
+                    && m.update.is_some()
+                    && crate::update::restart(None, true) =>
+            {
+                log!("atualização: reinicia em segundo plano pra versão nova");
+                iced::exit()
+            }
+            _ => Task::none(),
+        }
     }
 
     fn connected(
@@ -1321,6 +1463,11 @@ impl App {
                     Some(_) => Task::future(session::delete(server.clone())).discard(),
                     None => Task::none(),
                 };
+                // Em segundo plano não tem quem digite a senha.
+                if self.window.is_none() {
+                    log!("sessão recusada sem janela: sai");
+                    return forget.chain(iced::exit());
+                }
                 self.screen = Screen::Login(LoginForm::new(server, None));
                 Task::batch([forget, operation::focus(ID_USUARIO)])
             }
@@ -1424,7 +1571,6 @@ impl App {
         vault_ok: bool,
     ) -> Task<Msg> {
         let client = Client::new(&server, cookie);
-        let (a, b, c) = (client.clone(), client.clone(), client.clone());
         let mut avatar_paths = HashMap::new();
         if let Some(path) = &user.avatar_url {
             avatar_paths.insert(user.username.clone(), path.clone());
@@ -1459,6 +1605,7 @@ impl App {
             rejoin: crate::update::rejoin(),
         };
         let avatars = main.fetch_avatars();
+        let fresh = main.refresh();
         self.screen = Screen::Main(Box::new(main));
         Task::batch([
             avatars,
@@ -1466,9 +1613,7 @@ impl App {
                 tokio::time::sleep(DE_PE).await;
                 Msg::Healthy
             }),
-            Task::future(async move { Msg::Channels(a.channels().await) }),
-            Task::future(async move { Msg::Members(b.members().await) }),
-            Task::future(async move { Msg::Presence(c.presence().await) }),
+            fresh,
         ])
     }
 
@@ -1511,12 +1656,15 @@ impl App {
         };
         let server = m.server.clone();
         self.leave_call();
+        let forget = Task::future(session::delete(server.clone())).discard();
+        // Em segundo plano não tem quem digite a senha.
+        if self.window.is_none() {
+            log!("sessão vencida sem janela: sai");
+            return forget.chain(iced::exit());
+        }
         let error = Some("Sua sessão expirou. Entre de novo.".to_owned());
-        self.screen = Screen::Login(LoginForm::new(server.clone(), error));
-        Task::batch([
-            Task::future(session::delete(server)).discard(),
-            operation::focus(ID_USUARIO),
-        ])
+        self.screen = Screen::Login(LoginForm::new(server, error));
+        Task::batch([forget, operation::focus(ID_USUARIO)])
     }
 
     fn logout(&mut self) -> Task<Msg> {
@@ -1572,6 +1720,21 @@ impl LoginForm {
 }
 
 impl Main {
+    /// Busca canais, membros e presença: ao entrar e ao reabrir a janela.
+    fn refresh(&mut self) -> Task<Msg> {
+        self.polling = true;
+        let (a, b, c) = (
+            self.client.clone(),
+            self.client.clone(),
+            self.client.clone(),
+        );
+        Task::batch([
+            Task::future(async move { Msg::Channels(a.channels().await) }),
+            Task::future(async move { Msg::Members(b.members().await) }),
+            Task::future(async move { Msg::Presence(c.presence().await) }),
+        ])
+    }
+
     /// O que a interface segura e pode crescer, pros contadores de saúde.
     fn gauges(&self) {
         let images = self.call.as_ref().map_or(0, ActiveCall::images);
@@ -1688,6 +1851,7 @@ mod tests {
             screen,
             minimized: false,
             news: false,
+            window: Some(window::Id::unique()),
         }
     }
 
@@ -2062,9 +2226,58 @@ mod tests {
     fn ended_com_a_janela_fechando_limpa_o_pedido() {
         let mut a = in_call(&["Ana"]);
         let id = call_id(&mut a);
-        main_of(&mut a).closing = Some(window::Id::unique());
+        main_of(&mut a).closing = Some(Closing::Window(window::Id::unique()));
         let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::Left)));
         assert!(main_of(&mut a).closing.is_none());
+    }
+
+    #[test]
+    fn fechar_a_janela_segue_sem_ela_e_reabrir_busca_tudo_de_novo() {
+        let mut a = in_call(&["Ana"]);
+        let id = a.window.expect("teste com janela");
+        // Call que ainda abria o áudio não espera o `Ended`: sai junto com a janela.
+        let _ = a.update(Msg::CloseRequested(id));
+        assert!(main_of(&mut a).call.is_none());
+        a.minimized = true;
+        main_of(&mut a).full_window = true;
+        main_of(&mut a).settings = Some(Tab::About);
+        let _ = a.update(Msg::WindowClosed(window::Id::unique()));
+        assert_eq!(a.window, Some(id), "outra janela não conta");
+        let _ = a.update(Msg::WindowClosed(id));
+        assert_eq!(a.window, None);
+        assert!(!a.minimized);
+        let m = main_of(&mut a);
+        assert!(!m.full_window && m.settings.is_none() && m.chat.is_none());
+        assert!(
+            matches!(a.screen, Screen::Main(_)),
+            "o processo segue logado"
+        );
+
+        let _ = a.update(Msg::Presence(Ok(Presence::new())));
+        assert!(!main_of(&mut a).polling);
+        let _ = a.update(Msg::Show);
+        assert!(a.window.is_some_and(|novo| novo != id));
+        assert!(main_of(&mut a).polling, "presença buscada de novo");
+    }
+
+    #[test]
+    fn sem_janela_sessao_recusada_nao_abre_o_login() {
+        let mut a = main_app();
+        a.window = None;
+        let _ = a.update(Msg::Presence(Err(Error::Unauthorized)));
+        assert!(
+            matches!(a.screen, Screen::Main(_)),
+            "sai em vez de pedir senha"
+        );
+
+        let mut a = app(Screen::Connecting);
+        a.window = None;
+        let _ = a.update(Msg::Connected {
+            server: "https://a.b".into(),
+            cookie: Some(Secret("session=x".into())),
+            result: Err(Error::Unauthorized),
+        });
+        assert!(matches!(a.screen, Screen::Connecting));
     }
 
     #[test]

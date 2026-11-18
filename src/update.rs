@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
-mod win;
+pub mod win;
 
 const LATEST: &str = "https://api.github.com/repos/opedrou/concord-client/releases/latest";
 
@@ -101,10 +101,16 @@ fn data_dir() -> Option<PathBuf> {
 pub fn register() {
     let Some(exe) = installed() else { return };
     let Some(data) = data_dir() else { return };
-    let icon = data.join("concord/icon.png");
+    let Some(icon) = icon_path() else { return };
     let entry = data.join(format!("applications/{APP_ID}.desktop"));
     let _ = write_if_changed(&icon, crate::icon::PNG);
-    let _ = write_if_changed(&entry, desktop_entry(&exe, &icon).as_bytes());
+    let _ = write_if_changed(&entry, desktop_entry(&exe, &icon, "").as_bytes());
+}
+
+/// Ícone do menu, que o autostart também usa.
+#[cfg(target_os = "linux")]
+pub fn icon_path() -> Option<PathBuf> {
+    Some(data_dir()?.join("concord/icon.png"))
 }
 
 /// Flags de linha de comando do Linux que não abrem janela: `--register` (usado pelo
@@ -116,6 +122,9 @@ pub fn cli() -> bool {
         Some("--register") => register(),
         Some("--uninstall") => match (installed(), data_dir()) {
             (Some(exe), Some(data)) => {
+                // A aberta sai antes: senão segue rodando sem o programa no disco.
+                crate::instance::quit();
+                crate::autostart::remove();
                 uninstall(&exe, &data);
                 ask_wipe();
             }
@@ -188,7 +197,7 @@ fn wants_wipe(terminal: bool, input: &mut impl io::BufRead) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if std::fs::read(path).is_ok_and(|old| old == bytes) {
         return Ok(());
     }
@@ -198,10 +207,11 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::write(path, bytes)
 }
 
-/// `Exec` entre aspas, porque o caminho pode ter espaço. Escapes da especificação: dentro
-/// das aspas `"`, `` ` `` e `$` levam `\\`, a barra vira quatro, e `%` vira `%%`.
+/// `Exec` entre aspas, porque o caminho pode ter espaço, seguido de `args`. Escapes da
+/// especificação: dentro das aspas `"`, `` ` `` e `$` levam `\\`, a barra vira quatro, e `%`
+/// vira `%%`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn desktop_entry(exe: &Path, icon: &Path) -> String {
+pub fn desktop_entry(exe: &Path, icon: &Path, args: &str) -> String {
     let mut quoted = String::new();
     for c in exe.to_string_lossy().chars() {
         match c {
@@ -213,7 +223,7 @@ fn desktop_entry(exe: &Path, icon: &Path) -> String {
     }
     format!(
         "[Desktop Entry]\nType=Application\nName=Concord\nComment=Voz e transmissão de tela\n\
-         Exec=\"{quoted}\"\nIcon={}\nTerminal=false\nCategories=Network;Chat;\n\
+         Exec=\"{quoted}\"{args}\nIcon={}\nTerminal=false\nCategories=Network;Chat;\n\
          StartupWMClass={APP_ID}\n",
         icon.display()
     )
@@ -343,7 +353,7 @@ pub fn start() -> bool {
         Ok(false) => false,
         Ok(true) => {
             log!("atualização: esta versão não ficou de pé, voltou pra anterior");
-            restart(rejoin().as_deref())
+            restart(rejoin().as_deref(), crate::autostart::background())
         }
         Err(e) => {
             log!("atualização: não deu pra conferir a versão em teste: {e}");
@@ -436,6 +446,18 @@ fn installed() -> Option<PathBuf> {
         (!dev).then_some(exe)
     })
     .clone()
+}
+
+/// Executável que o autostart abre: o instalado, nunca o de desenvolvimento. No Windows é
+/// sempre o da pasta fixa, mesmo se esta cópia não conseguiu se copiar pra lá.
+#[cfg(not(windows))]
+pub fn launcher() -> Option<PathBuf> {
+    installed()
+}
+
+#[cfg(windows)]
+pub fn launcher() -> Option<PathBuf> {
+    installed().and(win::exe()).filter(|exe| exe.exists())
 }
 
 /// Pasta da config (`~/.config/concord`, `%APPDATA%\Concord`): a mesma onde mora o
@@ -662,13 +684,19 @@ fn swap(exe: &Path, state: &Path) -> io::Result<()> {
 }
 
 /// Abre a versão nova pelo caminho instalado. `false` se não abriu: aí esta segue aberta.
-/// Com `rejoin`, a nova entra direto nesse canal de voz.
-pub fn restart(rejoin: Option<&str>) -> bool {
+/// Com `rejoin`, a nova entra direto nesse canal de voz; com `background`, abre sem janela.
+/// Apaga antes a porta desta instância, que ainda está fechando: a nova vira a primária
+/// em vez de passar o pedido pra ela.
+pub fn restart(rejoin: Option<&str>, background: bool) -> bool {
     installed().is_some_and(|exe| {
         let mut cmd = Command::new(exe);
         if let Some(slug) = rejoin {
             cmd.args([REJOIN, slug]);
         }
+        if background {
+            cmd.arg(crate::autostart::BACKGROUND);
+        }
+        crate::instance::forget();
         cmd.spawn().is_ok()
     })
 }
@@ -970,9 +998,10 @@ mod tests {
         let e = desktop_entry(
             Path::new("/home/a b/50% $x/concord-client"),
             Path::new("/d/concord/icon.png"),
+            "",
         );
         assert!(
-            e.contains(r#"Exec="/home/a b/50%% \\$x/concord-client""#),
+            e.contains("Exec=\"/home/a b/50%% \\\\$x/concord-client\"\n"),
             "{e}"
         );
         assert!(e.contains("Icon=/d/concord/icon.png\n"));

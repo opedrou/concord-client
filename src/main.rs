@@ -10,20 +10,21 @@ macro_rules! log {
 
 mod api;
 mod audio;
+mod autostart;
 mod awake;
 mod call;
 mod chat;
 mod config;
 mod health;
 mod icon;
+mod instance;
 mod log;
 mod session;
 mod share;
 mod ui;
 mod update;
 
-use iced::{Size, window};
-use ui::{App, theme};
+use ui::{App, Msg, theme};
 
 fn main() -> iced::Result {
     // A atualização roda o binário baixado assim pra ver se ele abre neste computador.
@@ -49,37 +50,47 @@ fn main() -> iced::Result {
     if update::setup() {
         return Ok(());
     }
+    // Já tem um Concord aberto: abertura normal mostra a janela dele, a do autostart não
+    // pede nada. Antes do primeiro `log!`, pra não gastar um arquivo de log.
+    let background = autostart::background();
+    if instance::hand_off((!background).then_some(instance::Command::Show)) {
+        return Ok(());
+    }
+    // Em segundo plano sem servidor ou sem login não tem o que escutar.
+    if background
+        && !config::Config::read()
+            .server
+            .is_some_and(|s| session::stored_blocking(&s))
+    {
+        return Ok(());
+    }
     if update::start() {
         return Ok(());
     }
+    instance::bind();
+    #[cfg(windows)]
+    update::win::set_app_id();
     health::start();
     #[cfg(target_os = "linux")]
     update::register();
-    let window = window::Settings {
-        size: Size::new(1200.0, 760.0),
-        min_size: Some(Size::new(860.0, 560.0)),
-        icon: icon::window(),
-        #[cfg(target_os = "linux")]
-        platform_specific: window::settings::PlatformSpecific {
-            application_id: update::APP_ID.into(),
-            ..Default::default()
-        },
-        // Com call ativa, a saída espera o `Ended` antes de fechar.
-        exit_on_close_request: false,
-        ..window::Settings::default()
-    };
-    let mut app = iced::application(App::boot, App::update, App::view)
+    // Daemon: fechar a janela não encerra o processo, e ele pode abrir sem janela.
+    let mut app = iced::daemon(App::boot, App::update, view)
         .title("Concord")
-        .theme(App::theme)
+        .theme(|a: &App, _| a.theme())
         .subscription(App::subscription)
-        .default_font(theme::BODY)
-        .window(window);
+        .default_font(theme::BODY);
     for font in theme::FONTS {
         app = app.font(font);
     }
     let result = app.run();
+    instance::release();
     if result.is_ok() {
         update::closed();
     }
     result
+}
+
+/// Uma janela só: a mesma tela pra qualquer id.
+fn view(app: &App, _: iced::window::Id) -> iced::Element<'_, Msg> {
+    app.view()
 }

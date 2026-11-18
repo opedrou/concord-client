@@ -48,6 +48,12 @@ pub struct Config {
     pub share_audio: bool,
     /// Versão cujas novidades já foram vistas, ou a instalada do zero.
     pub seen_version: Option<String>,
+    /// Interruptor "Notificações": chamados e menções viram aviso do sistema.
+    pub notifications: bool,
+    /// Interruptor "Iniciar com o computador", em segundo plano (`crate::autostart`).
+    pub autostart: bool,
+    /// Data local (`AAAA-MM-DD`) do último som de abertura: toca na primeira do dia.
+    pub greeted_on: Option<String>,
 }
 
 impl Default for Config {
@@ -71,14 +77,25 @@ impl Default for Config {
             share_quality: Quality::default(),
             share_audio: true,
             seen_version: None,
+            notifications: true,
+            autostart: true,
+            greeted_on: None,
         }
     }
 }
 
 impl Config {
-    /// Arquivo ilegível vira config nova: o que se perde é o endereço e as
-    /// preferências, nada que impeça de abrir.
+    /// Lê e registra no log. Ver [`Config::read`].
     pub fn load() -> Self {
+        let c = Self::read();
+        c.note();
+        c
+    }
+
+    /// Arquivo ilegível vira config nova: o que se perde é o endereço e as
+    /// preferências, nada que impeça de abrir. Não escreve no log: a abertura em segundo
+    /// plano sem login sai antes de gastar um arquivo de log.
+    pub fn read() -> Self {
         let mut c: Self = path()
             .and_then(|p| fs::read(p).ok())
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -99,7 +116,6 @@ impl Config {
             c.mic_gain = MicGain::Manual(c.manual_gain_db);
         }
         c.volumes.values_mut().for_each(|v| *v = (*v).min(100));
-        c.note();
         c
     }
 
@@ -122,7 +138,7 @@ impl Config {
         let text = format!(
             "servidor {}, entrada {}, saída {}, ruído {:?}, sensibilidade {:?}, ganho {:?}, \
              volume geral {}, volumes {volumes:?}, mic mudo {}, surdo {}, transmissão {:?} \
-             com áudio {}",
+             com áudio {}, notificações {}, iniciar com o computador {}, som de abertura em {}",
             self.server.as_deref().unwrap_or("nenhum"),
             self.input.as_deref().unwrap_or("padrão"),
             self.output.as_deref().unwrap_or("padrão"),
@@ -134,6 +150,9 @@ impl Config {
             self.deafened,
             self.share_quality,
             self.share_audio,
+            self.notifications,
+            self.autostart,
+            self.greeted_on.as_deref().unwrap_or("nunca"),
         );
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if *last != text {
@@ -270,13 +289,18 @@ pub fn update_path() -> Option<PathBuf> {
     Some(dir()?.join("update.json"))
 }
 
+/// Porta da instância aberta. Ver `crate::instance`.
+pub fn instance_path() -> Option<PathBuf> {
+    Some(dir()?.join("instance.port"))
+}
+
 #[cfg(windows)]
-fn dir() -> Option<PathBuf> {
+pub fn dir() -> Option<PathBuf> {
     Some(PathBuf::from(env::var_os("APPDATA")?).join("Concord"))
 }
 
 #[cfg(not(windows))]
-fn dir() -> Option<PathBuf> {
+pub fn dir() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -379,6 +403,21 @@ mod tests {
         };
         let c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert!(!c.share_audio);
+    }
+
+    #[test]
+    fn notificacoes_e_autostart_vem_ligados_e_voltam_do_arquivo() {
+        let c: Config = serde_json::from_str(r#"{"mic_muted":true}"#).unwrap();
+        assert!(c.notifications && c.autostart && c.greeted_on.is_none());
+        let c = Config {
+            notifications: false,
+            autostart: false,
+            greeted_on: Some("2026-11-18".into()),
+            ..Config::default()
+        };
+        let c: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(!c.notifications && !c.autostart);
+        assert_eq!(c.greeted_on.as_deref(), Some("2026-11-18"));
     }
 
     #[test]

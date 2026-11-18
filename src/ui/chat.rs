@@ -963,6 +963,7 @@ mod tests {
             screen: Screen::Connecting,
             minimized: false,
             news: false,
+            window: Some(iced::window::Id::unique()),
         };
         let user = User {
             id: 3,

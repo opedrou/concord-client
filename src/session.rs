@@ -35,6 +35,13 @@ pub async fn delete(server: String) {
     let _ = spawn_blocking(move || delete_blocking(&server)).await;
 }
 
+/// Sem async, pra abertura em segundo plano, que sai antes da janela se não tem login.
+pub fn stored_blocking(server: &str) -> bool {
+    Entry::new(SERVICO, server)
+        .and_then(|e| e.get_password())
+        .is_ok()
+}
+
 /// Sem async, pro `--uninstall`, que roda antes de existir runtime.
 pub fn delete_blocking(server: &str) {
     if let Ok(e) = Entry::new(SERVICO, server) {

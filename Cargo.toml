@@ -34,21 +34,26 @@ log = "0.4"
 cpal = "0.18"
 # Áudio da transmissão: WASAPI process loopback, como no spike.
 wasapi = "0.26"
-# Atalhos, "Aplicativos instalados" e a pergunta do desinstalar (`update::win`); RAM, threads,
-# handles e memória de vídeo no log (`health`). A mesma versão que o `wasapi` já puxa.
+# Atalhos com o AUMID, "Aplicativos instalados" e a pergunta do desinstalar (`update::win`);
+# autostart; RAM, threads, handles e memória de vídeo no log (`health`). A mesma versão que o
+# `wasapi` já puxa.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
     "Win32_Security",
+    "Win32_Storage_EnhancedStorage",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Power",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_Variant",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

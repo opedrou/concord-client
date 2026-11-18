@@ -13,19 +13,23 @@ use std::{
 
 use windows::{
     Win32::{
+        Storage::EnhancedStorage::PKEY_AppUserModel_ID,
         System::{
             Com::{
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
                 CoTaskMemFree, CoUninitialize, IPersistFile, STGM_READ,
+                StructuredStorage::{PROPVARIANT, PVCHF_DEFAULT, PropVariantChangeType},
             },
             Registry::{
                 HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
                 RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
             },
+            Variant::VT_LPWSTR,
         },
         UI::{
             Shell::{
-                FOLDERID_Desktop, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, SLGP_RAWPATH,
+                FOLDERID_Desktop, IShellLinkW, KF_FLAG_DEFAULT, PropertiesSystem::IPropertyStore,
+                SHGetKnownFolderPath, SLGP_RAWPATH, SetCurrentProcessExplicitAppUserModelID,
                 ShellLink,
             },
             WindowsAndMessaging::{IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW},
@@ -35,6 +39,9 @@ use windows::{
 };
 
 const UNINSTALL_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Concord");
+/// Id do app pro Windows: junta a janela, o atalho do Menu Iniciar e os avisos do sistema
+/// sob o nome e o ícone do Concord.
+pub const AUMID: &str = "Concord.Desktop";
 /// Processo filho sem console: nada pisca na tela.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -103,8 +110,15 @@ pub fn register(exe: &Path) {
     let _ = uninstall_entry(exe);
 }
 
-/// `.lnk` pelo COM do Shell. Só grava se faltar ou apontar pra outro lugar: regravar toda
-/// vez faria o Menu Iniciar listar o Concord como adicionado recentemente.
+/// Ver [`AUMID`]. Antes de qualquer janela, senão ela fica com o id que o Windows inventa.
+pub fn set_app_id() {
+    // SAFETY: texto com terminador, copiado pelo Windows.
+    let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(AUMID)) };
+}
+
+/// `.lnk` pelo COM do Shell. Só grava se faltar, apontar pra outro lugar ou não ter o
+/// [`AUMID`]: regravar toda vez faria o Menu Iniciar listar o Concord como adicionado
+/// recentemente.
 fn shortcut(link: &Path, exe: &Path) -> Result<()> {
     // SAFETY: COM aberto e fechado nesta thread, antes de a janela existir; as interfaces
     // de `write_shortcut` são soltas antes do `CoUninitialize`.
@@ -124,12 +138,17 @@ unsafe fn write_shortcut(link: &Path, exe: &Path) -> Result<()> {
     unsafe {
         let shell: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         let file: IPersistFile = shell.cast()?;
+        let store: IPropertyStore = shell.cast()?;
         if file.Load(&link, STGM_READ).is_ok() {
             let mut path = [0u16; 1024];
             shell.GetPath(&mut path, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)?;
             let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
             let current = String::from_utf16_lossy(&path[..len]);
-            if current.eq_ignore_ascii_case(&exe.to_string_lossy()) {
+            // Instalação de antes do AUMID não tem ele no atalho: regrava uma vez.
+            let id = store
+                .GetValue(&PKEY_AppUserModel_ID)
+                .is_ok_and(|v| v.to_string() == AUMID);
+            if id && current.eq_ignore_ascii_case(&exe.to_string_lossy()) {
                 return Ok(());
             }
         }
@@ -137,6 +156,11 @@ unsafe fn write_shortcut(link: &Path, exe: &Path) -> Result<()> {
         shell.SetArguments(w!(""))?;
         shell.SetIconLocation(&exe, 0)?;
         shell.SetDescription(w!("Voz e transmissão de tela"))?;
+        // O atalho guarda texto `VT_LPWSTR`; o `From<&str>` dá `VT_BSTR`.
+        let mut id = PROPVARIANT::default();
+        PropVariantChangeType(&mut id, &PROPVARIANT::from(AUMID), PVCHF_DEFAULT, VT_LPWSTR)?;
+        store.SetValue(&PKEY_AppUserModel_ID, &id)?;
+        store.Commit()?;
         file.Save(&link, true)
     }
 }
@@ -204,6 +228,9 @@ fn ask_wipe() -> bool {
 /// cofre do Windows; sem "Sim" eles ficam.
 pub fn uninstall() {
     let Some(exe) = exe() else { return };
+    // A aberta sai antes: exe rodando não se apaga.
+    crate::instance::quit();
+    crate::autostart::remove();
     let wipe = ask_wipe();
     for link in [link(), desktop_link()].into_iter().flatten() {
         let _ = fs::remove_file(link);
