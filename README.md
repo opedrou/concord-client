@@ -4,7 +4,7 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.15.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.16.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
@@ -66,13 +66,26 @@ o seletor de tela do sistema (xdg-desktop-portal).
 - No chat, selecionar e copiar funciona dentro de uma mensagem, não pegando várias de uma vez.
 - O chat manda a foto original; o site encolhe antes de enviar.
 
-## Novidades da v0.1.15
+## Novidades da v0.1.16
+
+### Novo
+- **O que tem de novo:** na primeira abertura depois de atualizar, uma janela mostra o que mudou
+  na versão. Ela aparece uma vez e fecha no OK.
 
 ### Corrigido
-- **Microfone que não abria no Windows:** alguns microfones só aceitam o próprio formato, em
-  estéreo ou em outra taxa, e recusavam o que o app pedia. O mic ficava desligado a call inteira,
-  ninguém ouvia, e o log mostrava `AUDCLNT_E_UNSUPPORTED_FORMAT`. Agora o app abre o microfone no
-  formato dele e converte.
+- **Transmissão de tela travava uns segundos quando a rede perdia pacote:** o app não negociava o
+  reenvio de vídeo, então um pacote perdido parava a imagem de quem assiste até o navegador pedir
+  um quadro novo, uns 3 s depois. Agora o pacote perdido é reenviado. Com 5% de perda, o tempo com
+  a imagem parada caiu de mais de 50% pra perto de 3%. Vale pra tela e câmera, nos dois sistemas.
+- **Transmissão no Linux engasgava a cada 5 s:** o codificador da placa de vídeo mandava um quadro
+  completo a cada 5 s, grande demais pra caber na taxa, e a imagem parava um instante. Agora o
+  quadro completo só sai no começo e quando quem assiste pede.
+- **Transmissão no Linux demorava a se ajustar à rede:** a taxa nova só valia no quadro completo
+  seguinte, até 5 s depois. Agora vale no quadro seguinte.
+
+### Interno
+- O log do vídeo enviado mostra os pacotes reenviados e os que se perderam de vez.
+- As bancadas medem perda de pacote sem `sudo` e mudam o teto de taxa no meio da transmissão.
 
 ## Compilar
 
