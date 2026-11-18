@@ -151,6 +151,10 @@ pub fn devices() -> Devices {
 /// perdia 5 dB e mudava o som. Sai só o esquerdo, com +8 dB pro nível dos outros (pico
 /// -3,5 dBFS, RMS -19 dBFS):
 /// `ffmpeg -i X.wav -af "pan=mono|c0=FL,volume=8dB" -f s16le -ar 48000 assets/sounds/notify.pcm`
+///
+/// O `hello.pcm` veio de um wav estéreo de 96 kHz, com os canais quase iguais: a média só perde
+/// 1 dB. Sobe 8 dB pro pico dos outros (pico -2,8 dBFS, RMS -24 dBFS, 2,6 s):
+/// `ffmpeg -i X.wav -af "volume=8dB" -f s16le -ar 48000 -ac 1 assets/sounds/hello.pcm`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
     Join,
@@ -171,8 +175,7 @@ impl Effect {
             Effect::StreamStart => include_bytes!("../../assets/sounds/stream-start.pcm"),
             Effect::StreamStop => include_bytes!("../../assets/sounds/stream-stop.pcm"),
             Effect::Notify => include_bytes!("../../assets/sounds/notify.pcm"),
-            // O som de abertura ainda não chegou: até lá, o de entrar na call.
-            Effect::Hello => include_bytes!("../../assets/sounds/join.pcm"),
+            Effect::Hello => include_bytes!("../../assets/sounds/hello.pcm"),
         }
     }
 }
