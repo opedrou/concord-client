@@ -2,7 +2,11 @@
 //! tempo, o mesmo SSE e os mesmos anexos da tela, e o Chrome pelo site, nos dois sentidos. No meio, um proxy
 //! entre o cliente e o site derruba as conexões sem derrubar o site. Roda por
 //! `src/chat/bancada.sh`.
-use std::{pin::Pin, process::Command, time::Instant};
+use std::{
+    pin::Pin,
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use futures_util::{Stream, StreamExt};
 use tokio::{

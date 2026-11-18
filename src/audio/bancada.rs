@@ -557,6 +557,76 @@ fn bancada_som_de_saida() {
 /// Prazo do `LINGER` do motor com folga.
 const LINGER_TEST: Duration = Duration::from_secs(4);
 
+/// Som avulso, sem o motor: abre só a saída, nunca o mic, toca o som inteiro e fecha. Salvo
+/// que não existe cai no padrão.
+#[test]
+#[ignore = "precisa do PipeWire próprio: src/audio/bancada.sh"]
+fn bancada_som_avulso() {
+    std::env::var("BANCADA_RAIZ").expect("rode por src/audio/bancada.sh");
+    let _rig = Rig::new();
+    pactl(&["set-default-sink", "bancada_fone"]);
+    let som = |nome: &str| {
+        fs::read_dir("/proc/self/task")
+            .unwrap()
+            .flatten()
+            .filter(|t| fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c.trim() == nome))
+            .count()
+    };
+    // Energia que o som tem de deixar na saída, em `i16` ao quadrado, com o ganho dos efeitos.
+    let esperada: f64 = Effect::Notify
+        .pcm()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| (f64::from(i16::from_le_bytes(b)) * 0.6).powi(2))
+        .sum();
+    let conta = |o: &str| pactl(&["list", "short", o]).lines().count();
+    for saida in [Some(FONE), Some("NaoExiste"), None] {
+        let capture = Capture::start("bancada_fone.monitor");
+        thread::sleep(Duration::from_millis(300));
+        capture.reset();
+        // O loopback e o mic falso da bancada já são streams.
+        let antes = (conta("sink-inputs"), conta("source-outputs"));
+        let t0 = Instant::now();
+        play_once(Effect::Notify, saida);
+        assert!(t0.elapsed() < Duration::from_millis(50), "bloqueou");
+        thread::sleep(Duration::from_millis(400));
+        let tocando = (conta("sink-inputs"), conta("source-outputs"));
+        let links = Command::new("pw-link").arg("-l").output().expect("pw-link");
+        let links = String::from_utf8_lossy(&links.stdout).into_owned();
+        while som("concord-som") > 0 && t0.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let durou = t0.elapsed();
+        thread::sleep(Duration::from_millis(300));
+        let chegou = capture.energy.lock().unwrap().sum;
+        let razao = 10.0 * (chegou / esperada).log10();
+        let depois = (conta("sink-inputs"), conta("source-outputs"));
+        println!(
+            "BANCADA som avulso {saida:?}: chegou {razao:+.2} dB da energia do som, thread \
+             {durou:?}, streams (saída, entrada) antes {antes:?} tocando {tocando:?} depois \
+             {depois:?}\n{links}",
+        );
+        // O nó do cpal só manda pro fone: nenhuma porta de entrada, nenhum mic aberto.
+        let nosso: Vec<&str> = links
+            .split("\ncpal-pulseaudio-")
+            .skip(1)
+            .flat_map(|bloco| bloco.lines().take(2))
+            .collect();
+        assert_eq!(nosso.len(), 4, "{nosso:?}");
+        assert!(nosso[0].ends_with(":output_FL") && nosso[1].ends_with("bancada_fone:playback_FL"));
+        assert!(nosso[2].ends_with(":output_FR") && nosso[3].ends_with("bancada_fone:playback_FR"));
+        assert_eq!(
+            tocando,
+            (antes.0 + 1, antes.1),
+            "uma saída a mais e entrada nenhuma"
+        );
+        assert_eq!(depois, antes, "fechou");
+        assert!(razao.abs() < 1.0, "{saida:?}: {razao:.2} dB");
+        assert_eq!(som("concord-som"), 0, "a thread acabou");
+    }
+}
+
 /// Fone Bluetooth que some e volta, e padrão do sistema que muda: a voz vai junto. Sem
 /// isso, o stream ficava no dispositivo pra onde o servidor o empurrou, sem erro nenhum.
 #[test]

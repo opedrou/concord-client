@@ -92,6 +92,7 @@ impl Participant {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Member {
+    pub id: i64,
     pub username: String,
     pub avatar_url: Option<String>,
 }
@@ -164,6 +165,28 @@ pub enum ChatEvent {
     #[serde(rename_all = "camelCase")]
     Deleted {
         message_id: i64,
+    },
+}
+
+/// Evento do SSE de notificações. Tipo que este cliente não conhece não decodifica, e o
+/// leitor pula.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum NotifyEvent {
+    /// Alguém chamou pra call do canal `channel` (slug). `at` em ISO 8601.
+    Call {
+        caller: String,
+        channel: String,
+        at: String,
+    },
+    /// Alguém marcou com `@` no canal de texto `channel_id`.
+    #[serde(rename_all = "camelCase")]
+    Mention {
+        author: String,
+        channel_id: i64,
+        channel_name: String,
+        excerpt: String,
+        at: String,
     },
 }
 
@@ -442,8 +465,37 @@ impl Client {
 
     /// SSE do canal, já com a resposta 200: a partir daqui o servidor entrega os eventos.
     pub async fn message_stream(&self, channel: i64) -> Result<Response, Error> {
+        self.event_stream(&format!("/api/channels/{channel}/messages/stream"))
+            .await
+    }
+
+    /// SSE das notificações de quem está logado: chamado pra call e `@`.
+    pub async fn notification_stream(&self) -> Result<Response, Error> {
+        self.event_stream("/api/notifications/stream").await
+    }
+
+    /// Chama pessoas pra call do canal: o servidor avisa cada uma no app dela. Devolve
+    /// quantas foram chamadas e quantas estavam com o app conectado. 429 é o limite de
+    /// chamadas, com o tempo de espera; 400 é lista ou canal que não existe mais.
+    // Ligado na interface na próxima etapa; aí este `allow` sai.
+    #[allow(dead_code)]
+    pub async fn call_people(
+        &self,
+        user_ids: &[i64],
+        channel_slug: &str,
+    ) -> Result<(u32, u32), Error> {
+        let url = format!("{}/api/call-people", self.base);
         let req = self
-            .get(&format!("/api/channels/{channel}/messages/stream"))
+            .authed(self.http.post(url))
+            .json(&json!({ "userIds": user_ids, "channelSlug": channel_slug }));
+        let resp = req.send().await.map_err(|_| Error::Offline)?;
+        let (status, wait) = (resp.status(), retry_after(resp.headers()));
+        classify_call(status, wait, &read_limited(resp, MAX_JSON).await?)
+    }
+
+    async fn event_stream(&self, path: &str) -> Result<Response, Error> {
+        let req = self
+            .get(path)
             .header(header::ACCEPT, "text/event-stream")
             .timeout(ABERTO);
         let resp = tokio::time::timeout(Duration::from_secs(15), req.send()).await;
@@ -491,6 +543,25 @@ fn classify_me(status: StatusCode, body: &[u8]) -> Result<User, Error> {
         }
         s if s.is_server_error() => Err(Error::Server(s.as_u16())),
         _ => Err(Error::NotConcord),
+    }
+}
+
+/// `call-people`: 200 traz quantos foram chamados e quantos tinham o app conectado; 429
+/// traz a espera do `Retry-After`. 400 (`invalid_body`, `unknown_user`, `unknown_channel`)
+/// fica `Server(400)`: a lista da tela está velha, e buscar de novo resolve.
+fn classify_call(status: StatusCode, wait: u64, body: &[u8]) -> Result<(u32, u32), Error> {
+    #[derive(Deserialize)]
+    struct Body {
+        called: u32,
+        delivered: u32,
+    }
+    match status {
+        StatusCode::OK => serde_json::from_slice::<Body>(body)
+            .map(|b| (b.called, b.delivered))
+            .map_err(|_| Error::NotConcord),
+        StatusCode::TOO_MANY_REQUESTS => Err(Error::TooManyAttempts(wait)),
+        StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
+        s => Err(Error::Server(s.as_u16())),
     }
 }
 
@@ -637,6 +708,42 @@ mod tests {
             "/api/attachments/../auth/me",
             "/api/attachments/"
         ));
+    }
+
+    #[test]
+    fn chamar_pessoas_le_entregues_e_espera() {
+        let ok = br#"{"ok":true,"called":3,"delivered":1}"#;
+        assert_eq!(classify_call(StatusCode::OK, 60, ok), Ok((3, 1)));
+        assert_eq!(
+            classify_call(StatusCode::OK, 60, br#"{"ok":true,"called":3}"#),
+            Err(Error::NotConcord)
+        );
+        let limite = br#"{"error":"rate_limited"}"#;
+        assert_eq!(
+            classify_call(StatusCode::TOO_MANY_REQUESTS, 1800, limite),
+            Err(Error::TooManyAttempts(1800))
+        );
+        assert_eq!(
+            classify_call(StatusCode::BAD_REQUEST, 60, br#"{"error":"unknown_user"}"#),
+            Err(Error::Server(400))
+        );
+        assert_eq!(
+            classify_call(StatusCode::UNAUTHORIZED, 60, b""),
+            Err(Error::Unauthorized)
+        );
+        let mut h = header::HeaderMap::new();
+        assert_eq!(retry_after(&h), 60, "sem Retry-After");
+        h.insert(header::RETRY_AFTER, "3540".parse().unwrap());
+        assert_eq!(retry_after(&h), 3540);
+    }
+
+    #[test]
+    fn membro_traz_o_id() {
+        let m: Vec<Member> = serde_json::from_str(
+            r##"[{"id":5,"username":"ana","avatarUrl":null,"avatarColor":"#9d4edd"}]"##,
+        )
+        .unwrap();
+        assert_eq!((m[0].id, m[0].username.as_str()), (5, "ana"));
     }
 
     #[test]

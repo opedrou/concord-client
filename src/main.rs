@@ -19,8 +19,11 @@ mod health;
 mod icon;
 mod instance;
 mod log;
+mod notify;
 mod session;
 mod share;
+mod sse;
+mod tray;
 mod ui;
 mod update;
 

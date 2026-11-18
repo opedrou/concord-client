@@ -16,11 +16,12 @@ use std::{
         mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
 
-use mixer::VoiceQueue;
+use mixer::{Mixer, VoiceQueue};
 use worker::Command;
 
 pub const RATE: u32 = 48_000;
@@ -145,12 +146,23 @@ pub fn devices() -> Devices {
 ///
 /// O PCM é mono, 48 kHz, `i16` little-endian, convertido uma vez dos mp3 do site:
 /// `ffmpeg -i X.mp3 -f s16le -ar 48000 -ac 1 assets/sounds/X.pcm`
+///
+/// O `notify.pcm` veio de um wav estéreo com os canais em oposição de fase: a média dos dois
+/// perdia 5 dB e mudava o som. Sai só o esquerdo, com +8 dB pro nível dos outros (pico
+/// -3,5 dBFS, RMS -19 dBFS):
+/// `ffmpeg -i X.wav -af "pan=mono|c0=FL,volume=8dB" -f s16le -ar 48000 assets/sounds/notify.pcm`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// `Notify`, `Hello` e o `play_once` ligam na interface na próxima etapa; aí os `allow` saem.
+#[allow(dead_code)]
 pub enum Effect {
     Join,
     Leave,
     StreamStart,
     StreamStop,
+    /// Chamado pra call ou marcado com `@`.
+    Notify,
+    /// Primeira abertura da janela no dia.
+    Hello,
 }
 
 impl Effect {
@@ -160,8 +172,65 @@ impl Effect {
             Effect::Leave => include_bytes!("../../assets/sounds/leave.pcm"),
             Effect::StreamStart => include_bytes!("../../assets/sounds/stream-start.pcm"),
             Effect::StreamStop => include_bytes!("../../assets/sounds/stream-stop.pcm"),
+            Effect::Notify => include_bytes!("../../assets/sounds/notify.pcm"),
+            // O som de abertura ainda não chegou: até lá, o de entrar na call.
+            Effect::Hello => include_bytes!("../../assets/sounds/join.pcm"),
         }
     }
+}
+
+/// Folga do [`play_once`] além da duração do som: abrir a saída e esvaziar o anel.
+const ONCE_SLACK: Duration = Duration::from_secs(2);
+
+/// Toca um som sem o motor da call e sem abrir o mic: abre só a saída, toca e fecha. Não
+/// bloqueia. Sem o dispositivo salvo, toca no padrão do sistema. Saída travada desiste
+/// depois da duração do som mais [`ONCE_SLACK`]. Na call, o som vai pelo [`Engine::play`].
+#[allow(dead_code)]
+pub fn play_once(effect: Effect, output: Option<&str>) {
+    let output = output.map(String::from);
+    let spawned = thread::Builder::new()
+        .name("concord-som".into())
+        .spawn(move || once(effect.pcm(), output.as_deref()));
+    if let Err(e) = spawned {
+        log!("áudio: som avulso sem thread: {e}");
+    }
+}
+
+fn once(pcm: &'static [u8], output: Option<&str>) {
+    // O `open_output` já cai no padrão quando o salvo sumiu; isto cobre o salvo que existe
+    // e não abre.
+    let opened = device::open_output(output).or_else(|e| match output {
+        Some(_) => device::open_output(None),
+        None => Err(e),
+    });
+    let mut out = match opened {
+        Ok(out) => out,
+        Err(e) => {
+            log!("áudio: som avulso sem saída: {e}");
+            return;
+        }
+    };
+    let length = Duration::from_secs_f64(pcm.len() as f64 / 2.0 / RATE as f64);
+    let deadline = Instant::now() + length + ONCE_SLACK;
+    let mut mixer = Mixer::new(0, HashMap::new());
+    mixer.play(pcm);
+    let mut mix = [0f32; FRAME];
+    let capacity = out.ring.buffer().capacity();
+    // Toca e espera o anel esvaziar: soltar o stream antes corta o fim.
+    while (mixer.playing() || out.ring.slots() < capacity)
+        && Instant::now() < deadline
+        && !out.is_lost()
+    {
+        while mixer.playing() && out.ring.slots() >= FRAME {
+            mixer.mix(&mut mix);
+            for s in mix {
+                let _ = out.ring.push(s);
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    // O que já saiu do anel ainda passa pelo buffer do servidor de áudio.
+    thread::sleep(Duration::from_millis(100));
 }
 
 /// Dono da thread de áudio. Clone barato; o motor para quando o último clone cai.
@@ -302,6 +371,8 @@ mod tests {
             Effect::Leave,
             Effect::StreamStart,
             Effect::StreamStop,
+            Effect::Notify,
+            Effect::Hello,
         ] {
             let pcm = effect.pcm();
             assert_eq!(pcm.len() % 2, 0, "{effect:?}: i16 inteiro");

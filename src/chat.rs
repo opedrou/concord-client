@@ -3,11 +3,10 @@
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use image::{ImageReader, Limits, imageops::FilterType};
 
-use futures_util::{SinkExt, Stream};
+use futures_util::Stream;
 
 use crate::api::{ChatEvent, Client, Error, Message, Page};
 
@@ -23,12 +22,6 @@ const MAX_PAGINAS: usize = 20;
 pub const MAX_TEXTO: usize = 4000;
 /// Mesmo autor dentro disso fica no mesmo bloco, como na web.
 const JUNTA_MS: i64 = 5 * 60 * 1000;
-const PRIMEIRA_ESPERA: Duration = Duration::from_secs(1);
-const MAX_ESPERA: Duration = Duration::from_secs(30);
-/// O servidor manda ping a cada 25 s: sem nada nesse tempo, a conexão morreu calada.
-const SILENCIO: Duration = Duration::from_secs(60);
-/// Evento maior que isso não é do Concord.
-const MAX_EVENTO: usize = 1024 * 1024;
 /// Imagem guardada pra mostrar na mensagem: o dobro do tamanho na tela, pra telas HiDPI.
 const MINIATURA: (u32, u32) = (800, 600);
 const MAX_LADO_ORIGINAL: u32 = 8192;
@@ -170,91 +163,15 @@ pub async fn recover(client: &Client, channel: i64, asked: Option<i64>) -> Resul
     })
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Live {
-    /// Conectou ou voltou: hora de buscar o que perdeu.
-    Connected,
-    Event(ChatEvent),
-    /// Caiu. Tenta de novo sozinho, esperando cada vez mais.
-    Lost,
-    Unauthorized,
-}
+/// Tempo real do canal.
+pub type Live = crate::sse::Live<ChatEvent>;
 
-/// SSE do canal enquanto o stream existir. Reconecta sozinho, com espera de 1 s dobrando até
-/// 30 s, e volta pra 1 s depois de uma conexão que durou.
+/// SSE do canal enquanto o stream existir; ver [`crate::sse::live`].
 pub fn live(client: Client, channel: i64) -> impl Stream<Item = Live> {
-    iced::stream::channel(64, async move |mut out| {
-        let mut wait = PRIMEIRA_ESPERA;
-        loop {
-            match client.message_stream(channel).await {
-                Ok(mut resp) => {
-                    let since = Instant::now();
-                    if out.send(Live::Connected).await.is_err() {
-                        return;
-                    }
-                    let mut sse = Sse::default();
-                    while let Ok(Ok(Some(chunk))) =
-                        tokio::time::timeout(SILENCIO, resp.chunk()).await
-                    {
-                        let Some(events) = sse.push(&chunk) else {
-                            break;
-                        };
-                        for event in events.iter().filter_map(|d| serde_json::from_str(d).ok()) {
-                            if out.send(Live::Event(event)).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    if since.elapsed() > MAX_ESPERA {
-                        wait = PRIMEIRA_ESPERA;
-                    }
-                    log!("chat: o tempo real caiu, volta em {} s", wait.as_secs());
-                    if out.send(Live::Lost).await.is_err() {
-                        return;
-                    }
-                }
-                Err(Error::Unauthorized) => {
-                    let _ = out.send(Live::Unauthorized).await;
-                    return;
-                }
-                Err(_) => {}
-            }
-            tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(MAX_ESPERA);
-        }
+    crate::sse::live("chat", "message", move || {
+        let client = client.clone();
+        async move { client.message_stream(channel).await }
     })
-}
-
-/// Leitor de `text/event-stream`, só o que o Concord usa: `event` e `data`.
-#[derive(Default)]
-struct Sse {
-    buf: Vec<u8>,
-}
-
-impl Sse {
-    /// O `data` de cada evento `message` completo. `None`: evento grande demais.
-    fn push(&mut self, chunk: &[u8]) -> Option<Vec<String>> {
-        self.buf.extend(chunk.iter().filter(|&&b| b != b'\r'));
-        let mut out = Vec::new();
-        while let Some(end) = self.buf.windows(2).position(|w| w == b"\n\n") {
-            let block: Vec<u8> = self.buf.drain(..end + 2).collect();
-            let block = String::from_utf8_lossy(&block);
-            let (mut event, mut data) = ("message", Vec::new());
-            for line in block.lines() {
-                let (field, value) = line.split_once(':').unwrap_or((line, ""));
-                let value = value.strip_prefix(' ').unwrap_or(value);
-                match field {
-                    "event" => event = value,
-                    "data" => data.push(value),
-                    _ => {}
-                }
-            }
-            if event == "message" && !data.is_empty() {
-                out.push(data.join("\n"));
-            }
-        }
-        (self.buf.len() <= MAX_EVENTO).then_some(out)
-    }
 }
 
 /// Texto que o servidor aceita: sem espaço nas pontas e até 4000 em UTF-16.
@@ -551,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn contrato_das_mensagens_e_do_sse() {
+    fn contrato_das_mensagens() {
         let page: Page = serde_json::from_str(
             r#"{"messages":[
                 {"id":7,"channelId":2,"authorId":null,"authorName":"Usuário removido","content":"oi","createdAt":1700000000000,"attachment":null},
@@ -568,24 +485,6 @@ mod tests {
         assert_eq!((foto.kind, foto.size()), (crate::api::Kind::Image, 0));
         let outro = page.messages[2].attachment.as_ref().unwrap();
         assert_eq!(outro.kind, crate::api::Kind::File);
-
-        let mut sse = Sse::default();
-        let corpo = ": connected\n\nevent: message\ndata: {\"type\":\"deleted\",\"messageId\":7,\"channelId\":2}\n\n: ping\n\nevent: message\r\ndata: {\"type\":\"created\",\"message\":{\"id\":10,\"channelId\":2,\"authorId\":3,\"authorName\":\"ana\",\"content\":\"a\\nb\",\"createdAt\":1,\"attachment\":null}}\r\n\r\nevent: mess";
-        // Em pedaços que cortam no meio da linha.
-        let (a, b) = corpo.split_at(70);
-        let mut dados = sse.push(a.as_bytes()).unwrap();
-        dados.extend(sse.push(b.as_bytes()).unwrap());
-        let eventos: Vec<ChatEvent> = dados
-            .iter()
-            .map(|d| serde_json::from_str(d).unwrap())
-            .collect();
-        assert_eq!(eventos[0], ChatEvent::Deleted { message_id: 7 });
-        let ChatEvent::Created { message } = &eventos[1] else {
-            panic!("{eventos:?}");
-        };
-        assert_eq!((message.id, message.content.as_str()), (10, "a\nb"));
-        assert_eq!(sse.buf, b"event: mess");
-        assert!(sse.push(&vec![b'x'; MAX_EVENTO]).is_none());
     }
 
     #[test]
