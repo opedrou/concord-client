@@ -2091,6 +2091,7 @@ mod tests {
         };
         let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
         print(&a, "links");
+        print_largura(&a, "links-estreito", 900.0);
 
         // Datas relativas no cabeçalho, e a lixeira na mensagem sob o mouse.
         let mut a = app();
@@ -2124,7 +2125,6 @@ mod tests {
         let c = chat(&mut a);
         c.unread = true;
         print(&a, "novas");
-        print_largura(&a, "links-estreito", 900.0);
     }
 
     #[test]
