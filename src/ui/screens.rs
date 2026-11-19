@@ -301,11 +301,41 @@ fn action<'a>(
         .into()
 }
 
+/// Sair e Trocar servidor: o primeiro clique só pergunta, como o apagar mensagem do chat.
+fn confirmed<'a>(
+    m: &Main,
+    (label, question, yes): (&'a str, &str, &'a str),
+    msg: Msg,
+    style: fn(&Theme, button::Status) -> button::Style,
+) -> Element<'a, Msg> {
+    if !m.confirm {
+        return action(label, Msg::Confirm(true), style);
+    }
+    let call = if m.call.is_some() {
+        " Você sai da call."
+    } else {
+        ""
+    };
+    row![
+        text(format!("{question}{call}")).size(14).color(FG2),
+        action(yes, msg, style),
+        action("Cancelar", Msg::Confirm(false), theme::ghost),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 fn server_panel(m: &Main) -> Element<'_, Msg> {
     column![
         title("Servidor"),
         labeled("Endereço", text(&m.server).size(15).color(FG)),
-        action("Trocar servidor", Msg::ChangeServer, theme::outline),
+        confirmed(
+            m,
+            ("Trocar servidor", "Trocar de servidor?", "Trocar"),
+            Msg::ChangeServer,
+            theme::outline
+        ),
     ]
     .spacing(16)
     .into()
@@ -331,7 +361,12 @@ fn account_panel(m: &Main) -> Element<'_, Msg> {
                 .align_y(Alignment::Center),
         )
         .push(vault_warning)
-        .push(action("Sair", Msg::Logout, theme::danger))
+        .push(confirmed(
+            m,
+            ("Sair", "Sair da conta?", "Sair"),
+            Msg::Logout,
+            theme::danger,
+        ))
         .spacing(16)
         .into()
 }

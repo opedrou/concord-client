@@ -150,6 +150,8 @@ struct Main {
     /// Motor de teste da aba Voz; só existe sem call.
     probe: Probe,
     next_probe: u64,
+    /// Sair ou Trocar servidor das configurações clicado uma vez, esperando a confirmação.
+    confirm: bool,
     /// Última leitura do mic, em dBFS, e se o limitador está aberto.
     level: f32,
     open: bool,
@@ -288,6 +290,8 @@ pub enum Msg {
     MeterTick,
     /// "Testar" da saída: toca o som de entrada nela.
     TestOutput,
+    /// Primeiro clique no Sair ou no Trocar servidor das configurações; `false` cancela.
+    Confirm(bool),
     ProbeStarted(u64, Result<Boot, String>),
     Devices(Devices),
     CloseRequested(window::Id),
@@ -985,6 +989,12 @@ impl App {
                 self.chime(Effect::Join);
                 Task::none()
             }
+            Msg::Confirm(ask) => {
+                if let Screen::Main(m) = &mut self.screen {
+                    m.confirm = ask;
+                }
+                Task::none()
+            }
             Msg::ProbeStarted(id, result) => {
                 if let Screen::Main(m) = &mut self.screen
                     && matches!(m.probe, Probe::Opening(open) if open == id)
@@ -1061,6 +1071,7 @@ impl App {
             Msg::OpenSettings(tab) => {
                 if let Screen::Main(m) = &mut self.screen {
                     m.settings = Some(tab);
+                    m.confirm = false;
                 }
                 if tab != Tab::Voice {
                     self.stop_probe();
@@ -1455,6 +1466,7 @@ impl App {
     fn close_settings(&mut self) {
         if let Screen::Main(m) = &mut self.screen {
             m.settings = None;
+            m.confirm = false;
         }
         self.stop_probe();
     }
@@ -1864,6 +1876,7 @@ impl App {
             devices: None,
             probe: Probe::Off,
             next_probe: 0,
+            confirm: false,
             level: MANUAL_MIN_DB,
             open: false,
             closing: None,
@@ -3272,6 +3285,23 @@ mod tests {
     }
 
     #[test]
+    fn sair_e_trocar_servidor_perguntam_antes() {
+        let mut a = voice_app();
+        let _ = a.update(Msg::OpenSettings(Tab::Account));
+        let _ = a.update(Msg::Confirm(true));
+        assert!(main_of(&mut a).confirm);
+        let _ = a.update(Msg::Confirm(false));
+        assert!(!main_of(&mut a).confirm, "cancelou");
+        let _ = a.update(Msg::Confirm(true));
+        let _ = a.update(Msg::OpenSettings(Tab::Server));
+        assert!(!main_of(&mut a).confirm, "outra aba não herda a pergunta");
+        let _ = a.update(Msg::Confirm(true));
+        let _ = a.update(Msg::Escape);
+        let _ = a.update(Msg::OpenSettings(Tab::Server));
+        assert!(!main_of(&mut a).confirm, "reabrir começa sem pergunta");
+    }
+
+    #[test]
     fn ganho_automatico_e_manual_guardam_o_valor() {
         use crate::audio::MicGain;
         let mut a = voice_tab();
@@ -3686,6 +3716,20 @@ mod tests {
         voz(&mut a, false, -40.0, -22.0, true);
         main_of(&mut a).probe = Probe::Failed;
         print(&a, "voz-erro");
+        // Sair e Trocar servidor esperando a confirmação.
+        main_of(&mut a).confirm = true;
+        main_of(&mut a).settings = Some(Tab::Account);
+        print(&a, "config-conta-confirma");
+        main_of(&mut a).settings = Some(Tab::Server);
+        print(&a, "config-servidor-confirma");
+        let _ = a.update(Msg::JoinChannel("Call".into()));
+        main_of(&mut a).confirm = true;
+        print(&a, "config-servidor-confirma-na-call");
+        print_at(
+            &a,
+            "config-servidor-confirma-janela-minima",
+            Size::new(860.0, 560.0),
+        );
 
         // Palco: 1, 4 e 9 pessoas, com quem fala e quem está mudo.
         let nomes = [
