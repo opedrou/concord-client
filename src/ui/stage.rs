@@ -1,8 +1,8 @@
 //! Palco da call: grade de tiles, barra de controles e painel de volume.
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, center, checkbox, column, container, image, mouse_area, opaque, pick_list,
-    pin, responsive, row, scrollable, slider, space, stack, text, toggler,
+    Column, Row, button, center, checkbox, column, container, hover, image, mouse_area, opaque,
+    pick_list, pin, responsive, row, scrollable, slider, space, stack, text, toggler,
 };
 use iced::{Alignment, Color, ContentFit, Element, Length, Padding, Size, Theme, border};
 
@@ -49,9 +49,9 @@ pub fn view<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Elemen
     let base = with_bar(call, config, move |area| match &call.live {
         Some(live) if !live.is_empty() => {
             if call.watching.is_some() && call.view == voice::View::Focus {
-                focus(m, call, live, area)
+                focus(m, call, config, live, area)
             } else {
-                grid(m, call, live, area)
+                grid(m, call, config, live, area)
             }
         }
         _ => center(text("Conectando…").size(15).color(FG2)).into(),
@@ -135,7 +135,13 @@ fn with_bar<'a>(
 }
 
 /// Transmissão assistida grande, com a outra transmissão e as pessoas numa coluna do lado.
-fn focus<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) -> Element<'a, Msg> {
+fn focus<'a>(
+    m: &'a Main,
+    call: &'a ActiveCall,
+    config: &'a Config,
+    live: &'a [Live],
+    area: Size,
+) -> Element<'a, Msg> {
     let watched = live
         .iter()
         .find(|p| Some(&p.identity) == call.watching.as_ref());
@@ -159,7 +165,7 @@ fn focus<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) ->
         .iter()
         .filter(|p| p.screen_share && Some(&p.identity) != call.watching.as_ref())
         .map(|p| screen_tile(m, call, p, SIDE))
-        .chain(live.iter().map(|p| tile(m, call, p, SIDE)));
+        .chain(live.iter().map(|p| tile(m, call, config, p, SIDE)));
     let side = scrollable(Column::with_children(others).spacing(GAP))
         .width(SIDE.width)
         .style(theme::thin_scroll);
@@ -250,7 +256,13 @@ fn screen_tag<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, width: f32) ->
         .into()
 }
 
-fn grid<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) -> Element<'a, Msg> {
+fn grid<'a>(
+    m: &'a Main,
+    call: &'a ActiveCall,
+    config: &'a Config,
+    live: &'a [Live],
+    area: Size,
+) -> Element<'a, Msg> {
     // Cada transmissão vira um tile próprio, antes das pessoas, como no site.
     let screens: Vec<&Live> = live.iter().filter(|p| p.screen_share).collect();
     let cells: Vec<(&Live, bool)> = screens
@@ -266,7 +278,7 @@ fn grid<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) -> 
             if screen {
                 screen_tile(m, call, p, size)
             } else {
-                tile(m, call, p, size)
+                tile(m, call, config, p, size)
             }
         }))
         .spacing(GAP)
@@ -275,7 +287,13 @@ fn grid<'a>(m: &'a Main, call: &'a ActiveCall, live: &'a [Live], area: Size) -> 
     center(Column::with_children(rows).spacing(GAP)).into()
 }
 
-fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
+fn tile<'a>(
+    m: &'a Main,
+    call: &'a ActiveCall,
+    config: &'a Config,
+    p: &'a Live,
+    size: Size,
+) -> Element<'a, Msg> {
     let name = voice::name_of(p);
     let speaking = call.speaking(name);
     let face = size.width.min(size.height) * 0.34;
@@ -346,12 +364,37 @@ fn tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Eleme
             ..Default::default()
         });
     if p.is_local {
-        tile.into()
-    } else {
-        mouse_area(tile)
-            .on_right_press(Msg::OpenVolume(name.to_owned()))
-            .into()
+        return tile.into();
     }
+    // Mudo pra mim no canto: aparece no hover e fica fixo enquanto a pessoa está mutada.
+    let silenced = config.volume_of(name) == 0;
+    let corner = container(container(mute_button(name, silenced)).style(theme::pill))
+        .align_right(Length::Fill)
+        .align_top(Length::Fill)
+        .padding(10);
+    let tile: Element<'_, Msg> = if silenced {
+        stack![tile, corner].into()
+    } else {
+        hover(tile, corner)
+    };
+    mouse_area(tile)
+        .on_right_press(Msg::OpenVolume(name.to_owned()))
+        .into()
+}
+
+/// Botão de mudo de uma pessoa (ou da transmissão dela), só pra mim: zera o volume ou
+/// volta no de antes.
+fn mute_button(name: &str, silenced: bool) -> Element<'_, Msg> {
+    let (glyph, color, tip) = if silenced {
+        (VOLUME_X, DANGER, "Voltar a ouvir")
+    } else {
+        (VOLUME, FG, "Silenciar pra mim")
+    };
+    let b = button(container(icon(glyph, 16.0, color)).center(28))
+        .padding(0)
+        .style(theme::ghost)
+        .on_press(Msg::MutePerson(name.to_owned()));
+    tipped(b.into(), tip)
 }
 
 /// Tile da transmissão de alguém. Sem assistir: a prévia borrada e o botão. Assistindo: o
@@ -966,11 +1009,7 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
         .on_release(Msg::VolumeDone)
         .width(Length::Fill);
     let line = row![
-        icon(
-            if volume == 0 { VOLUME_X } else { VOLUME },
-            18.0,
-            if volume == 0 { DANGER } else { FG2 }
-        ),
+        mute_button(name, volume == 0),
         text(if screen { "Transmissão" } else { "Voz" })
             .size(13)
             .color(FG2),

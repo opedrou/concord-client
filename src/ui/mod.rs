@@ -218,6 +218,8 @@ pub enum Msg {
     OpenVolume(String),
     CloseVolume,
     Volume(String, u8),
+    /// Botão de mudo de uma pessoa: zera ou volta no volume de antes.
+    MutePerson(String),
     Master(u8),
     /// Solta um slider: grava na config.
     VolumeDone,
@@ -336,6 +338,7 @@ fn action(msg: &Msg) -> Option<String> {
         Msg::JoinChannel(slug) => format!("entrou na call {slug}"),
         Msg::Leave => "saiu da call".into(),
         Msg::OpenVolume(name) => format!("abriu o volume de {name}"),
+        Msg::MutePerson(name) => format!("mudo/desmudo de {name}"),
         Msg::ShareButton => "clicou em transmitir".into(),
         Msg::ShareQuality(q) => format!("escolheu a qualidade {q:?}"),
         Msg::ShareAudio(b) => on(
@@ -809,14 +812,13 @@ impl App {
             }
             Msg::Volume(name, slider) => {
                 let muted = self.config.set_volume(&name, slider);
-                if let Some(call) = self.call_mut() {
-                    if let (Some(muted), Some(c)) = (muted, &call.call) {
-                        c.set_muted_people(muted);
-                    }
-                    if let Some(engine) = &call.engine {
-                        engine.set_person_volume(&name, slider);
-                    }
-                }
+                self.push_volume(&name, slider, muted);
+                Task::none()
+            }
+            Msg::MutePerson(name) => {
+                let (slider, muted) = self.config.toggle_person(&name);
+                self.push_volume(&name, slider, muted);
+                self.persist();
                 Task::none()
             }
             Msg::Master(slider) => {
@@ -1948,6 +1950,18 @@ impl App {
         self.news = false;
         self.config.seen_version = Some(env!("CARGO_PKG_VERSION").into());
         self.persist();
+    }
+
+    /// Volume de uma pessoa já gravado na config: vai pro motor e, se a lista de mudos
+    /// mudou, pra sala (`concord.muted`).
+    fn push_volume(&mut self, name: &str, slider: u8, muted: Option<Vec<String>>) {
+        let Some(call) = self.call_mut() else { return };
+        if let (Some(muted), Some(c)) = (muted, &call.call) {
+            c.set_muted_people(muted);
+        }
+        if let Some(engine) = &call.engine {
+            engine.set_person_volume(name, slider);
+        }
     }
 
     fn persist(&self) {

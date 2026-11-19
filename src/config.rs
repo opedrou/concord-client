@@ -45,6 +45,8 @@ pub struct Config {
     pub master_volume: u8,
     /// Nome da pessoa -> slider. Quem não está aqui fica em [`VOLUME_PADRAO`].
     pub volumes: HashMap<String, u8>,
+    /// Volume de antes do botão de mudo, pra desmutar voltar nele.
+    pub muted_from: HashMap<String, u8>,
     pub share_quality: Quality,
     /// Interruptor "Transmitir áudio". Só no Linux por enquanto.
     pub share_audio: bool,
@@ -77,6 +79,7 @@ impl Default for Config {
             manual_gain_db: 0.0,
             master_volume: VOLUME_PADRAO,
             volumes: HashMap::new(),
+            muted_from: HashMap::new(),
             share_quality: Quality::default(),
             share_audio: true,
             seen_version: None,
@@ -236,7 +239,23 @@ impl Config {
         let slider = slider.min(100);
         let was_zero = self.volume_of(name) == 0;
         self.volumes.insert(name.to_owned(), slider);
+        if slider > 0 {
+            self.muted_from.remove(name);
+        }
         (was_zero != (slider == 0)).then(|| self.muted_people())
+    }
+
+    /// Botão de mudo: zera guardando o volume, ou volta pro guardado. Devolve o slider
+    /// novo e, como [`Config::set_volume`], a lista de mudos se ela mudou.
+    pub fn toggle_person(&mut self, name: &str) -> (u8, Option<Vec<String>>) {
+        let now = self.volume_of(name);
+        let to = if now == 0 {
+            self.muted_from.remove(name).unwrap_or(VOLUME_PADRAO)
+        } else {
+            self.muted_from.insert(name.to_owned(), now);
+            0
+        };
+        (to, self.set_volume(name, to))
     }
 
     /// Desmutar desliga o surdo, igual à web (`setMicMuted`).
@@ -352,6 +371,22 @@ mod tests {
             Some(vec!["Ana".into(), "Bia".into()])
         );
         assert_eq!(c.set_volume("Ana", 5), Some(vec!["Bia".to_owned()]));
+    }
+
+    #[test]
+    fn botao_de_mudo_volta_no_volume_de_antes() {
+        let mut c = Config::default();
+        c.set_volume("Ana", 40);
+        assert_eq!(c.toggle_person("Ana"), (0, Some(vec!["Ana".to_owned()])));
+        assert_eq!(c.toggle_person("Ana"), (40, Some(vec![])));
+        // Zerada no slider, sem volume guardado: volta no padrão.
+        c.set_volume("Bia", 0);
+        assert_eq!(c.toggle_person("Bia").0, VOLUME_PADRAO);
+        // Mexer no slider depois do mudo esquece o guardado.
+        c.toggle_person("Ana");
+        c.set_volume("Ana", 30);
+        c.set_volume("Ana", 0);
+        assert_eq!(c.toggle_person("Ana").0, VOLUME_PADRAO);
     }
 
     #[test]

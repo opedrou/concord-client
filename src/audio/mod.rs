@@ -153,8 +153,9 @@ pub fn devices() -> Devices {
 /// `ffmpeg -i X.wav -af "pan=mono|c0=FL,volume=8dB" -f s16le -ar 48000 assets/sounds/notify.pcm`
 ///
 /// O `hello.pcm` veio de um wav estéreo de 96 kHz, com os canais quase iguais: a média só perde
-/// 1 dB. Sobe 8 dB pro pico dos outros (pico -2,8 dBFS, RMS -24 dBFS, 2,6 s):
-/// `ffmpeg -i X.wav -af "volume=8dB" -f s16le -ar 48000 -ac 1 assets/sounds/hello.pcm`
+/// 1 dB. Sobe 2 dB: metade da amplitude dos outros, porque toca sozinho ao abrir e assustava
+/// (pico -8,8 dBFS, RMS -29,8 dBFS, 2,6 s):
+/// `ffmpeg -i X.wav -af "volume=2dB" -f s16le -ar 48000 -ac 1 assets/sounds/hello.pcm`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
     Join,
