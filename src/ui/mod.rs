@@ -286,6 +286,8 @@ pub enum Msg {
     Gain(f32),
     /// Relógio do medidor de entrada.
     MeterTick,
+    /// "Testar" da saída: toca o som de entrada nela.
+    TestOutput,
     ProbeStarted(u64, Result<Boot, String>),
     Devices(Devices),
     CloseRequested(window::Id),
@@ -370,6 +372,7 @@ fn action(msg: &Msg) -> Option<String> {
             "ligou o ganho automático",
             "desligou o ganho automático",
         ),
+        Msg::TestOutput => "testou a saída".into(),
         Msg::OpenSettings(tab) => format!("abriu as configurações em {tab:?}"),
         Msg::CloseSettings => "fechou as configurações".into(),
         Msg::CloseNews => "fechou as novidades da versão".into(),
@@ -976,6 +979,10 @@ impl App {
                         m.open = open;
                     }
                 }
+                Task::none()
+            }
+            Msg::TestOutput => {
+                self.chime(Effect::Join);
                 Task::none()
             }
             Msg::ProbeStarted(id, result) => {
@@ -3254,6 +3261,14 @@ mod tests {
             a.config.audio_prefs().sensitivity,
             Sensitivity::Manual(-55.0)
         );
+    }
+
+    #[test]
+    fn testar_saida_toca_a_entrada() {
+        let mut a = voice_tab();
+        chimes();
+        let _ = a.update(Msg::TestOutput);
+        assert_eq!(chimes(), [Effect::Join]);
     }
 
     #[test]

@@ -336,12 +336,14 @@ fn account_panel(m: &Main) -> Element<'_, Msg> {
         .into()
 }
 
-/// Opções de um dispositivo: "Padrão do sistema" e depois a lista do sistema.
+/// Opções de um dispositivo: "Padrão do sistema" e depois a lista do sistema. Com `test`,
+/// um botão "Testar" do lado.
 fn device_field<'a>(
     label: &'a str,
     names: &[String],
     selected: &Option<String>,
     msg: fn(Option<String>) -> Msg,
+    test: Option<Msg>,
 ) -> Element<'a, Msg> {
     let options: Vec<String> = [PADRAO.to_owned()]
         .into_iter()
@@ -356,7 +358,11 @@ fn device_field<'a>(
     .text_size(14.4)
     .style(theme::pick)
     .menu_style(theme::pick_menu);
-    labeled(label, list)
+    let test = test.map(|msg| action("Testar", msg, theme::outline));
+    labeled(
+        label,
+        row![list].push(test).spacing(8).align_y(Alignment::Center),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -389,12 +395,19 @@ fn voice_panel<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
         .width(Length::Fill);
     column![
         title("Voz"),
-        device_field("Microfone", &devices.inputs, &config.input, Msg::Input),
+        device_field(
+            "Microfone",
+            &devices.inputs,
+            &config.input,
+            Msg::Input,
+            None
+        ),
         device_field(
             "Saída de áudio",
             &devices.outputs,
             &config.output,
-            Msg::Output
+            Msg::Output,
+            Some(Msg::TestOutput),
         ),
         labeled("Redução de ruído", noise),
         sensitivity(m, config),
