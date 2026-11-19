@@ -84,6 +84,14 @@ pub enum Msg {
     /// Botão de anexar: abre o seletor do sistema.
     Attach,
     Picked(Option<PathBuf>),
+    /// Arquivo solto na janela com o chat aberto.
+    Dropped(PathBuf),
+    /// Ctrl+V no campo.
+    Paste,
+    /// A imagem que estava no clipboard, já num arquivo temporário. `None`: não tinha.
+    Pasted(Option<PathBuf>),
+    /// O texto do clipboard, quando não tinha imagem.
+    PasteText(Option<String>),
     /// Bytes já entregues e o total do upload.
     Progress(u64, u64),
     Uploaded(Result<Uploaded, String>),
@@ -368,11 +376,25 @@ impl Chat {
                     self.upload = Upload::Idle;
                     return Task::none();
                 };
-                let name = path
-                    .file_name()
-                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-                (self.upload, self.error) = (Upload::sending(name), None);
-                return upload(client.clone(), channel, path);
+                return self.start_upload(path, client, false);
+            }
+            // Arrastado pra janela: mesmo caminho do botão, com o mesmo limite e os mesmos erros.
+            Msg::Dropped(path) => return self.attach(path, client, false),
+            // Ctrl+V: imagem no clipboard anexa; sem imagem, cola o texto como o campo faria.
+            Msg::Paste => {
+                return Task::future(async move {
+                    App::Chat(channel, Msg::Pasted(logic::clipboard_image().await))
+                });
+            }
+            Msg::Pasted(Some(path)) => return self.attach(path, client, true),
+            Msg::Pasted(None) => {
+                return iced::clipboard::read()
+                    .map(move |text| App::Chat(channel, Msg::PasteText(text)));
+            }
+            Msg::PasteText(text) => {
+                if let Some(text) = text {
+                    self.edit(Action::Edit(Edit::Paste(Arc::new(text))));
+                }
             }
             Msg::Progress(now, all) => {
                 if let Upload::Sending { sent, total, .. } = &mut self.upload {
@@ -518,6 +540,27 @@ impl Chat {
         Task::none()
     }
 
+    /// Anexa o que não veio do seletor (arrastado ou colado), só com o campo livre: é um anexo
+    /// por mensagem. `temporary`: arquivo nosso, que some depois de lido.
+    fn attach(&mut self, path: PathBuf, client: &Client, temporary: bool) -> Task<App> {
+        if !matches!(self.upload, Upload::Idle) || self.sending {
+            if temporary {
+                let _ = std::fs::remove_file(&path);
+            }
+            self.error = Some("Só um anexo por mensagem.".to_owned());
+            return Task::none();
+        }
+        self.start_upload(path, client, temporary)
+    }
+
+    fn start_upload(&mut self, path: PathBuf, client: &Client, temporary: bool) -> Task<App> {
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        (self.upload, self.error) = (Upload::sending(name), None);
+        upload(client.clone(), self.channel, path, temporary)
+    }
+
     fn failed(&mut self, e: Error, what: &str) -> Task<App> {
         if e == Error::Unauthorized {
             return Task::done(App::Chat(self.channel, Msg::Expired));
@@ -625,11 +668,18 @@ impl Upload {
     }
 }
 
-/// Lê o arquivo fora da thread da interface e sobe, avisando o andamento.
-fn upload(client: Client, channel: i64, path: PathBuf) -> Task<App> {
+/// Lê o arquivo fora da thread da interface e sobe, avisando o andamento. `temporary` apaga o
+/// arquivo assim que lido.
+fn upload(client: Client, channel: i64, path: PathBuf, temporary: bool) -> Task<App> {
     let run = iced::stream::channel(8, async move |mut out| {
         let result = async {
-            let read = tokio::task::spawn_blocking(move || logic::read_attachment(&path));
+            let read = tokio::task::spawn_blocking(move || {
+                let read = logic::read_attachment(&path);
+                if temporary {
+                    let _ = std::fs::remove_file(&path);
+                }
+                read
+            });
             let (name, bytes) = read.await.map_err(|e| e.to_string())??;
             let mut progress = out.clone();
             let sent = move |sent, total| {
@@ -1362,7 +1412,11 @@ fn enter_sends(key: KeyPress, channel: i64) -> Option<Binding<App>> {
         Key::Named(Named::Enter) if focused && !key.modifiers.shift() => {
             Some(Binding::Custom(App::Chat(channel, Msg::Send)))
         }
-        _ => Binding::from_key_press(key),
+        // O colar padrão do campo só lê texto: vai por `Msg::Paste`, que olha a imagem antes.
+        _ => match Binding::from_key_press(key) {
+            Some(Binding::Paste) => Some(Binding::Custom(App::Chat(channel, Msg::Paste))),
+            binding => binding,
+        },
     }
 }
 
@@ -2111,6 +2165,83 @@ mod tests {
         let _ = c.update(Msg::Scrolled(false), &cliente);
         let _ = c.update(Msg::Sent(Ok(msg(6, "opedro", 6, "y"))), &cliente);
         assert!(!c.unread && c.at_bottom);
+    }
+
+    #[test]
+    fn arquivo_solto_anexa_so_com_o_chat_aberto_e_o_campo_livre() {
+        use iced::{Event, event, window};
+        let solto = |p: &str| Event::Window(window::Event::FileDropped(p.into()));
+        let ignora = event::Status::Ignored;
+        // A janela traduz o evento do sistema pra mensagem do app.
+        let msg = super::super::focus(solto("/tmp/x/a.png"), ignora, window::Id::unique());
+        assert!(matches!(msg, Some(App::FileDropped(p)) if p.ends_with("a.png")));
+
+        let mut a = app();
+        // Sem chat aberto, nada acontece.
+        let _ = a.update(App::FileDropped("/tmp/x/a.png".into()));
+        assert!(main(&mut a).chat.is_none());
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let _ = a.update(App::FileDropped("/tmp/x/a.png".into()));
+        let c = chat(&mut a);
+        assert!(matches!(&c.upload, Upload::Sending { name, .. } if name == "a.png"));
+        // Segundo arquivo com o primeiro subindo: um anexo por mensagem, o primeiro segue.
+        let _ = a.update(App::FileDropped("/tmp/x/b.png".into()));
+        let c = chat(&mut a);
+        assert!(matches!(&c.upload, Upload::Sending { name, .. } if name == "a.png"));
+        assert_eq!(c.error.as_deref(), Some("Só um anexo por mensagem."));
+    }
+
+    #[test]
+    fn ctrl_v_do_campo_passa_pelo_msg_paste() {
+        use iced::keyboard::{
+            Modifiers,
+            key::{Code, Physical},
+        };
+        let colar = |modifiers| KeyPress {
+            key: Key::Character("v".into()),
+            modified_key: Key::Character("v".into()),
+            physical_key: Physical::Code(Code::KeyV),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        };
+        let ctrl = if cfg!(target_os = "macos") {
+            Modifiers::LOGO
+        } else {
+            Modifiers::CTRL
+        };
+        assert!(matches!(
+            enter_sends(colar(ctrl), 1),
+            Some(Binding::Custom(App::Chat(1, Msg::Paste)))
+        ));
+        // `v` sozinho não é colar.
+        assert!(!matches!(
+            enter_sends(colar(Modifiers::empty()), 1),
+            Some(Binding::Custom(_))
+        ));
+        // Colar texto: entra no campo como antes.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let cliente = Client::new("https://a.b", None);
+        let c = chat(&mut a);
+        let _ = c.update(Msg::PasteText(Some("oi colado".into())), &cliente);
+        assert_eq!(c.draft.text(), "oi colado");
+        let _ = c.update(Msg::PasteText(None), &cliente);
+        assert_eq!(c.draft.text(), "oi colado");
+        // Imagem colada com um anexo já pronto: erro, e o arquivo temporário vai embora.
+        let tmp = std::env::temp_dir().join("concord-teste-colado.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        c.upload = Upload::Ready(Uploaded {
+            path: "x.png".into(),
+            name: "x.png".into(),
+            mime: "image/png".into(),
+            kind: "image".into(),
+            size: 1,
+        });
+        let _ = c.update(Msg::Pasted(Some(tmp.clone())), &cliente);
+        assert!(!tmp.exists());
+        assert_eq!(c.error.as_deref(), Some("Só um anexo por mensagem."));
+        assert!(matches!(c.upload, Upload::Ready(_)));
     }
 
     #[test]

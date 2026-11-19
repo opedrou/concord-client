@@ -384,6 +384,48 @@ pub async fn open_link(link: String) -> Result<(), String> {
         .map_err(|_| "Nenhum app abriu o link.".to_owned())
 }
 
+/// A imagem do clipboard (um print, por exemplo) como PNG na pasta temporária, pra anexar.
+/// `None`: o clipboard tem texto, não tem imagem, ou o sistema não deixou ler.
+pub async fn clipboard_image() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(|| {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        // Texto manda: planilha e página copiam texto e imagem juntos, e quem cola quer o texto.
+        if clipboard.get_text().is_ok_and(|t| !t.is_empty()) {
+            return None;
+        }
+        let picture = clipboard.get_image().ok()?;
+        let (w, h) = (
+            u32::try_from(picture.width).ok()?,
+            u32::try_from(picture.height).ok()?,
+        );
+        let png = encode_png(w, h, &picture.bytes)?;
+        let dir = std::env::temp_dir().join("concord-anexos");
+        let name = chrono::Local::now().format("captura-%Y%m%d-%H%M%S.png");
+        let path = dir.join(name.to_string());
+        save(&dir, &path, &png).ok()?;
+        Some(path)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// PNG de uma imagem RGBA. `None` se o tamanho dos bytes não bate com a largura e a altura.
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    use image::codecs::png::{CompressionType, FilterType as Filter, PngEncoder};
+    use image::{ExtendedColorType, ImageEncoder};
+    // O codificador dá `assert` com tamanho errado, em vez de erro.
+    if width == 0 || height == 0 || rgba.len() as u64 != u64::from(width) * u64::from(height) * 4 {
+        return None;
+    }
+    let mut png = Vec::new();
+    // Rápido: print de tela cheia não pode demorar a subir, e o servidor aceita até 95 MB.
+    PngEncoder::new_with_quality(&mut png, CompressionType::Fast, Filter::Adaptive)
+        .write_image(rgba, width, height, ExtendedColorType::Rgba8)
+        .ok()?;
+    Some(png)
+}
+
 /// Lê o arquivo escolhido pra anexar: nome e bytes, até 95 MiB.
 pub fn read_attachment(path: &Path) -> Result<(String, Vec<u8>), String> {
     let size = std::fs::metadata(path)
@@ -659,6 +701,21 @@ mod tests {
                 .count(),
             3999
         );
+    }
+
+    #[test]
+    fn print_do_clipboard_vira_png_que_volta_igual() {
+        // 2x2 com alfa: o que sai do arboard é RGBA, e tem de voltar sem perder canal.
+        let rgba: Vec<u8> = (0..16).map(|i| i * 16).collect();
+        let png = encode_png(2, 2, &rgba).unwrap();
+        let back = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(back.dimensions(), (2, 2));
+        assert_eq!(back.into_raw(), rgba);
+        // Bytes que não fecham com o tamanho não viram arquivo.
+        assert!(encode_png(2, 2, &rgba[..15]).is_none());
+        assert!(encode_png(0, 0, &[]).is_none());
     }
 
     #[test]
