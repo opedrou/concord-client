@@ -61,21 +61,34 @@ pub fn text(event: &NotifyEvent, channels: &[Channel]) -> (String, String) {
     }
 }
 
-/// Mostra a notificação e espera ela fechar. `true`: a pessoa clicou nela. Sem servidor de
-/// notificação no sistema, `false` e uma linha no log.
-pub async fn show(title: String, body: String) -> bool {
+/// Botão "Agora não" do chamado: fecha sem entrar.
+const AGORA_NAO: &str = "agora-nao";
+
+/// Mostra a notificação e espera ela fechar. `true`: a pessoa clicou nela, ou em "Entrar".
+/// `call` põe os botões "Entrar" e "Agora não". Sem servidor de notificação no sistema,
+/// `false` e uma linha no log.
+pub async fn show(title: String, body: String, call: bool) -> bool {
     // Thread solta, não `spawn_blocking`: o runtime espera as tarefas bloqueantes ao fechar,
     // e um aviso que ninguém fecha (o GNOME guarda na lista) seguraria o Sair.
     let (tx, rx) = tokio::sync::oneshot::channel();
     let spawned = std::thread::Builder::new()
         .name("concord-aviso".into())
         .spawn(move || {
-            let _ = tx.send(show_blocking(&title, &body));
+            let _ = tx.send(show_blocking(&title, &body, call));
         });
     spawned.is_ok() && rx.await.unwrap_or(false)
 }
 
-fn show_blocking(title: &str, body: &str) -> bool {
+/// Clique no corpo ou num botão que não seja o "Agora não".
+fn accepted(r: &NotificationResponse) -> bool {
+    match r {
+        NotificationResponse::Default => true,
+        NotificationResponse::Action(action) => action != AGORA_NAO,
+        _ => false,
+    }
+}
+
+fn show_blocking(title: &str, body: &str, call: bool) -> bool {
     let mut n = Notification::new();
     n.summary(title).body(body);
     // O nome e o ícone vêm do `.desktop` que a instalação põe no menu.
@@ -90,6 +103,10 @@ fn show_blocking(title: &str, body: &str) -> bool {
     // Menu Iniciar, senão o toast sai sem o nome e o ícone do Concord.
     #[cfg(windows)]
     n.app_id(crate::update::win::AUMID);
+    // Ações no Linux; no Windows o notify-rust vira cada uma num botão do toast.
+    if call {
+        n.action("entrar", "Entrar").action(AGORA_NAO, "Agora não");
+    }
     let handle = match n.show() {
         Ok(handle) => handle,
         Err(e) => {
@@ -105,12 +122,7 @@ fn show_blocking(title: &str, body: &str) -> bool {
     // O `wait_for_action` do Windows dá clique no corpo como "__closed": o `wait_for_response`
     // separa os dois nos dois sistemas.
     let mut clicked = false;
-    let _ = handle.wait_for_response(|r: &NotificationResponse| {
-        clicked = matches!(
-            r,
-            NotificationResponse::Default | NotificationResponse::Action(_)
-        );
-    });
+    let _ = handle.wait_for_response(|r: &NotificationResponse| clicked = accepted(r));
     clicked
 }
 
@@ -167,6 +179,16 @@ mod texto {
             text(&mencao(4), &canais),
             ("bia te marcou em #geral".into(), "oi @ana, bora?".into())
         );
+    }
+
+    #[test]
+    fn agora_nao_fecha_sem_entrar() {
+        assert!(accepted(&NotificationResponse::Default), "clique no corpo");
+        assert!(accepted(&NotificationResponse::Action("entrar".into())));
+        assert!(!accepted(&NotificationResponse::Action(AGORA_NAO.into())));
+        assert!(!accepted(&NotificationResponse::Closed(
+            notify_rust::CloseReason::Dismissed
+        )));
     }
 
     #[test]
@@ -257,9 +279,16 @@ mod tests {
             "o D-Bus abriria um servidor de verdade"
         );
 
-        assert!(!show("Ana te chamou".into(), "call-tete".into()).await);
+        assert!(!show("Ana te chamou".into(), "call-tete".into(), true).await);
 
-        for (resposta, clicou) in [(Some("default"), true), (None, false)] {
+        // Resposta do servidor, se é chamado e se conta como clique.
+        for (resposta, call, clicou) in [
+            (Some("default"), true, true),
+            (Some("entrar"), true, true),
+            (Some(AGORA_NAO), true, false),
+            (Some("default"), false, true),
+            (None, false, false),
+        ] {
             let (pedidos, mut recebidos) = tokio::sync::mpsc::unbounded_channel();
             let servidor = zbus::connection::Builder::session()
                 .unwrap()
@@ -275,14 +304,19 @@ mod tests {
                 .unwrap();
             let resultado = tokio::time::timeout(
                 Duration::from_secs(5),
-                show("Ana te chamou".into(), "call-tete".into()),
+                show("Ana te chamou".into(), "call-tete".into(), call),
             )
             .await
             .expect("a espera não acabou");
             assert_eq!(resultado, clicou, "{resposta:?}");
             let (app, acoes, dicas) = recebidos.recv().await.unwrap();
             assert_eq!(app, "Concord");
-            assert_eq!(acoes, ["default", "Abrir"]);
+            let botoes: &[&str] = if call {
+                &["entrar", "Entrar", AGORA_NAO, "Agora não"]
+            } else {
+                &[]
+            };
+            assert_eq!(acoes, [&["default", "Abrir"], botoes].concat());
             assert_eq!(
                 dicas
                     .get("suppress-sound")

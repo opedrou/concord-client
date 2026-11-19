@@ -1371,7 +1371,8 @@ impl App {
         self.chime(Effect::Notify);
         log!("notificação: mostrou {kind}");
         Task::future(async move {
-            let clicked = crate::notify::show(title, body).await;
+            let call = matches!(pending, Pending::Join(_));
+            let clicked = crate::notify::show(title, body, call).await;
             Msg::NotifyClosed(pending, clicked)
         })
     }
