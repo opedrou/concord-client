@@ -2,6 +2,7 @@
 //! fica em `crate::chat`.
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,8 +14,8 @@ use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::text::Wrapping;
 use iced::widget::text_editor::{Action, Binding, Cursor, Edit, KeyPress, Motion, Position};
 use iced::widget::{
-    Column, button, column, container, image, mouse_area, progress_bar, row, scrollable, space,
-    text, text_editor,
+    Column, button, column, container, image, mouse_area, progress_bar, rich_text, row, scrollable,
+    space, span, stack, text, text_editor,
 };
 use iced::{
     Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task, Theme,
@@ -23,7 +24,7 @@ use iced::{
 
 use super::sidebar::{CLOSE, HASH, icon};
 use super::theme::{
-    self, BG, BG2, BORDER, BORDER2, DANGER, DANGER_SOFT, FG, FG2, FG3, HOVER, IDLE,
+    self, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, DANGER_SOFT, FG, FG2, FG3, HOVER, IDLE,
 };
 use super::{Main, Msg as App, avatar};
 use crate::api::{Attachment, Channel, Client, Error, Kind, Member, Message, Page, Uploaded, User};
@@ -46,6 +47,8 @@ const MENU: f32 = 280.0;
 const SUGESTOES: usize = 6;
 const MAX_PREFIXO: usize = 32;
 const SELECAO: Color = Color::from_rgba8(157, 78, 221, 0.45);
+/// Fundo da pílula da menção, atrás do `@nome`.
+const PILULA: Color = Color::from_rgba8(157, 78, 221, 0.32);
 
 #[derive(Clone, Debug)]
 pub enum Msg {
@@ -124,6 +127,8 @@ pub struct Chat {
     confirm: Option<i64>,
     /// Nomes pra sugerir no `@`: todos menos a própria pessoa.
     members: Vec<String>,
+    /// Todos os nomes, inclusive o próprio: é o que vira pílula nas mensagens.
+    everyone: Vec<String>,
     /// Linha marcada na lista do `@`.
     pick: usize,
     /// Esc fechou a lista deste `@` (linha e coluna dele): só volta com texto novo.
@@ -164,6 +169,7 @@ impl Chat {
             name: channel.name.clone(),
             timeline: Timeline::default(),
             texts: HashMap::new(),
+            everyone: Vec::new(),
             draft: text_editor::Content::new(),
             loaded: false,
             loading_more: false,
@@ -205,6 +211,7 @@ impl Chat {
             .filter(|p| p.username != me)
             .map(|p| p.username.clone())
             .collect();
+        self.everyone = members.iter().map(|p| p.username.clone()).collect();
     }
 
     /// O `@` antes do cursor. Sem seleção, e não enquanto envia.
@@ -721,11 +728,24 @@ fn message_row<'a>(
     let mut body = Column::new().spacing(4);
     if let Some(content) = chat.texts.get(&id) {
         let selectable = text_editor(content)
+            .highlight_with::<Mentions>(chat.everyone.clone(), |_, _| {
+                iced::advanced::text::highlighter::Format {
+                    color: Some(ACCENT2),
+                    font: None,
+                }
+            })
             .on_action(move |action| App::Chat(channel, Msg::Select(id, action)))
             .size(TEXTO)
             .padding(0)
             .style(read_only);
-        body = body.push(selectable);
+        let found = mention_ranges(&message.content, &chat.everyone);
+        if found.is_empty() {
+            body = body.push(selectable);
+        } else {
+            // Camada de baixo com o mesmo texto e tamanho, só com o fundo das menções: o editor
+            // por cima segue selecionável. As duas quebram linha igual.
+            body = body.push(stack![pill_layer(&message.content, &found), selectable]);
+        }
     }
     if let Some(attachment) = &message.attachment {
         body = body.push(attachment_view(chat, id, attachment));
@@ -778,6 +798,97 @@ fn message_row<'a>(
     } else {
         cell.into()
     }
+}
+
+/// Texto invisível com a pílula roxa atrás de cada menção.
+fn pill_layer<'a>(content: &'a str, found: &[Range<usize>]) -> Element<'a, App> {
+    let hidden = |s: &'a str| span(s).color(Color::TRANSPARENT);
+    let mut spans = Vec::new();
+    let mut from = 0;
+    for r in found {
+        spans.push(hidden(&content[from..r.start]));
+        spans.push(
+            hidden(&content[r.clone()])
+                .background(Background::Color(PILULA))
+                .border(border::rounded(5))
+                .padding([0, 2]),
+        );
+        from = r.end;
+    }
+    spans.push(hidden(&content[from..]));
+    rich_text::<(), App, Theme, iced::Renderer>(spans)
+        .size(TEXTO)
+        .width(Length::Fill)
+        .into()
+}
+
+/// Pinta de roxo claro o `@nome` de cada linha do editor, com as regras de `mention_ranges`.
+struct Mentions {
+    names: Vec<String>,
+    line: usize,
+}
+
+impl text::Highlighter for Mentions {
+    type Settings = Vec<String>;
+    type Highlight = ();
+    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, ())>;
+
+    fn new(names: &Vec<String>) -> Self {
+        Self {
+            names: names.clone(),
+            line: 0,
+        }
+    }
+
+    fn update(&mut self, names: &Vec<String>) {
+        self.names.clone_from(names);
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.line = self.line.min(line);
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        self.line += 1;
+        let found = mention_ranges(line, &self.names);
+        found
+            .into_iter()
+            .map(|r| (r, ()))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn current_line(&self) -> usize {
+        self.line
+    }
+}
+
+/// Onde estão as menções em `content` (bytes, com o `@`). Mesma regra do servidor: `@` fora
+/// de palavra, mais um nome que existe, o mais longo primeiro, sem letra, número ou `_` logo
+/// depois. Maiúscula e minúscula contam.
+fn mention_ranges(content: &str, names: &[String]) -> Vec<Range<usize>> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut by_length: Vec<&str> = names.iter().map(String::as_str).collect();
+    by_length.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut found: Vec<Range<usize>> = Vec::new();
+    for (at, _) in content.match_indices('@') {
+        if found.last().is_some_and(|r| at < r.end) {
+            continue;
+        }
+        if content[..at].chars().next_back().is_some_and(word) {
+            continue;
+        }
+        let after = &content[at + 1..];
+        let name = by_length.iter().find(|n| {
+            !n.is_empty()
+                && after.starts_with(**n)
+                && !after[n.len()..].chars().next().is_some_and(word)
+        });
+        if let Some(n) = name {
+            found.push(at..at + 1 + n.len());
+        }
+    }
+    found
 }
 
 /// A própria mensagem, ou qualquer uma pra admin. O servidor confere de novo.
@@ -1532,12 +1643,15 @@ mod tests {
         use iced_test::simulator::Simulator;
 
         fn print(a: &super::super::App, nome: &str) {
+            print_largura(a, nome, 1200.0);
+        }
+        fn print_largura(a: &super::super::App, nome: &str, largura: f32) {
             let settings = Settings {
                 fonts: theme::FONTS.map(Into::into).to_vec(),
                 default_font: theme::BODY,
                 ..Settings::default()
             };
-            let mut ui = Simulator::with_size(settings, Size::new(1200.0, 760.0), a.view());
+            let mut ui = Simulator::with_size(settings, Size::new(largura, 760.0), a.view());
             let print = ui.snapshot(&a.theme()).unwrap();
             assert!(
                 print
@@ -1666,6 +1780,81 @@ mod tests {
         c.draft = text_editor::Content::new();
         digita(c, "falou @");
         print(&a, "arroba-todos");
+
+        // Menções com pílula: no meio, no começo, no fim, com espaço no nome, em texto que
+        // quebra linha, e a janela estreita.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let lista = vec![
+            msg(1, "Ana", 0, "@Opedro olha isso aqui"),
+            msg(
+                2,
+                "Bruno",
+                1,
+                "fala @Ana e @Zé da Silva, vê se alguém mais vai, valeu @Bruno",
+            ),
+            msg(
+                3,
+                "Ana",
+                2,
+                "@Opedro @Mariana alguém lembra de trazer a lista dos mods? da última vez demorou \
+                 uns 40 minutos pra todo mundo conseguir entrar no servidor e metade desistiu \
+                 antes, então @Zé da Silva confere isso antes das 21h por favor, e depois avisa \
+                 o @Bruno e a @Ana",
+            ),
+            msg(
+                4,
+                "Bruno",
+                3,
+                "@Fulano não existe, a@Ana é e-mail, @Anabela também não\nmas @Ana\ne @Opedro",
+            ),
+        ];
+        let page = Page {
+            messages: lista,
+            has_more: false,
+        };
+        let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
+        let todos = ["Opedro", "Ana", "Mariana", "Bruno", "Zé da Silva"];
+        let todos: Vec<Member> = todos.iter().zip(1..).map(|(n, i)| membro(i, n)).collect();
+        chat(&mut a).set_members(&todos, "Opedro");
+        print(&a, "mencoes");
+        print_largura(&a, "mencoes-estreito", 640.0);
+        print_largura(&a, "mencoes-estreito2", 560.0);
+    }
+
+    #[test]
+    fn mencoes_seguem_a_regra_do_servidor() {
+        let nomes: Vec<String> = ["Ana", "Ana Maria", "Zé", "ana", "Jo-ão"]
+            .map(String::from)
+            .to_vec();
+        fn marcas<'a>(t: &'a str, nomes: &[String]) -> Vec<&'a str> {
+            mention_ranges(t, nomes)
+                .into_iter()
+                .map(|r| &t[r])
+                .collect()
+        }
+        let acha = |t| marcas(t, &nomes);
+        // Mais longo primeiro, e o nome com espaço ou hífen.
+        assert_eq!(acha("oi @Ana Maria e @Jo-ão"), ["@Ana Maria", "@Jo-ão"]);
+        // Começo e fim do texto, várias menções.
+        assert_eq!(acha("@Ana @Ana"), ["@Ana", "@Ana"]);
+        assert_eq!(acha("@Ana"), ["@Ana"]);
+        // Acento, com letra de fronteira depois.
+        assert_eq!(acha("fala @Zé, vem"), ["@Zé"]);
+        assert!(acha("@Zéca").is_empty());
+        // Fronteira: letra, número ou `_` depois não marca, pontuação marca.
+        assert!(acha("@Ana2 @Ana_ @Anabela").is_empty());
+        assert_eq!(acha("@Ana! (@Ana)"), ["@Ana", "@Ana"]);
+        // `@` colado numa palavra é e-mail.
+        assert!(acha("a@Ana x@Ana 1@Ana").is_empty());
+        // Nome que não existe, e maiúscula diferente é outro nome.
+        assert!(acha("@Fulano @ @@").is_empty());
+        assert_eq!(acha("@ANA @ana"), ["@ana"]);
+        // Faixa em bytes certa depois de acento.
+        let t = "é @Zé";
+        assert_eq!(marcas(t, &nomes), ["@Zé"]);
+        assert_eq!(mention_ranges(t, &nomes)[0], 3..7);
+        assert!(mention_ranges("@Ana", &[]).is_empty());
     }
 
     /// Anexo como o servidor manda.
