@@ -1017,18 +1017,18 @@ fn composer<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
         .padding([9, 0])
         .max_height(140)
         .style(read_only);
-    // Sublinhado por baixo das menções, só com o campo curto: se rolar, desalinharia.
+    // Sublinhado por baixo das menções, só com o campo curto: se rolar, desalinharia. O
+    // `stack` fica sempre, com a camada vazia sem menção: o iced liga o estado ao lugar na
+    // árvore, e trocar o editor de lugar tirava o foco no meio da digitação.
     let draft = chat.draft.text();
     let found = mention_ranges(&draft, &chat.everyone);
-    let editor: Element<'_, App> = if found.is_empty() || !short(&draft) {
-        editor.into()
+    let under: Element<'_, App> = if found.is_empty() || !short(&draft) {
+        space().into()
     } else {
         let under = mention_layer(&draft, &found, |s| s.underline(true).color(ACCENT2));
-        stack![editor]
-            .push_under(container(under).padding([9, 0]))
-            .width(Length::Fill)
-            .into()
+        container(under).padding([9, 0]).into()
     };
+    let editor = stack![editor].push_under(under).width(Length::Fill);
     let idle = matches!(chat.upload, Upload::Idle);
     let attached = matches!(chat.upload, Upload::Ready(_));
     let typed = !chat.draft.text().trim().is_empty();
@@ -1117,12 +1117,19 @@ fn composer<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
         }
     };
     let mentions = suggestions.map(|(_, names)| mention_list(m, chat, &names));
-    column![]
+    // O campo fica sempre no mesmo lugar da árvore: com a lista do `@` entrando antes dele na
+    // mesma coluna, o iced recriava o editor e o foco sumia ao digitar o `@`.
+    let above = error.is_some() || upload.is_some() || mentions.is_some();
+    let above = column![]
         .push(error)
         .push(upload)
         .push(mentions)
-        .push(card)
         .spacing(6)
+        .padding(Padding {
+            bottom: if above { 6.0 } else { 0.0 },
+            ..Padding::ZERO
+        });
+    column![above, card]
         .padding(Padding {
             top: 4.0,
             right: 16.0,
