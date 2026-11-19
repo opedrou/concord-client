@@ -20,6 +20,7 @@ use crate::share::{Quality, Source, State};
 
 const ALERT: &[u8] = include_bytes!("../../assets/icons/alert-triangle.svg").as_slice();
 const VIDEO: &[u8] = include_bytes!("../../assets/icons/video.svg").as_slice();
+const MAXIMIZE: &[u8] = include_bytes!("../../assets/icons/maximize.svg").as_slice();
 
 /// Largura fixa e altura aproximada do painel de volume, pra centrar no tile.
 const PANEL: Size = Size::new(280.0, 104.0);
@@ -169,7 +170,7 @@ fn focus<'a>(
     let others = live
         .iter()
         .filter(|p| p.screen_share && Some(&p.identity) != call.watching.as_ref())
-        .map(|p| screen_tile(m, call, p, SIDE))
+        .map(|p| screen_tile(m, call, config, p, SIDE))
         .chain(live.iter().map(|p| tile(m, call, config, p, SIDE)));
     let side = scrollable(Column::with_children(others).spacing(GAP))
         .width(SIDE.width)
@@ -281,7 +282,7 @@ fn grid<'a>(
     let rows = cells.chunks(cols).map(|chunk| {
         Row::with_children(chunk.iter().map(|&(p, screen)| {
             if screen {
-                screen_tile(m, call, p, size)
+                screen_tile(m, call, config, p, size)
             } else {
                 tile(m, call, config, p, size)
             }
@@ -391,7 +392,7 @@ fn tile<'a>(
 
 /// Botão de mudo de uma pessoa (ou da transmissão dela), só pra mim: zera o volume ou
 /// volta no de antes.
-fn mute_button(name: &str, silenced: bool) -> Element<'_, Msg> {
+fn mute_button<'a>(name: &str, silenced: bool) -> Element<'a, Msg> {
     let (glyph, color, tip) = if silenced {
         (VOLUME_X, DANGER, "Voltar a ouvir")
     } else {
@@ -406,7 +407,13 @@ fn mute_button(name: &str, silenced: bool) -> Element<'_, Msg> {
 
 /// Tile da transmissão de alguém. Sem assistir: a prévia borrada e o botão. Assistindo: o
 /// vídeo, com tela cheia e parar no canto.
-fn screen_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
+fn screen_tile<'a>(
+    m: &'a Main,
+    call: &'a ActiveCall,
+    config: &'a Config,
+    p: &'a Live,
+    size: Size,
+) -> Element<'a, Msg> {
     if p.is_local {
         return own_tile(m, call, p, size);
     }
@@ -418,8 +425,23 @@ fn screen_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -
             .padding([5, 10])
             .style(theme::outline)
             .on_press(Msg::Watch(None));
+        // Tela cheia e mudo da transmissão, os mesmos do painel de volume, sem o clique direito.
+        let key = Config::screen_key(voice::name_of(p));
+        let silenced = config.volume_of(&key) == 0;
+        let full = button(container(icon(MAXIMIZE, 16.0, FG)).center(28))
+            .padding(0)
+            .style(theme::ghost)
+            .on_press(Msg::Fullscreen);
+        let tools = container(
+            row![
+                tipped(full.into(), "Tela cheia"),
+                mute_button(&key, silenced)
+            ]
+            .spacing(2),
+        )
+        .style(theme::pill);
         body = body.push(
-            container(stop)
+            container(row![tools, stop].spacing(8).align_y(Alignment::Center))
                 .align_right(Length::Fill)
                 .align_top(Length::Fill)
                 .padding(10),
@@ -687,7 +709,12 @@ fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element
                 .size(13.5)
                 .font(theme::SEMIBOLD)
                 .color(IDLE);
-            container(label)
+            // Refaz o pedido de antes: mesma qualidade, áudio e, no Windows, a mesma fonte.
+            let retry = button(text("Tentar de novo").size(13).font(theme::SEMIBOLD))
+                .padding([5, 12])
+                .style(theme::outline)
+                .on_press(Msg::ShareStart);
+            container(row![label, retry].spacing(14).align_y(Alignment::Center))
                 .padding([7, 14])
                 .style(theme::tooltip)
                 .into()

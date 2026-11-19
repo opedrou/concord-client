@@ -3168,6 +3168,9 @@ mod tests {
         let mut a = in_call(&["Ana"]);
         share(&mut a, ShareState::Failed);
         assert_eq!(call_of(&mut a).share, ShareState::Failed);
+        // "Tentar de novo" refaz o pedido sem passar pelo painel de qualidade.
+        let _ = a.update(Msg::ShareStart);
+        assert!(!call_of(&mut a).share_panel);
         let _ = a.update(Msg::ShareButton);
         assert_eq!(call_of(&mut a).share, ShareState::Off);
         assert!(call_of(&mut a).share_panel);
@@ -3922,6 +3925,21 @@ mod tests {
         let (mut a, _) = palco(4);
         share(&mut a, ShareState::Failed);
         print(&a, "tela-falha");
+
+        // Assistindo a transmissão da Carla: Tela cheia e mudo no canto, junto do Parar.
+        let (mut a, id) = palco(4);
+        let mut lista = call_of(&mut a).live.clone().unwrap();
+        lista
+            .iter_mut()
+            .find(|l| l.name == "Carla")
+            .unwrap()
+            .screen_share = true;
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
+        let _ = a.update(Msg::Watch(Some("Carla__1".into())));
+        call_of(&mut a).screen = Some(alocada(640, 360));
+        print(&a, "tela-assistindo");
+        a.config.volumes.insert(Config::screen_key("Carla"), 0);
+        print(&a, "tela-assistindo-mudo");
 
         let mut a = voice_app();
         let _ = a.update(Msg::JoinChannel("call".into()));
