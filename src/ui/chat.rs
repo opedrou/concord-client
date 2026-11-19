@@ -1317,19 +1317,22 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// Hora local da mensagem; de outro dia, com a data.
+/// Data e hora local do cabeçalho do grupo: "Hoje 19:13", "Ontem 19:13", ou a data.
 fn when(ms: i64) -> String {
     use chrono::{DateTime, Local};
-    let Some(at) = DateTime::from_timestamp_millis(ms) else {
-        return String::new();
-    };
-    let at = at.with_timezone(&Local);
-    let format = if at.date_naive() == Local::now().date_naive() {
-        "%H:%M"
-    } else {
-        "%d/%m/%Y %H:%M"
-    };
-    at.format(format).to_string()
+    DateTime::from_timestamp_millis(ms)
+        .map(|at| at.with_timezone(&Local).naive_local())
+        .map_or_else(String::new, |at| relative(at, Local::now().date_naive()))
+}
+
+/// `at` e `today` no mesmo fuso, pra o teste não depender do relógio nem do fuso da máquina.
+fn relative(at: chrono::NaiveDateTime, today: chrono::NaiveDate) -> String {
+    let clock = at.format("%H:%M");
+    match (today - at.date()).num_days() {
+        0 => format!("Hoje {clock}"),
+        1 => format!("Ontem {clock}"),
+        _ => at.format("%d/%m/%Y %H:%M").to_string(),
+    }
 }
 
 fn clock(ms: i64) -> String {
@@ -1948,6 +1951,24 @@ mod tests {
         let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
         print(&a, "links");
         print_largura(&a, "links-estreito", 900.0);
+    }
+
+    #[test]
+    fn data_do_grupo_diz_hoje_e_ontem() {
+        use chrono::NaiveDate;
+        let dia = |m, d| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        let hoje = dia(11, 19);
+        let as_19_13 = |d: NaiveDate| d.and_hms_opt(19, 13, 0).unwrap();
+        assert_eq!(relative(as_19_13(hoje), hoje), "Hoje 19:13");
+        assert_eq!(relative(as_19_13(dia(11, 18)), hoje), "Ontem 19:13");
+        assert_eq!(relative(as_19_13(dia(11, 17)), hoje), "17/11/2026 19:13");
+        // Virada de mês e de ano.
+        assert_eq!(relative(as_19_13(dia(10, 31)), dia(11, 1)), "Ontem 19:13");
+        let ano = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let novo = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert_eq!(relative(as_19_13(ano), novo), "Ontem 19:13");
+        // Mensagem "do futuro" (relógio da máquina atrasado) mostra a data, não "Hoje".
+        assert_eq!(relative(as_19_13(dia(11, 20)), hoje), "20/11/2026 19:13");
     }
 
     #[test]
