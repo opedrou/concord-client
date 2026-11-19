@@ -15,11 +15,12 @@ use super::theme::{self, ACCENT, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, FG, 
 use super::voice::{self, ActiveCall, GAP, Status};
 use super::{Main, Msg, avatar};
 use crate::call::{Live, MAX_ATTEMPTS};
-use crate::config::{Config, SCREEN as SCREEN_KEY};
+use crate::config::{Config, SCREEN as SCREEN_KEY, VOLUME_PADRAO};
 use crate::share::{Quality, Source, State};
 
 const ALERT: &[u8] = include_bytes!("../../assets/icons/alert-triangle.svg").as_slice();
 const VIDEO: &[u8] = include_bytes!("../../assets/icons/video.svg").as_slice();
+const MAXIMIZE: &[u8] = include_bytes!("../../assets/icons/maximize.svg").as_slice();
 
 /// Largura fixa e altura aproximada do painel de volume, pra centrar no tile.
 const PANEL: Size = Size::new(280.0, 104.0);
@@ -37,8 +38,10 @@ const THUMB_NAME: f32 = 180.0;
 const THUMB_NAME_SIZE: f32 = 12.0;
 /// Barra de controles com a margem dela, pra os avisos abrirem logo acima.
 const ABOVE_BAR: f32 = 94.0;
-/// Faixa do pé do palco onde o mouse faz a barra aparecer.
+/// Faixa do pé do palco onde o mouse faz a barra aparecer (Foco e tela cheia).
 const BAR_ZONE: f32 = 140.0;
+/// Altura que a barra fixa da grade toma do palco: os tiles não ficam por baixo dela.
+const BAR_DOCK: f32 = 74.0;
 /// Espectadores desenhados no tile da transmissão: o resto vira "+N". Como no site.
 const MAX_VIEWERS: usize = 3;
 const VIEWER_FACE: f32 = 18.0;
@@ -105,17 +108,20 @@ fn overlays<'a>(
     }));
 }
 
-/// Palco com a barra de controles por cima, só com o mouse perto do pé.
+/// Palco com a barra de controles. Na grade ela é fixa e o corpo cede o lugar dela; no Foco e
+/// na tela cheia ela vem por cima, só com o mouse perto do pé.
 fn with_bar<'a>(
     call: &'a ActiveCall,
     config: &'a Config,
     body: impl Fn(Size) -> Element<'a, Msg> + 'a,
 ) -> Element<'a, Msg> {
     responsive(move |area| {
+        let dock = if call.bar_docked() { BAR_DOCK } else { 0.0 };
         let mut layers = stack![
-            container(body(area))
+            container(body(Size::new(area.width, area.height - dock)))
                 .width(Length::Fill)
                 .height(Length::Fill)
+                .padding(Padding::ZERO.bottom(dock))
         ];
         if call.bar_visible() {
             layers = layers.push(
@@ -164,7 +170,7 @@ fn focus<'a>(
     let others = live
         .iter()
         .filter(|p| p.screen_share && Some(&p.identity) != call.watching.as_ref())
-        .map(|p| screen_tile(m, call, p, SIDE))
+        .map(|p| screen_tile(m, call, config, p, SIDE))
         .chain(live.iter().map(|p| tile(m, call, config, p, SIDE)));
     let side = scrollable(Column::with_children(others).spacing(GAP))
         .width(SIDE.width)
@@ -276,7 +282,7 @@ fn grid<'a>(
     let rows = cells.chunks(cols).map(|chunk| {
         Row::with_children(chunk.iter().map(|&(p, screen)| {
             if screen {
-                screen_tile(m, call, p, size)
+                screen_tile(m, call, config, p, size)
             } else {
                 tile(m, call, config, p, size)
             }
@@ -377,14 +383,16 @@ fn tile<'a>(
     } else {
         hover(tile, corner)
     };
+    // O botão do canto captura o clique dele: o `mouse_area` só vê o que sobra.
     mouse_area(tile)
+        .on_press(Msg::OpenVolume(name.to_owned()))
         .on_right_press(Msg::OpenVolume(name.to_owned()))
         .into()
 }
 
 /// Botão de mudo de uma pessoa (ou da transmissão dela), só pra mim: zera o volume ou
 /// volta no de antes.
-pub(super) fn mute_button(name: &str, silenced: bool) -> Element<'_, Msg> {
+pub(super) fn mute_button<'a>(name: &str, silenced: bool) -> Element<'a, Msg> {
     let (glyph, color, tip) = if silenced {
         (VOLUME_X, DANGER, "Voltar a ouvir")
     } else {
@@ -399,7 +407,13 @@ pub(super) fn mute_button(name: &str, silenced: bool) -> Element<'_, Msg> {
 
 /// Tile da transmissão de alguém. Sem assistir: a prévia borrada e o botão. Assistindo: o
 /// vídeo, com tela cheia e parar no canto.
-fn screen_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> Element<'a, Msg> {
+fn screen_tile<'a>(
+    m: &'a Main,
+    call: &'a ActiveCall,
+    config: &'a Config,
+    p: &'a Live,
+    size: Size,
+) -> Element<'a, Msg> {
     if p.is_local {
         return own_tile(m, call, p, size);
     }
@@ -411,8 +425,23 @@ fn screen_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -
             .padding([5, 10])
             .style(theme::outline)
             .on_press(Msg::Watch(None));
+        // Tela cheia e mudo da transmissão, os mesmos do painel de volume, sem o clique direito.
+        let key = Config::screen_key(voice::name_of(p));
+        let silenced = config.volume_of(&key) == 0;
+        let full = button(container(icon(MAXIMIZE, 16.0, FG)).center(28))
+            .padding(0)
+            .style(theme::ghost)
+            .on_press(Msg::Fullscreen);
+        let tools = container(
+            row![
+                tipped(full.into(), "Tela cheia"),
+                mute_button(&key, silenced)
+            ]
+            .spacing(2),
+        )
+        .style(theme::pill);
         body = body.push(
-            container(stop)
+            container(row![tools, stop].spacing(8).align_y(Alignment::Center))
                 .align_right(Length::Fill)
                 .align_top(Length::Fill)
                 .padding(10),
@@ -443,7 +472,7 @@ fn screen_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -
         .height(size.height)
         .clip(true)
         .style(rounded_stage);
-    // Clique na assistida aumenta; botão direito abre o volume dela e a tela cheia.
+    // Clique na assistida aumenta, dois ligam a tela cheia; botão direito abre o volume dela.
     let mut area =
         mouse_area(tile).on_right_press(Msg::OpenVolume(Config::screen_key(voice::name_of(p))));
     if watching {
@@ -499,9 +528,14 @@ fn own_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> E
 }
 
 /// Transmissão assistida em tela cheia, sem a barra lateral. A barra de controles aparece
-/// com o mouse perto do pé, com "Fechar transmissão" no lugar de sair; Esc volta.
+/// com o mouse perto do pé, com "Fechar transmissão" no lugar de sair; Esc ou duplo clique volta.
 pub fn full<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
-    let base = with_bar(call, config, move |_| screen_image(call, 15.0));
+    // Duplo clique sai da tela cheia, como o Esc.
+    let base = with_bar(call, config, move |_| {
+        mouse_area(screen_image(call, 15.0))
+            .on_double_click(Msg::Escape)
+            .into()
+    });
     let mut layers = vec![container(base).style(theme::fill(theme::STAGE)).into()];
     overlays(m, call, config, &mut layers);
     stack(layers).into()
@@ -675,7 +709,12 @@ fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element
                 .size(13.5)
                 .font(theme::SEMIBOLD)
                 .color(IDLE);
-            container(label)
+            // Refaz o pedido de antes: mesma qualidade, áudio e, no Windows, a mesma fonte.
+            let retry = button(text("Tentar de novo").size(13).font(theme::SEMIBOLD))
+                .padding([5, 12])
+                .style(theme::outline)
+                .on_press(Msg::ShareStart);
+            container(row![label, retry].spacing(14).align_y(Alignment::Center))
                 .padding([7, 14])
                 .style(theme::tooltip)
                 .into()
@@ -983,6 +1022,16 @@ pub(super) fn floating(ring: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// Ganho real da posição do slider: 100 vale 200%. A posição padrão dá 1,0082 e mostra 100%.
+fn percent(slider: u8) -> String {
+    let gain = if slider == VOLUME_PADRAO {
+        1.0
+    } else {
+        crate::audio::gain(slider)
+    };
+    format!("{}%", (gain * 100.0).round())
+}
+
 /// Volume de uma pessoa. Fecha no X, no Escape ou com um clique fora (`overlays`).
 fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> Element<'a, Msg> {
     let volume = config.volume_of(name);
@@ -1014,6 +1063,11 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
             .size(13)
             .color(FG2),
         level,
+        text(percent(volume))
+            .size(13)
+            .color(FG2)
+            .width(42)
+            .align_x(Alignment::End),
     ]
     .spacing(10)
     .align_y(Alignment::Center);
@@ -1051,6 +1105,14 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percentual_e_o_ganho_real_do_slider() {
+        assert_eq!(percent(0), "0%");
+        assert_eq!(percent(71), "100%");
+        assert_eq!(percent(100), "200%");
+        assert_eq!(percent(50), "50%");
+    }
 
     #[test]
     fn nome_comprido_corta_com_reticencias_na_largura() {

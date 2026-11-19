@@ -15,6 +15,9 @@ use crate::call::{Call, End, Live};
 use crate::config::Config;
 use crate::share::{self, Quality};
 
+/// Intervalo entre dois cliques na transmissão pra valerem como duplo clique.
+pub const DOUBLE_CLICK: Duration = Duration::from_millis(350);
+
 /// Quanto o anel de fala fica aceso depois que a pessoa cala, como na web.
 const SPEAKING_HOLD: Duration = Duration::from_millis(400);
 
@@ -120,6 +123,9 @@ pub struct ActiveCall {
     uploaded_at: Option<u64>,
     /// Tamanho da transmissão assistida.
     pub view: View,
+    /// Último clique na transmissão e o número do recuo agendado: ver [`ActiveCall::screen_click`].
+    last_click: Option<Instant>,
+    click_seq: u64,
     /// Mouse perto do pé do palco: a barra de controles aparece.
     pub bar_near: bool,
     /// Último ponto do mouse no palco, e onde o painel de volume foi aberto.
@@ -177,6 +183,8 @@ impl ActiveCall {
             preview_paused: false,
             uploaded_at: None,
             view: View::Tile,
+            last_click: None,
+            click_seq: 0,
             bar_near: false,
             cursor: Point::ORIGIN,
             volume_at: Point::ORIGIN,
@@ -188,9 +196,47 @@ impl ActiveCall {
         self.watching.is_some() && self.view == View::Full
     }
 
+    /// Clique na transmissão assistida; dois em [`DOUBLE_CLICK`] ligam a tela cheia. No tile o
+    /// primeiro aumenta na hora. No grande o recuo pro tile espera o segundo clique: devolve o
+    /// número dele, pra agendar `screen_unfocus`.
+    pub fn screen_click(&mut self, now: Instant) -> Option<u64> {
+        self.click_seq += 1;
+        if self
+            .last_click
+            .is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK)
+        {
+            self.last_click = None;
+            self.view = View::Full;
+            self.volume_panel = None;
+            return None;
+        }
+        self.last_click = Some(now);
+        match self.view {
+            View::Tile => {
+                self.view = View::Focus;
+                None
+            }
+            View::Focus => Some(self.click_seq),
+            View::Full => None,
+        }
+    }
+
+    /// Fim da espera de `screen_click`: sem segundo clique, o grande volta pro tile.
+    pub fn screen_unfocus(&mut self, seq: u64) {
+        if seq == self.click_seq && self.view == View::Focus {
+            self.view = View::Tile;
+        }
+    }
+
+    /// Na grade a barra fica sempre no pé do palco; só o Foco e a tela cheia a escondem.
+    pub fn bar_docked(&self) -> bool {
+        self.watching.is_none() || self.view == View::Tile
+    }
+
     /// A barra fica com o mouse perto, ou enquanto algo dela está aberto.
     pub fn bar_visible(&self) -> bool {
-        self.bar_near
+        self.bar_docked()
+            || self.bar_near
             || self.share_panel
             || self.share_menu
             || self.people.is_some()
@@ -758,6 +804,58 @@ mod tests {
                 t.width * cols as f32 + GAP * (cols - 1) as f32 <= area.width - 2.0 * PAD_X + 0.5
             );
             assert!(t.height * rows as f32 + GAP * (rows - 1) as f32 <= area.height);
+        }
+    }
+
+    #[test]
+    fn duplo_clique_na_transmissao_liga_a_tela_cheia() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut call = ActiveCall::new(1, "call-tete".into());
+        call.watching = Some("Ana__1".into());
+
+        // Tile: o primeiro aumenta na hora, o segundo seguido vira tela cheia.
+        assert_eq!(call.screen_click(ms(0)), None);
+        assert_eq!(call.view, View::Focus);
+        assert_eq!(call.screen_click(ms(200)), None);
+        assert_eq!(call.view, View::Full);
+
+        // Grande: o clique solto só recua quando a espera acaba sem segundo clique.
+        call.view = View::Focus;
+        let seq = call.screen_click(ms(1000)).expect("agenda o recuo");
+        assert_eq!(call.view, View::Focus, "ainda espera");
+        call.screen_unfocus(seq);
+        assert_eq!(call.view, View::Tile);
+
+        // Grande com dois cliques: tela cheia, e o recuo que já tinha saído não faz nada.
+        call.view = View::Focus;
+        let seq = call.screen_click(ms(3000)).expect("agenda o recuo");
+        assert_eq!(call.screen_click(ms(3200)), None);
+        assert_eq!(call.view, View::Full);
+        call.screen_unfocus(seq);
+        assert_eq!(call.view, View::Full);
+
+        // Cliques espaçados não contam como duplo.
+        call.view = View::Tile;
+        call.screen_click(ms(5000));
+        let seq = call.screen_click(ms(5500)).expect("agenda o recuo");
+        assert_eq!(call.view, View::Focus);
+        call.screen_unfocus(seq);
+        assert_eq!(call.view, View::Tile);
+    }
+
+    #[test]
+    fn barra_fixa_na_grade_e_so_no_mouse_no_foco_e_na_tela_cheia() {
+        let mut call = ActiveCall::new(1, "call-tete".into());
+        assert!(call.bar_visible(), "grade sem transmissão");
+        call.watching = Some("Ana__1".into());
+        assert!(call.bar_visible(), "transmissão no tile da grade");
+        for view in [View::Focus, View::Full] {
+            call.view = view;
+            call.bar_near = false;
+            assert!(!call.bar_visible(), "{view:?} esconde");
+            call.bar_near = true;
+            assert!(call.bar_visible(), "{view:?} com o mouse no pé");
         }
     }
 

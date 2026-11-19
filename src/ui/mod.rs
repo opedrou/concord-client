@@ -268,6 +268,8 @@ pub enum Msg {
     Fullscreen,
     /// Clique na transmissão assistida: alterna entre o tile e grande com as pessoas do lado.
     FocusScreen,
+    /// Fim da espera de um clique solto na transmissão grande.
+    ScreenUnfocus(u64),
     /// Mouse perto ou longe do pé do palco: mostra ou esconde a barra.
     BarNear(bool),
     /// Mouse no palco: onde está e se está perto do pé.
@@ -371,6 +373,7 @@ fn action(msg: &Msg) -> Option<String> {
         Msg::Fullscreen => "pôs a transmissão em tela cheia".into(),
         Msg::ToggleFullscreen => "apertou F".into(),
         Msg::FocusScreen => "clicou na transmissão".into(),
+        Msg::ScreenUnfocus(_) => "voltou a transmissão pro tile".into(),
         Msg::Focus(b) => on(*b, "janela ganhou o foco", "janela perdeu o foco"),
         Msg::RestartForUpdate => "clicou pra abrir a versão nova".into(),
         Msg::Input(d) => format!("escolheu a entrada {}", device(d)),
@@ -1216,11 +1219,21 @@ impl App {
                 Task::none()
             }
             Msg::FocusScreen => {
-                if let Some(call) = self.call_mut().filter(|c| c.watching.is_some()) {
-                    call.view = match call.view {
-                        voice::View::Tile => voice::View::Focus,
-                        _ => voice::View::Tile,
-                    };
+                let seq = self
+                    .call_mut()
+                    .filter(|c| c.watching.is_some())
+                    .and_then(|c| c.screen_click(Instant::now()));
+                match seq {
+                    Some(seq) => Task::future(async move {
+                        tokio::time::sleep(voice::DOUBLE_CLICK).await;
+                        Msg::ScreenUnfocus(seq)
+                    }),
+                    None => Task::none(),
+                }
+            }
+            Msg::ScreenUnfocus(seq) => {
+                if let Some(call) = self.call_mut() {
+                    call.screen_unfocus(seq);
                 }
                 Task::none()
             }
@@ -3144,9 +3157,11 @@ mod tests {
         let _ = a.update(Msg::FocusScreen);
         assert_eq!(
             call_of(&mut a).view,
-            voice::View::Tile,
-            "outro clique volta"
+            voice::View::Full,
+            "dois cliques seguidos: tela cheia"
         );
+        assert!(main_of(&mut a).full_window, "a janela segue a tela cheia");
+        let _ = a.update(Msg::Escape);
 
         let _ = a.update(Msg::Fullscreen);
         assert!(main_of(&mut a).full_window, "a janela segue a tela cheia");
@@ -3454,6 +3469,9 @@ mod tests {
         let mut a = in_call(&["Ana"]);
         share(&mut a, ShareState::Failed);
         assert_eq!(call_of(&mut a).share, ShareState::Failed);
+        // "Tentar de novo" refaz o pedido sem passar pelo painel de qualidade.
+        let _ = a.update(Msg::ShareStart);
+        assert!(!call_of(&mut a).share_panel);
         let _ = a.update(Msg::ShareButton);
         assert_eq!(call_of(&mut a).share, ShareState::Off);
         assert!(call_of(&mut a).share_panel);
@@ -4071,6 +4089,8 @@ mod tests {
         let _ = a.update(Msg::ToggleDeafen);
         a.config.volumes.insert("Ana".into(), 40);
         print(&a, "palco-surdo-volume");
+        a.config.volumes.insert("Ana".into(), 100);
+        print(&a, "palco-volume-200");
 
         // Avisos da web: selo de quem não me ouve, gravação e conexão instável (no meu tile).
         let (mut a, id) = palco(4);
@@ -4206,6 +4226,21 @@ mod tests {
         let (mut a, _) = palco(4);
         share(&mut a, ShareState::Failed);
         print(&a, "tela-falha");
+
+        // Assistindo a transmissão da Carla: Tela cheia e mudo no canto, junto do Parar.
+        let (mut a, id) = palco(4);
+        let mut lista = call_of(&mut a).live.clone().unwrap();
+        lista
+            .iter_mut()
+            .find(|l| l.name == "Carla")
+            .unwrap()
+            .screen_share = true;
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(lista)));
+        let _ = a.update(Msg::Watch(Some("Carla__1".into())));
+        call_of(&mut a).screen = Some(alocada(640, 360));
+        print(&a, "tela-assistindo");
+        a.config.volumes.insert(Config::screen_key("Carla"), 0);
+        print(&a, "tela-assistindo-mudo");
 
         let mut a = voice_app();
         let _ = a.update(Msg::JoinChannel("call".into()));
