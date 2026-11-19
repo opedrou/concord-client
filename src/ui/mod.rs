@@ -2,6 +2,7 @@
 mod avatar;
 mod chat;
 mod drawn;
+mod members;
 mod people;
 mod screens;
 mod sidebar;
@@ -127,6 +128,8 @@ struct Main {
     user: User,
     channels: Vec<Channel>,
     presence: Presence,
+    /// Espelho de `Config::members_open`: as fotos só descem com a lista aberta.
+    members_open: bool,
     polling: bool,
     failures: u8,
     /// Username -> caminho do avatar.
@@ -169,6 +172,8 @@ struct Main {
     tray: bool,
     /// Quem tem conta no servidor, pra chamar pra call e pro `@` do chat.
     members: Vec<Member>,
+    /// Usernames online, do polling de presença. Quem está em voz conta de qualquer jeito.
+    online: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -200,7 +205,7 @@ pub enum Msg {
     Members(Result<Vec<Member>, Error>),
     Tick,
     PollIf(Option<bool>),
-    Presence(Result<Presence, Error>),
+    Presence(Result<(Presence, Vec<String>), Error>),
     Avatar(String, Option<(image::Handle, Color)>),
     ToggleMic,
     ToggleDeafen,
@@ -291,6 +296,7 @@ pub enum Msg {
     /// Sai do app: deixa a call e encerra o processo.
     Quit,
     DragStart,
+    ToggleMembers,
     DragMove(f32),
     DragEnd,
     OpenSettings(Tab),
@@ -619,6 +625,7 @@ impl App {
                     sidebar::view(m, &self.config),
                     sidebar::resize_handle(),
                     content,
+                    members::view(m),
                 ];
                 match m.settings {
                     _ if self.news => stack![base, screens::news()].into(),
@@ -999,6 +1006,22 @@ impl App {
             },
             Msg::WindowClosed(id) => self.window_closed(id),
             Msg::Show => self.show(),
+            Msg::ToggleMembers => {
+                self.config.members_open = !self.config.members_open;
+                // Precisa do estado novo, que `action` não vê.
+                let what = if self.config.members_open {
+                    "abriu"
+                } else {
+                    "fechou"
+                };
+                log!("ação: {what} a lista de membros");
+                self.persist();
+                let Screen::Main(m) = &mut self.screen else {
+                    return Task::none();
+                };
+                m.members_open = self.config.members_open;
+                m.fetch_avatars()
+            }
             Msg::DragStart => {
                 if let Screen::Main(m) = &mut self.screen {
                     m.resizing = true;
@@ -1806,6 +1829,7 @@ impl App {
             user,
             channels: Vec::new(),
             presence: Presence::new(),
+            members_open: self.config.members_open,
             polling: true,
             failures: 0,
             avatar_paths,
@@ -1832,6 +1856,7 @@ impl App {
             focused: self.window.is_some(),
             tray: false,
             members: Vec::new(),
+            online: HashSet::new(),
         };
         let avatars = main.fetch_avatars();
         let fresh = main.refresh();
@@ -1846,14 +1871,15 @@ impl App {
         ])
     }
 
-    fn presence(&mut self, result: Result<Presence, Error>) -> Task<Msg> {
+    fn presence(&mut self, result: Result<(Presence, Vec<String>), Error>) -> Task<Msg> {
         let Screen::Main(m) = &mut self.screen else {
             return Task::none();
         };
         m.polling = false;
         match result {
-            Ok(presence) => {
+            Ok((presence, online)) => {
                 m.presence = presence;
+                m.online = online.into_iter().collect();
                 m.failures = 0;
                 m.fetch_avatars()
             }
@@ -1999,7 +2025,8 @@ impl Main {
         }
     }
 
-    /// Só baixa quem aparece na tela: quem está em canal, no chat aberto, e a própria pessoa.
+    /// Só baixa quem aparece na tela: quem está em canal, no chat aberto, a própria pessoa e,
+    /// com a lista aberta, os membros.
     fn fetch_avatars(&mut self) -> Task<Msg> {
         let mut paths: Vec<String> = self
             .presence
@@ -2015,6 +2042,13 @@ impl Main {
                     .flat_map(|_| self.members.iter().map(|p| p.username.as_str())),
             )
             .chain([self.user.username.as_str()])
+            .chain(
+                self.members_open
+                    .then_some(&self.members)
+                    .into_iter()
+                    .flatten()
+                    .map(|p| p.username.as_str()),
+            )
             .filter_map(|name| self.avatar_paths.get(name))
             .filter(|path| !self.requested.contains(*path))
             .cloned()
@@ -2225,7 +2259,7 @@ mod tests {
     fn falha_de_presenca_mantem_a_lista_e_avisa_depois_de_tres() {
         let mut a = main_app();
         let lista = Presence::from([("call".to_owned(), vec![])]);
-        let _ = a.update(Msg::Presence(Ok(lista)));
+        let _ = a.update(Msg::Presence(Ok((lista, vec![]))));
         for _ in 0..FALHAS_ATE_AVISAR {
             let _ = a.update(Msg::PollIf(None));
             let _ = a.update(Msg::Presence(Err(Error::Offline)));
@@ -2233,14 +2267,14 @@ mod tests {
         let m = main_of(&mut a);
         assert!(m.presence.contains_key("call"));
         assert_eq!(m.failures, FALHAS_ATE_AVISAR);
-        let _ = a.update(Msg::Presence(Ok(Presence::new())));
+        let _ = a.update(Msg::Presence(Ok((Presence::new(), vec![]))));
         assert_eq!(main_of(&mut a).failures, 0);
     }
 
     #[test]
     fn presenca_para_com_janela_minimizada_e_nao_sobrepoe() {
         let mut a = main_app();
-        let _ = a.update(Msg::Presence(Ok(Presence::new())));
+        let _ = a.update(Msg::Presence(Ok((Presence::new(), vec![]))));
         let _ = a.update(Msg::PollIf(Some(true)));
         assert!(!main_of(&mut a).polling);
         let _ = a.update(Msg::PollIf(Some(false)));
@@ -2271,6 +2305,70 @@ mod tests {
             m.requested,
             HashSet::from(["/api/avatars/1?v=a".to_owned()])
         );
+        let _ = m.fetch_avatars();
+        assert_eq!(m.requested.len(), 1);
+    }
+
+    #[test]
+    fn botao_de_membros_alterna_e_grava() {
+        let mut a = main_app();
+        assert!(a.config.members_open);
+        let antes = saves();
+        let _ = a.update(Msg::ToggleMembers);
+        assert!(!a.config.members_open);
+        assert!(!main_of(&mut a).members_open);
+        assert_eq!(saves(), antes + 1);
+        let _ = a.update(Msg::ToggleMembers);
+        assert!(a.config.members_open);
+        assert!(main_of(&mut a).members_open);
+    }
+
+    #[test]
+    fn membros_agrupam_online_e_offline_em_ordem() {
+        let mut a = main_app();
+        let fala = |n: &str| Participant {
+            identity: format!("{n}__1"),
+            name: n.into(),
+            muted: false,
+            camera: false,
+            screen_share: false,
+        };
+        let membro = |n: &str| Member {
+            id: 0,
+            username: n.into(),
+            avatar_url: None,
+        };
+        let _ = a.update(Msg::Members(Ok(vec![
+            membro("zé"),
+            membro("Bruno"),
+            membro("ana"),
+        ])));
+        let Screen::Main(m) = &mut a.screen else {
+            panic!()
+        };
+        m.presence = Presence::from([("call".to_owned(), vec![fala("zé")])]);
+        m.online = HashSet::from(["Bruno".to_owned()]);
+        let (online, offline) = members::groups(m);
+        // O próprio usuário e quem está em voz contam como online.
+        assert_eq!(online, ["Bruno", "Opedro", "zé"]);
+        assert_eq!(offline, ["ana"]);
+    }
+
+    #[test]
+    fn avatar_de_membro_so_baixa_com_a_lista_aberta() {
+        let mut a = main_app();
+        let m = main_of(&mut a);
+        m.members = vec![Member {
+            id: 9,
+            username: "Ana".into(),
+            avatar_url: None,
+        }];
+        m.avatar_paths
+            .insert("Ana".into(), "/api/avatars/9?v=a".into());
+        m.members_open = false;
+        let _ = m.fetch_avatars();
+        assert!(m.requested.is_empty());
+        m.members_open = true;
         let _ = m.fetch_avatars();
         assert_eq!(m.requested.len(), 1);
     }
@@ -2611,7 +2709,7 @@ mod tests {
             "o processo segue logado"
         );
 
-        let _ = a.update(Msg::Presence(Ok(Presence::new())));
+        let _ = a.update(Msg::Presence(Ok((Presence::new(), vec![]))));
         assert!(!main_of(&mut a).polling);
         let _ = a.update(Msg::Show);
         assert!(a.window.is_some_and(|novo| novo != id));
@@ -3460,7 +3558,27 @@ mod tests {
                 pessoa("Ana", true, false, false),
             ],
         )]);
+        main_of(&mut a).members = [
+            "Ana",
+            "Bruno com nome bem comprido demais pra caber",
+            "Opedro",
+            "Zé da Silva",
+            "carlos",
+            "Dani",
+        ]
+        .iter()
+        .zip(1..)
+        .map(|(username, id)| Member {
+            id,
+            username: (*username).into(),
+            avatar_url: None,
+        })
+        .collect();
+        main_of(&mut a).online = HashSet::from(["carlos".to_owned()]);
         print(&a, "principal");
+        let _ = a.update(Msg::ToggleMembers);
+        print(&a, "principal-membros-fechada");
+        let _ = a.update(Msg::ToggleMembers);
         a.news = true;
         print(&a, "novidades");
         a.news = false;

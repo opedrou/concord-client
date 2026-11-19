@@ -215,12 +215,26 @@ impl fmt::Debug for ConnectionDetails {
 #[derive(Deserialize)]
 struct PresenceBody {
     channels: Vec<PresenceChannel>,
+    /// Servidor velho não manda: todo mundo fora de voz fica offline.
+    #[serde(default)]
+    online: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct PresenceChannel {
     slug: String,
     participants: Vec<Participant>,
+}
+
+impl PresenceBody {
+    fn split(self) -> (Presence, Vec<String>) {
+        let channels = self
+            .channels
+            .into_iter()
+            .map(|c| (c.slug, c.participants))
+            .collect();
+        (channels, self.online)
+    }
 }
 
 /// Slug do canal -> quem está nele.
@@ -365,13 +379,10 @@ impl Client {
         serde_json::from_slice(&bytes).map_err(|_| Error::NotConcord)
     }
 
-    pub async fn presence(&self) -> Result<Presence, Error> {
+    /// Quem está em cada canal de voz e os usernames online.
+    pub async fn presence(&self) -> Result<(Presence, Vec<String>), Error> {
         let body: PresenceBody = self.json("/api/channels/presence").await?;
-        Ok(body
-            .channels
-            .into_iter()
-            .map(|c| (c.slug, c.participants))
-            .collect())
+        Ok(body.split())
     }
 
     pub async fn members(&self) -> Result<Vec<Member>, Error> {
@@ -593,6 +604,21 @@ async fn read_limited(mut resp: Response, max: usize) -> Result<Vec<u8>, Error> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn presenca_le_online_e_servidor_velho_sem_o_campo() {
+        let com = r#"{"channels":[{"slug":"call","participants":[]}],"online":["Ana","Zé"]}"#;
+        let (canais, online) = serde_json::from_str::<super::PresenceBody>(com)
+            .unwrap()
+            .split();
+        assert!(canais.contains_key("call"));
+        assert_eq!(online, ["Ana", "Zé"]);
+        let velho = r#"{"channels":[]}"#;
+        let (_, online) = serde_json::from_str::<super::PresenceBody>(velho)
+            .unwrap()
+            .split();
+        assert!(online.is_empty());
+    }
+
     use super::*;
 
     #[test]

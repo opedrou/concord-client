@@ -51,14 +51,28 @@ fn initials(name: &str) -> String {
 }
 
 pub fn view<'a>(name: &str, photo: Option<&image::Handle>, size: f32) -> Element<'a, Msg> {
+    faded(name, photo, size, 1.0)
+}
+
+/// Como `view`, mais apagado com `alpha` menor que 1.
+pub fn faded<'a>(
+    name: &str,
+    photo: Option<&image::Handle>,
+    size: f32,
+    alpha: f32,
+) -> Element<'a, Msg> {
     if let Some(photo) = photo {
         return image(photo.clone())
             .width(size)
             .height(size)
             .border_radius(size / 2.0)
+            .opacity(alpha)
             .into();
     }
-    let color = color_for(name);
+    let color = Color {
+        a: alpha,
+        ..color_for(name)
+    };
     container(center(
         text(initials(name)).size(size * 0.4).font(theme::SEMIBOLD),
     ))
@@ -67,7 +81,10 @@ pub fn view<'a>(name: &str, photo: Option<&image::Handle>, size: f32) -> Element
     .style(move |_| container::Style {
         background: Some(color.into()),
         border: border::rounded(size / 2.0),
-        text_color: Some(theme::FG),
+        text_color: Some(Color {
+            a: alpha,
+            ..theme::FG
+        }),
         ..Default::default()
     })
     .into()

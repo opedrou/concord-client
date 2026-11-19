@@ -26,6 +26,8 @@ pub struct Config {
     /// Fixo por instalação: a identity na sala é `<username>__<install_id>`.
     pub install_id: String,
     pub sidebar_width: f32,
+    /// Lista de membros na lateral direita: aberta ou só o trilho.
+    pub members_open: bool,
     pub mic_muted: bool,
     pub deafened: bool,
     pub mic_before_deafen: bool,
@@ -62,6 +64,7 @@ impl Default for Config {
             server: None,
             install_id: Uuid::new_v4().to_string(),
             sidebar_width: SIDEBAR_PADRAO,
+            members_open: true,
             mic_muted: false,
             deafened: false,
             mic_before_deafen: false,
@@ -481,5 +484,6 @@ mod tests {
         let c: Config = serde_json::from_str(r#"{"server":"https://a.b"}"#).unwrap();
         assert_eq!(c.server.as_deref(), Some("https://a.b"));
         assert_eq!(c.sidebar_width, SIDEBAR_PADRAO);
+        assert!(c.members_open);
     }
 }

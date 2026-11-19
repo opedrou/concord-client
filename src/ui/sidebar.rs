@@ -33,6 +33,7 @@ pub const CHEVRON_UP: &[u8] = icon!("chevron-up");
 pub const MARK: &[u8] = icon!("mark");
 pub const DOWNLOAD: &[u8] = icon!("download");
 pub const USER_PLUS: &[u8] = icon!("user-plus");
+pub const USERS: &[u8] = icon!("users");
 
 pub fn icon<'a>(bytes: &'static [u8], size: f32, color: Color) -> Element<'a, Msg> {
     svg(svg::Handle::from_memory(bytes))
@@ -219,7 +220,7 @@ fn channel_row<'a>(
 }
 
 /// Nome longo corta na borda em vez de quebrar linha ou empurrar os ícones.
-fn one_line(content: &str, size: f32) -> text::Text<'_> {
+pub fn one_line(content: &str, size: f32) -> text::Text<'_> {
     text(content)
         .size(size)
         .wrapping(Wrapping::None)
