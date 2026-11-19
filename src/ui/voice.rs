@@ -59,6 +59,8 @@ pub struct ActiveCall {
     /// Separa esta call da anterior: eventos atrasados de quem saiu são ignorados.
     pub id: u64,
     pub slug: String,
+    /// Quando entrou, pro tempo de call da sidebar.
+    pub since: Instant,
     pub status: Status,
     /// `None` enquanto o motor de áudio ainda abre.
     pub call: Option<Call>,
@@ -144,6 +146,7 @@ impl ActiveCall {
         Self {
             id,
             slug,
+            since: Instant::now(),
             status: Status::Connecting,
             call: None,
             engine: None,

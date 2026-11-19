@@ -174,6 +174,8 @@ struct Main {
     members: Vec<Member>,
     /// Usernames online, do polling de presença. Quem está em voz conta de qualquer jeito.
     online: HashSet<String>,
+    /// Canal de texto -> menções ainda não vistas, na pílula da sidebar. Só na memória.
+    mentions: HashMap<i64, u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -214,6 +216,8 @@ pub enum Msg {
     CallEvent(u64, call::Event),
     /// Relógio do anel de fala.
     Frame(Instant),
+    /// Relógio de 1 s do tempo de call na sidebar: só pede um desenho novo.
+    CallClock,
     Leave,
     OpenVolume(String),
     CloseVolume,
@@ -585,6 +589,13 @@ impl App {
                 subs.push(time::every(QUADRO).map(Msg::Frame));
             }
             let shown = !self.minimized;
+            // O tempo de call só aparece na sidebar: sem janela, minimizada ou em tela cheia,
+            // não acorda a interface.
+            let sidebar =
+                shown && self.window.is_some() && m.call.as_ref().is_some_and(|c| !c.fullscreen());
+            if sidebar {
+                subs.push(time::every(Duration::from_secs(1)).map(|_| Msg::CallClock));
+            }
             if shown && m.call.as_ref().is_some_and(|c| c.watching.is_some()) {
                 subs.push(time::every(TELA).map(|_| Msg::ScreenTick));
             }
@@ -800,6 +811,7 @@ impl App {
                 }
                 Task::none()
             }
+            Msg::CallClock => Task::none(),
             Msg::Leave => {
                 self.leave_call();
                 Task::none()
@@ -1129,6 +1141,10 @@ impl App {
             Msg::Focus(focused) => {
                 if let Screen::Main(m) = &mut self.screen {
                     m.focused = focused;
+                    // O chat aberto, que estava sem foco, volta a ser visto.
+                    if focused && let Some(open) = &m.chat {
+                        m.mentions.remove(&open.channel);
+                    }
                 }
                 if let Some(call) = self.call_mut() {
                     call.set_focus(focused);
@@ -1310,7 +1326,7 @@ impl App {
             Live::Lost => return Task::none(),
             Live::Unauthorized => return self.session_expired(),
         };
-        let Screen::Main(m) = &self.screen else {
+        let Screen::Main(m) = &mut self.screen else {
             return Task::none();
         };
         let (kind, pending) = match &event {
@@ -1321,6 +1337,12 @@ impl App {
         let call = m.call.as_ref().map(|c| c.slug.as_str());
         let seen = self.window.is_some() && m.focused;
         let chat = m.chat.as_ref().filter(|_| seen).map(|c| c.channel);
+        // A pílula da sidebar conta o que a pessoa ainda não viu, mesmo sem mostrar o aviso.
+        if let NotifyEvent::Mention { channel_id, .. } = &event
+            && chat != Some(*channel_id)
+        {
+            *m.mentions.entry(*channel_id).or_default() += 1;
+        }
         if let Some(why) = crate::notify::skip(&event, call, chat) {
             log!("notificação: pulou {kind}, {why}");
             return Task::none();
@@ -1398,6 +1420,7 @@ impl App {
         };
         match msg {
             chat::Msg::Open => {
+                m.mentions.remove(&channel);
                 let text = |c: &&Channel| c.id == channel && c.kind == ChannelKind::Text;
                 let Some(c) = m.channels.iter().find(text) else {
                     return Task::none();
@@ -1880,6 +1903,7 @@ impl App {
             tray: false,
             members: Vec::new(),
             online: HashSet::new(),
+            mentions: HashMap::new(),
         };
         let avatars = main.fetch_avatars();
         let fresh = main.refresh();
@@ -2638,6 +2662,33 @@ mod tests {
         let _ = a.update(Msg::Focus(true));
         let _ = a.update(mencao(7));
         assert_eq!(chimes(), [Effect::Notify], "outro canal");
+    }
+
+    #[test]
+    fn pilula_conta_mencao_por_canal_e_zera_ao_abrir() {
+        let mut a = in_call(&["Ana"]);
+        let conta = |a: &mut App, id| main_of(a).mentions.get(&id).copied().unwrap_or(0);
+        let _ = a.update(mencao(1));
+        let _ = a.update(mencao(1));
+        let _ = a.update(mencao(7));
+        assert_eq!((conta(&mut a, 1), conta(&mut a, 7)), (2, 1));
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        assert_eq!(conta(&mut a, 1), 0, "abrir zera");
+        assert_eq!(conta(&mut a, 7), 1, "o outro fica");
+        // Aberto e com foco: já está vendo, não conta.
+        let _ = a.update(mencao(1));
+        assert_eq!(conta(&mut a, 1), 0);
+        // Aberto sem foco: conta, e voltar o foco zera.
+        let _ = a.update(Msg::Focus(false));
+        let _ = a.update(mencao(1));
+        assert_eq!(conta(&mut a, 1), 1);
+        let _ = a.update(Msg::Focus(true));
+        assert_eq!(conta(&mut a, 1), 0);
+        // Janela fechada em segundo plano: conta.
+        let _ = a.update(Msg::Chat(1, chat::Msg::Close));
+        a.window = None;
+        let _ = a.update(mencao(1));
+        assert_eq!(conta(&mut a, 1), 1);
     }
 
     #[test]
@@ -4037,5 +4088,37 @@ mod tests {
         let id = call_id(&mut a);
         let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::RoomClosed)));
         print(&a, "home-aviso");
+
+        // Sidebar com call e chat aberto: bloco "Em call", pílula de `@` e mudo por pessoa.
+        let (mut a, id) = palco(4);
+        call_of(&mut a).since -= Duration::from_secs(3600 + 7 * 60 + 9);
+        let _ = a.update(Msg::MutePerson("Carla".into()));
+        let m = main_of(&mut a);
+        m.channels
+            .push(canal(4, "memes e piadas", ChannelKind::Text));
+        m.mentions.insert(4, 3);
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        print(&a, "sidebar-call-chat");
+        a.config.sidebar_width = SIDEBAR_MIN;
+        main_of(&mut a).mentions.insert(4, 120);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Reconnecting { attempt: 1 }));
+        print(&a, "sidebar-call-reconectando-estreita");
+        // Mouse na linha da Ana: aparece o botão de mudo.
+        a.config.sidebar_width = 288.0;
+        let settings = iced::Settings {
+            fonts: theme::FONTS.map(Into::into).to_vec(),
+            default_font: theme::BODY,
+            ..iced::Settings::default()
+        };
+        let mut ui = Simulator::with_size(settings, Size::new(1200.0, 760.0), a.view());
+        let ponto = iced::Point::new(150.0, 281.0);
+        ui.point_at(ponto);
+        let _ = ui.simulate([Event::Mouse(mouse::Event::CursorMoved { position: ponto })]);
+        let print = ui.snapshot(&a.theme()).unwrap();
+        assert!(
+            print
+                .matches_image("snapshots/sidebar-hover-mudo.png")
+                .unwrap()
+        );
     }
 }

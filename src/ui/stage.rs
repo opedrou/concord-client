@@ -384,7 +384,7 @@ fn tile<'a>(
 
 /// Botão de mudo de uma pessoa (ou da transmissão dela), só pra mim: zera o volume ou
 /// volta no de antes.
-fn mute_button(name: &str, silenced: bool) -> Element<'_, Msg> {
+pub(super) fn mute_button(name: &str, silenced: bool) -> Element<'_, Msg> {
     let (glyph, color, tip) = if silenced {
         (VOLUME_X, DANGER, "Voltar a ouvir")
     } else {
