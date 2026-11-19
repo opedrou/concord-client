@@ -31,6 +31,8 @@ use super::{Main, Msg as App, avatar};
 use crate::api::{Attachment, Channel, Client, Error, Kind, Member, Message, Page, Uploaded, User};
 use crate::chat::{self as logic, Live, Timeline, Window};
 
+const CLIP: &[u8] = include_bytes!("../../assets/icons/paperclip.svg");
+const TRASH: &[u8] = include_bytes!("../../assets/icons/trash.svg");
 const LISTA: &str = "chat-lista";
 const COMPOSER: &str = "chat-composer";
 const ROSTO: f32 = 40.0;
@@ -968,7 +970,11 @@ fn delete_actions<'a>(channel: i64, id: i64, confirming: bool) -> Element<'a, Ap
             .on_press(App::Chat(channel, msg))
     };
     if !confirming {
-        return small("Apagar", delete_style, Msg::AskDelete(id)).into();
+        let trash = button(container(icon(TRASH, 16.0, FG3)).center(26))
+            .padding(0)
+            .style(delete_style)
+            .on_press(App::Chat(channel, Msg::AskDelete(id)));
+        return tipped(trash.into(), "Apagar mensagem");
     }
     row![
         text("Apagar a mensagem?").size(12.5).color(FG2),
@@ -1073,10 +1079,12 @@ fn composer<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
     let attached = matches!(chat.upload, Upload::Ready(_));
     let typed = !chat.draft.text().trim().is_empty();
     let ready = !chat.sending && (idle || attached) && (typed || attached);
-    let attach = button(text("Anexar").size(14))
-        .padding([8, 10])
+    let enabled = idle && !chat.sending;
+    let attach = button(container(icon(CLIP, 20.0, if enabled { FG2 } else { FG3 })).center(34))
+        .padding(0)
         .style(theme::ghost)
-        .on_press_maybe((idle && !chat.sending).then_some(App::Chat(channel, Msg::Attach)));
+        .on_press_maybe(enabled.then_some(App::Chat(channel, Msg::Attach)));
+    let attach = tipped(attach.into(), "Anexar arquivo");
     let send = button(
         text(if chat.sending {
             "Enviando…"
@@ -1950,6 +1958,28 @@ mod tests {
         };
         let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
         print(&a, "links");
+
+        // Datas relativas no cabeçalho, e a lixeira na mensagem sob o mouse.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let agora = chrono::Utc::now().timestamp_millis();
+        let em = |id, autor, atras_ms, texto| Message {
+            created_at: agora - atras_ms,
+            ..msg(id, autor, 0, texto)
+        };
+        let dia = 24 * 3_600_000;
+        let lista = vec![
+            em(1, "Ana", 5 * dia, "faz uns dias"),
+            em(2, "Bruno", dia, "ontem a gente falou disso"),
+            em(3, "Opedro", 0, "e agora é hoje"),
+        ];
+        let page = Page {
+            messages: lista,
+            has_more: false,
+        };
+        let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
+        let _ = a.update(App::Chat(1, Msg::Hover(3, true)));
+        print(&a, "datas");
         print_largura(&a, "links-estreito", 900.0);
     }
 
