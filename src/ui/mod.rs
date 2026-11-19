@@ -309,6 +309,8 @@ pub enum Msg {
     FocusNext,
     FocusPrevious,
     Escape,
+    /// Tecla F: alterna a tela cheia da transmissão assistida.
+    ToggleFullscreen,
     /// Canal de texto, pelo id: respostas de outro canal caem fora.
     Chat(i64, chat::Msg),
     /// Tempo real das notificações: chamado pra call e `@`.
@@ -354,6 +356,7 @@ fn action(msg: &Msg) -> Option<String> {
         Msg::Watch(Some(who)) => format!("clicou em Assistir {who}"),
         Msg::Watch(None) => "parou de assistir".into(),
         Msg::Fullscreen => "pôs a transmissão em tela cheia".into(),
+        Msg::ToggleFullscreen => "apertou F".into(),
         Msg::FocusScreen => "clicou na transmissão".into(),
         Msg::Focus(b) => on(*b, "janela ganhou o foco", "janela perdeu o foco"),
         Msg::RestartForUpdate => "clicou pra abrir a versão nova".into(),
@@ -772,6 +775,10 @@ impl App {
                 }
                 Task::none()
             }
+            // Os atalhos chegam de qualquer tela: só valem logado.
+            Msg::ToggleMic | Msg::ToggleDeafen if !matches!(self.screen, Screen::Main(_)) => {
+                Task::none()
+            }
             Msg::ToggleMic => {
                 self.config.toggle_mic();
                 self.persist();
@@ -1146,6 +1153,20 @@ impl App {
                 if let Some(call) = self.call_mut().filter(|c| c.watching.is_some()) {
                     call.view = voice::View::Full;
                     call.volume_panel = None;
+                }
+                Task::none()
+            }
+            Msg::ToggleFullscreen => {
+                // Com configurações ou novidades por cima, a tecla não é do palco.
+                let covered =
+                    self.news || matches!(&self.screen, Screen::Main(m) if m.settings.is_some());
+                if let Some(call) = self.call_mut().filter(|c| c.watching.is_some() && !covered) {
+                    if call.fullscreen() {
+                        call.view = voice::View::Focus;
+                    } else {
+                        call.view = voice::View::Full;
+                        call.volume_panel = None;
+                    }
                 }
                 Task::none()
             }
@@ -2093,13 +2114,31 @@ impl Main {
 }
 
 fn keys(event: keyboard::Event) -> Option<Msg> {
-    let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+    let keyboard::Event::KeyPressed {
+        key,
+        modifiers,
+        repeat,
+        ..
+    } = event
+    else {
         return None;
     };
-    match key {
+    // O `keyboard::listen` só entrega o que nenhum widget capturou: o F digitado num campo
+    // ou no chat não chega aqui. Segurar a tecla não repete o atalho.
+    match key.as_ref() {
         Key::Named(Named::Tab) if modifiers.shift() => Some(Msg::FocusPrevious),
         Key::Named(Named::Tab) => Some(Msg::FocusNext),
         Key::Named(Named::Escape) => Some(Msg::Escape),
+        Key::Character(c) if modifiers.control() && modifiers.shift() && !repeat => {
+            match c.to_lowercase().as_str() {
+                "m" => Some(Msg::ToggleMic),
+                "d" => Some(Msg::ToggleDeafen),
+                _ => None,
+            }
+        }
+        Key::Character(c) if modifiers.is_empty() && !repeat && c.eq_ignore_ascii_case("f") => {
+            Some(Msg::ToggleFullscreen)
+        }
         _ => None,
     }
 }
@@ -2475,6 +2514,92 @@ mod tests {
         assert_eq!(a.config.greeted_on.as_deref(), Some(hoje.as_str()));
         let _ = a.update(Msg::Channels(Ok(Vec::new())));
         assert!(chimes().is_empty());
+    }
+
+    fn tecla(key: &str, modifiers: keyboard::Modifiers, repeat: bool) -> Option<Msg> {
+        let key = Key::Character(key.into());
+        keys(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat,
+        })
+    }
+
+    #[test]
+    fn atalhos_de_teclado() {
+        use keyboard::Modifiers as M;
+        let ctrl_shift = M::CTRL | M::SHIFT;
+        assert!(matches!(
+            tecla("m", ctrl_shift, false),
+            Some(Msg::ToggleMic)
+        ));
+        assert!(matches!(
+            tecla("D", ctrl_shift, false),
+            Some(Msg::ToggleDeafen)
+        ));
+        assert!(matches!(
+            tecla("f", M::empty(), false),
+            Some(Msg::ToggleFullscreen)
+        ));
+        assert!(tecla("m", M::CTRL, false).is_none(), "falta o Shift");
+        assert!(tecla("f", M::CTRL, false).is_none(), "F com modificador");
+        assert!(tecla("m", M::empty(), false).is_none(), "M solto");
+        assert!(tecla("m", ctrl_shift, true).is_none(), "tecla segurada");
+        assert!(tecla("f", M::empty(), true).is_none(), "tecla segurada");
+    }
+
+    #[test]
+    fn f_alterna_a_tela_cheia_so_com_transmissao_assistida() {
+        let mut a = in_call(&["Ana"]);
+        let _ = a.update(Msg::ToggleFullscreen);
+        assert_eq!(call_of(&mut a).view, voice::View::Tile, "sem assistir");
+        call_of(&mut a).watching = Some("Ana__1".into());
+        let _ = a.update(Msg::ToggleFullscreen);
+        assert!(call_of(&mut a).fullscreen());
+        let _ = a.update(Msg::ToggleFullscreen);
+        assert_eq!(call_of(&mut a).view, voice::View::Focus);
+        // Configurações por cima: a tecla não mexe no palco.
+        main_of(&mut a).settings = Some(Tab::About);
+        let _ = a.update(Msg::ToggleFullscreen);
+        assert_eq!(call_of(&mut a).view, voice::View::Focus);
+    }
+
+    #[test]
+    fn atalho_de_mic_e_fone_so_logado() {
+        let mut a = app(login());
+        let _ = a.update(Msg::ToggleMic);
+        let _ = a.update(Msg::ToggleDeafen);
+        assert!(!a.config.mic_muted && !a.config.deafened);
+        let mut a = main_app();
+        let _ = a.update(Msg::ToggleMic);
+        assert!(a.config.mic_muted);
+    }
+
+    /// O F digitado no chat é do editor: o iced marca o evento como capturado e o
+    /// `keyboard::listen` não entrega. Sem foco no campo, o evento passa.
+    #[test]
+    fn f_digitado_no_chat_nao_chega_no_atalho() {
+        use iced::{Point, Settings, Size};
+        use iced_test::simulator::{Simulator, click};
+
+        let mut a = voice_app();
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        let settings = Settings {
+            fonts: theme::FONTS.map(Into::into).to_vec(),
+            default_font: theme::BODY,
+            ..Settings::default()
+        };
+        let mut ui = Simulator::with_size(settings, Size::new(1200.0, 760.0), a.view());
+        assert_eq!(ui.typewrite("f"), event::Status::Ignored, "campo sem foco");
+        ui.point_at(Point::new(700.0, 725.0));
+        let _ = ui.simulate(click());
+        assert_eq!(ui.typewrite("f"), event::Status::Captured, "campo com foco");
     }
 
     fn chamado(channel: &str) -> Msg {

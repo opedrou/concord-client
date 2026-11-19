@@ -310,9 +310,9 @@ fn footer<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
             config.mic_muted,
             Msg::ToggleMic,
             if config.mic_muted {
-                "Ligar o microfone"
+                "Ligar o microfone (Ctrl+Shift+M)"
             } else {
-                "Desligar o microfone"
+                "Desligar o microfone (Ctrl+Shift+M)"
             },
         ),
         icon_button(
@@ -324,9 +324,9 @@ fn footer<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
             config.deafened,
             Msg::ToggleDeafen,
             if config.deafened {
-                "Voltar a ouvir"
+                "Voltar a ouvir (Ctrl+Shift+D)"
             } else {
-                "Parar de ouvir"
+                "Parar de ouvir (Ctrl+Shift+D)"
             },
         ),
         icon_button(

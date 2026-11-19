@@ -521,9 +521,9 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
         config.mic_muted,
         Msg::ToggleMic,
         if config.mic_muted {
-            "Ligar o microfone"
+            "Ligar o microfone (Ctrl+Shift+M)"
         } else {
-            "Desligar o microfone"
+            "Desligar o microfone (Ctrl+Shift+M)"
         },
     );
     let ears = square(
@@ -535,9 +535,9 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
         config.deafened,
         Msg::ToggleDeafen,
         if config.deafened {
-            "Voltar a ouvir"
+            "Voltar a ouvir (Ctrl+Shift+D)"
         } else {
-            "Parar de ouvir"
+            "Parar de ouvir (Ctrl+Shift+D)"
         },
     );
     let on_air = matches!(call.share, State::Choosing | State::Live);
