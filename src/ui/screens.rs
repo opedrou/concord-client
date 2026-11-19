@@ -8,12 +8,13 @@ use iced::{Alignment, Color, Element, Length, Theme};
 use super::sidebar::{CLOSE, icon, mark};
 use super::theme::{self, BG, DANGER, FG, FG2, FG3, GREEN, IDLE};
 use super::voice::Probe;
-use super::{ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avatar};
+use super::{Control, ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avatar};
 use crate::api::Secret;
 use crate::audio::{
-    GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_MAX_DB, MANUAL_MIN_DB, MicGain, NoiseLevel, Sensitivity,
+    self, GAIN_DEFAULT_DB, GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_DEFAULT_DB, MANUAL_MAX_DB,
+    MANUAL_MIN_DB, MicGain, NoiseLevel, Sensitivity,
 };
-use crate::config::Config;
+use crate::config::{Config, VOLUME_PADRAO};
 use crate::update::Check;
 
 /// Primeira opção das listas de dispositivo: `None` na config.
@@ -301,11 +302,41 @@ fn action<'a>(
         .into()
 }
 
+/// Sair e Trocar servidor: o primeiro clique só pergunta, como o apagar mensagem do chat.
+fn confirmed<'a>(
+    m: &Main,
+    (label, question, yes): (&'a str, &str, &'a str),
+    msg: Msg,
+    style: fn(&Theme, button::Status) -> button::Style,
+) -> Element<'a, Msg> {
+    if !m.confirm {
+        return action(label, Msg::Confirm(true), style);
+    }
+    let call = if m.call.is_some() {
+        " Você sai da call."
+    } else {
+        ""
+    };
+    row![
+        text(format!("{question}{call}")).size(14).color(FG2),
+        action(yes, msg, style),
+        action("Cancelar", Msg::Confirm(false), theme::ghost),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 fn server_panel(m: &Main) -> Element<'_, Msg> {
     column![
         title("Servidor"),
         labeled("Endereço", text(&m.server).size(15).color(FG)),
-        action("Trocar servidor", Msg::ChangeServer, theme::outline),
+        confirmed(
+            m,
+            ("Trocar servidor", "Trocar de servidor?", "Trocar"),
+            Msg::ChangeServer,
+            theme::outline
+        ),
     ]
     .spacing(16)
     .into()
@@ -331,17 +362,24 @@ fn account_panel(m: &Main) -> Element<'_, Msg> {
                 .align_y(Alignment::Center),
         )
         .push(vault_warning)
-        .push(action("Sair", Msg::Logout, theme::danger))
+        .push(confirmed(
+            m,
+            ("Sair", "Sair da conta?", "Sair"),
+            Msg::Logout,
+            theme::danger,
+        ))
         .spacing(16)
         .into()
 }
 
-/// Opções de um dispositivo: "Padrão do sistema" e depois a lista do sistema.
+/// Opções de um dispositivo: "Padrão do sistema" e depois a lista do sistema. Com `test`,
+/// um botão "Testar" do lado.
 fn device_field<'a>(
     label: &'a str,
     names: &[String],
     selected: &Option<String>,
     msg: fn(Option<String>) -> Msg,
+    test: Option<Msg>,
 ) -> Element<'a, Msg> {
     let options: Vec<String> = [PADRAO.to_owned()]
         .into_iter()
@@ -356,7 +394,37 @@ fn device_field<'a>(
     .text_size(14.4)
     .style(theme::pick)
     .menu_style(theme::pick_menu);
-    labeled(label, list)
+    let test = test.map(|msg| action("Testar", msg, theme::outline));
+    labeled(
+        label,
+        row![list].push(test).spacing(8).align_y(Alignment::Center),
+    )
+}
+
+/// Volume geral em %, pela curva do motor. Trunca: a posição padrão dá 100,8% e mostra 100%.
+fn percent(slider: u8) -> u32 {
+    (audio::gain(slider) * 100.0 + 0.001) as u32
+}
+
+/// Valor de um slider e o botão que volta ele ao padrão, parado quando já está nele.
+fn value_line<'a>(
+    help: Option<&'a str>,
+    value: String,
+    at_default: bool,
+    control: Control,
+) -> Element<'a, Msg> {
+    let reset = button(text("Padrão").size(12.5))
+        .padding([2, 8])
+        .style(theme::ghost)
+        .on_press_maybe((!at_default).then_some(Msg::Restore(control)));
+    Row::new()
+        .push(help.map(|h| text(h).size(13).color(FG2)))
+        .push(space::horizontal())
+        .push(text(value).size(13).font(theme::MEDIUM))
+        .push(reset)
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -384,23 +452,54 @@ fn voice_panel<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
     .text_size(14.4)
     .style(theme::pick)
     .menu_style(theme::pick_menu);
-    let master = slider(0..=100u8, config.master_volume, Msg::Master)
-        .on_release(Msg::VolumeDone)
-        .width(Length::Fill);
+    let master = column![
+        slider(0..=100u8, config.master_volume, Msg::Master)
+            .on_release(Msg::VolumeDone)
+            .width(Length::Fill),
+        value_line(
+            None,
+            format!("{}%", percent(config.master_volume)),
+            config.master_volume == VOLUME_PADRAO,
+            Control::Master,
+        ),
+    ]
+    .spacing(2);
+    // Só sem call: o motor de teste é quem leva o mic pra saída.
+    let monitor = (m.call.is_none() && !matches!(m.probe, Probe::Failed)).then(|| {
+        column![
+            toggler(m.monitor)
+                .label("Ouvir minha voz")
+                .on_toggle(Msg::Monitor)
+                .size(20)
+                .text_size(14.4),
+            text("Use fone pra não dar microfonia. Sua voz volta meio segundo depois.")
+                .size(13)
+                .color(FG2),
+        ]
+        .spacing(8)
+    });
     column![
         title("Voz"),
-        device_field("Microfone", &devices.inputs, &config.input, Msg::Input),
+        device_field(
+            "Microfone",
+            &devices.inputs,
+            &config.input,
+            Msg::Input,
+            None
+        ),
         device_field(
             "Saída de áudio",
             &devices.outputs,
             &config.output,
-            Msg::Output
+            Msg::Output,
+            Some(Msg::TestOutput),
         ),
         labeled("Redução de ruído", noise),
         sensitivity(m, config),
         mic_gain(config),
-        labeled("Volume geral", master),
     ]
+    .push(monitor)
+    .push(labeled("Volume geral", master))
     .spacing(14)
     .into()
 }
@@ -486,13 +585,12 @@ fn sensitivity<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
                     .style(theme::threshold);
                 column![
                     stack![bar, marker],
-                    row![
-                        text("O microfone abre quando o nível passa da marca.")
-                            .size(13)
-                            .color(FG2),
-                        space::horizontal(),
-                        text(format!("{db:.0} dB")).size(13).font(theme::MEDIUM),
-                    ],
+                    value_line(
+                        Some("O microfone abre quando o nível passa da marca."),
+                        format!("{db:.0} dB"),
+                        db == MANUAL_DEFAULT_DB,
+                        Control::Threshold,
+                    ),
                 ]
                 .spacing(2)
                 .into()
@@ -519,13 +617,12 @@ fn mic_gain(config: &Config) -> Element<'_, Msg> {
                 .step(1.0f32)
                 .on_release(Msg::VolumeDone)
                 .width(Length::Fill),
-            row![
-                text("A barra da sensibilidade já mostra o efeito.")
-                    .size(13)
-                    .color(FG2),
-                space::horizontal(),
-                text(format!("{db:+.0} dB")).size(13).font(theme::MEDIUM),
-            ],
+            value_line(
+                Some("A barra da sensibilidade já mostra o efeito."),
+                format!("{db:+.0} dB"),
+                db == GAIN_DEFAULT_DB,
+                Control::Gain,
+            ),
         ]
         .spacing(2)
         .into(),
@@ -589,4 +686,19 @@ fn about_panel(m: &Main) -> Element<'_, Msg> {
     ]
     .spacing(12)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_geral_em_porcentagem_pela_curva() {
+        assert_eq!(percent(VOLUME_PADRAO), 100);
+        assert_eq!(
+            [0, 30, 50, 100].map(percent),
+            [0, 18, 50, 200],
+            "2·x², sem perder 1% no arredondamento"
+        );
+    }
 }

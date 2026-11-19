@@ -1306,3 +1306,133 @@ fn bancada_ganho() {
         );
     }
 }
+
+/// Energia (soma dos quadrados) de cada bloco de 10 ms que chega numa fonte, com a hora.
+type Blocos = Arc<Mutex<Vec<(Instant, f64)>>>;
+
+fn grava(source: &str) -> (Killed, Blocos) {
+    let mut child = Command::new("parec")
+        .args(["-d", source, "--format=s16le", "--rate=48000"])
+        .args(["--channels=1", "--raw", "--latency-msec=10"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("parec");
+    let mut stdout = child.stdout.take().unwrap();
+    let blocos = Blocos::default();
+    let saida = blocos.clone();
+    thread::spawn(move || {
+        let mut bytes = [0u8; FRAME * 2];
+        while stdout.read_exact(&mut bytes).is_ok() {
+            let soma = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| f64::from(i16::from_le_bytes(b)).powi(2))
+                .sum();
+            saida.lock().unwrap().push((Instant::now(), soma));
+        }
+    });
+    (Killed(child), blocos)
+}
+
+/// Depois de `t0`: quando o nível passou de -40 dBFS, o maior RMS de bloco e a energia toda.
+fn depois(blocos: &Blocos, t0: Instant) -> (Option<Instant>, f64, f64) {
+    let rms = |soma: f64| (soma / FRAME as f64).sqrt() / 32768.0;
+    let blocos = blocos.lock().unwrap();
+    let novos = blocos.iter().filter(|(t, _)| *t >= t0);
+    let inicio = novos.clone().find(|(_, s)| rms(*s) > 0.01).map(|(t, _)| *t);
+    let pico = novos.clone().map(|(_, s)| rms(*s)).fold(0.0, f64::max);
+    (inicio, pico, novos.map(|(_, s)| s).sum())
+}
+
+/// "Ouvir minha voz": o mic volta no fone uns 500 ms depois, no nível em que entrou, e só
+/// com o retorno ligado. E a confirmação do mic e do fone toca surda, onde o som de entrada
+/// some.
+#[test]
+#[ignore = "precisa do PipeWire próprio: src/audio/bancada.sh"]
+fn bancada_retorno() {
+    let raiz = std::env::var("BANCADA_RAIZ").expect("rode por src/audio/bancada.sh");
+    let mut rig = Rig::new();
+    // Sem o caminho fone -> sala: o mic ouve só o tom, nunca o próprio retorno.
+    let loopback = rig.0[2].clone();
+    rig.unload(&loopback);
+    let tom = format!("{raiz}/tom.wav");
+    // 300 ms de 1 kHz a -20 dBFS de pico.
+    let pcm: Vec<f32> = (0..RATE as usize * 3 / 10)
+        .map(|i| 0.1 * (std::f32::consts::TAU * 1000.0 * i as f32 / RATE as f32).sin())
+        .collect();
+    write_wav(&tom, &pcm);
+    let mut p = prefs(NoiseLevel::Off);
+    (p.sensitivity, p.mic_gain) = (Sensitivity::Manual(MANUAL_MIN_DB), MicGain::Manual(0.0));
+    let (engine, _mic) = Engine::start(p).expect("start");
+    let (_m, no_mic) = grava("bancada_mic");
+    let (_f, no_fone) = grava("bancada_fone.monitor");
+    thread::sleep(Duration::from_millis(500));
+    let toca = || {
+        let t0 = Instant::now();
+        let ok = Command::new("paplay")
+            .args(["--device=bancada_sala", &tom])
+            .status()
+            .expect("paplay");
+        assert!(ok.success());
+        thread::sleep(Duration::from_millis(1200));
+        (depois(&no_mic, t0), depois(&no_fone, t0))
+    };
+
+    let (mic, fone) = toca();
+    println!(
+        "BANCADA retorno desligado: mic pico {:.4}, fone pico {:.5}",
+        mic.1, fone.1
+    );
+    assert!(mic.0.is_some(), "o tom não chegou no mic");
+    assert!(fone.1 < 0.001, "sem retorno, nada no fone");
+
+    engine.set_monitor(true);
+    thread::sleep(Duration::from_millis(300));
+    let (mic, fone) = toca();
+    let links = Command::new("pw-link").arg("-l").output().expect("pw-link");
+    let links = String::from_utf8_lossy(&links.stdout).into_owned();
+    let atraso = fone.0.expect("o retorno não chegou no fone") - mic.0.expect("mic");
+    let nivel = 20.0 * (fone.1 / mic.1).log10();
+    println!(
+        "BANCADA retorno ligado: atraso {atraso:?}, mic pico {:.4}, fone pico {:.4} \
+         ({nivel:+.2} dB)\n{links}",
+        mic.1, fone.1
+    );
+    assert!(
+        (Duration::from_millis(450)..Duration::from_millis(800)).contains(&atraso),
+        "{atraso:?}"
+    );
+    assert!(nivel.abs() < 2.0, "{nivel:.2} dB");
+
+    engine.set_monitor(false);
+    thread::sleep(Duration::from_millis(800));
+    let (_, fone) = toca();
+    println!("BANCADA retorno desligado de novo: fone pico {:.5}", fone.1);
+    assert!(fone.1 < 0.001, "desligar tira o retorno");
+
+    // Surdo: o som de entrada some, a confirmação toca inteira.
+    let esperada: f64 = Effect::Off
+        .pcm()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| (f64::from(i16::from_le_bytes(b)) * 0.6).powi(2))
+        .sum();
+    engine.set_deafened(true);
+    let t0 = Instant::now();
+    engine.play(Effect::Join);
+    thread::sleep(Duration::from_millis(1500));
+    let (_, pico_entrada, _) = depois(&no_fone, t0);
+    let t0 = Instant::now();
+    engine.play(Effect::Off);
+    thread::sleep(Duration::from_millis(600));
+    let (_, pico, energia) = depois(&no_fone, t0);
+    let razao = 10.0 * (energia / esperada).log10();
+    println!(
+        "BANCADA surdo: entrada pico {pico_entrada:.5}; confirmação pico {pico:.4}, \
+         {razao:+.2} dB da energia do som"
+    );
+    assert!(pico_entrada < 0.001, "surdo não ouve a entrada");
+    assert!(razao.abs() < 1.0, "{razao:.2} dB");
+}

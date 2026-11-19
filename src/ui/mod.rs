@@ -24,9 +24,12 @@ use crate::api::{
     self, AddressError, Channel, ChannelKind, Client, Error, Member, NotifyEvent, Presence, Secret,
     User,
 };
-use crate::audio::{self, Devices, Effect, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
+use crate::audio::{
+    self, Devices, Effect, Engine, GAIN_DEFAULT_DB, MANUAL_DEFAULT_DB, MANUAL_MIN_DB, Meter,
+    NoiseLevel,
+};
 use crate::call::{self, Call, End};
-use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
+use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN, VOLUME_PADRAO};
 use crate::health::{self, Beat};
 use crate::session;
 use crate::share::{Quality, Source, Thumb};
@@ -153,6 +156,10 @@ struct Main {
     /// Motor de teste da aba Voz; só existe sem call.
     probe: Probe,
     next_probe: u64,
+    /// "Ouvir minha voz" ligado: vale pro motor de teste e cai junto com ele.
+    monitor: bool,
+    /// Sair ou Trocar servidor das configurações clicado uma vez, esperando a confirmação.
+    confirm: bool,
     /// Última leitura do mic, em dBFS, e se o limitador está aberto.
     level: f32,
     open: bool,
@@ -183,6 +190,14 @@ struct Main {
     online: HashSet<String>,
     /// Canal de texto -> menções ainda não vistas, na pílula da sidebar. Só na memória.
     mentions: HashMap<i64, u32>,
+}
+
+/// Slider da aba Voz com botão "Padrão".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Control {
+    Master,
+    Threshold,
+    Gain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -299,6 +314,14 @@ pub enum Msg {
     Gain(f32),
     /// Relógio do medidor de entrada.
     MeterTick,
+    /// "Testar" da saída: toca o som de entrada nela.
+    TestOutput,
+    /// Interruptor "Ouvir minha voz".
+    Monitor(bool),
+    /// Volta um slider da aba Voz ao padrão e grava.
+    Restore(Control),
+    /// Primeiro clique no Sair ou no Trocar servidor das configurações; `false` cancela.
+    Confirm(bool),
     ProbeStarted(u64, Result<Boot, String>),
     Devices(Devices),
     CloseRequested(window::Id),
@@ -391,6 +414,9 @@ fn action(msg: &Msg) -> Option<String> {
             "ligou o ganho automático",
             "desligou o ganho automático",
         ),
+        Msg::TestOutput => "testou a saída".into(),
+        Msg::Monitor(b) => on(*b, "ligou ouvir minha voz", "desligou ouvir minha voz"),
+        Msg::Restore(c) => format!("voltou {c:?} ao padrão"),
         Msg::OpenSettings(tab) => format!("abriu as configurações em {tab:?}"),
         Msg::CloseSettings => "fechou as configurações".into(),
         Msg::CloseNews => "fechou as novidades da versão".into(),
@@ -827,12 +853,22 @@ impl App {
                 self.config.toggle_mic();
                 self.persist();
                 self.apply_mute();
+                self.chime(if self.config.mic_muted {
+                    Effect::Off
+                } else {
+                    Effect::On
+                });
                 Task::none()
             }
             Msg::ToggleDeafen => {
                 self.config.toggle_deafen();
                 self.persist();
                 self.apply_mute();
+                self.chime(if self.config.deafened {
+                    Effect::Off
+                } else {
+                    Effect::On
+                });
                 Task::none()
             }
             Msg::JoinChannel(slug) => self.join_channel(slug),
@@ -1020,6 +1056,37 @@ impl App {
                 }
                 Task::none()
             }
+            Msg::TestOutput => {
+                self.chime(Effect::Join);
+                Task::none()
+            }
+            // Clicado com o motor ainda abrindo: liga quando ele abrir.
+            Msg::Monitor(on) => {
+                if let Screen::Main(m) = &mut self.screen
+                    && m.call.is_none()
+                {
+                    m.monitor = on;
+                    if let Probe::On(engine, _) = &m.probe {
+                        engine.set_monitor(on);
+                    }
+                }
+                Task::none()
+            }
+            Msg::Restore(control) => {
+                let task = self.handle(match control {
+                    Control::Master => Msg::Master(VOLUME_PADRAO),
+                    Control::Threshold => Msg::Threshold(MANUAL_DEFAULT_DB),
+                    Control::Gain => Msg::Gain(GAIN_DEFAULT_DB),
+                });
+                self.persist();
+                task
+            }
+            Msg::Confirm(ask) => {
+                if let Screen::Main(m) = &mut self.screen {
+                    m.confirm = ask;
+                }
+                Task::none()
+            }
             Msg::ProbeStarted(id, result) => {
                 if let Screen::Main(m) = &mut self.screen
                     && matches!(m.probe, Probe::Opening(open) if open == id)
@@ -1027,6 +1094,9 @@ impl App {
                     // Sem MicFrames, os blocos do mic só são descartados pelo motor.
                     m.probe = match result.ok().and_then(|boot| boot.take()) {
                         Some((engine, _frames)) => {
+                            if m.monitor {
+                                engine.set_monitor(true);
+                            }
                             let meter = engine.meter();
                             Probe::On(engine, meter)
                         }
@@ -1096,6 +1166,7 @@ impl App {
             Msg::OpenSettings(tab) => {
                 if let Screen::Main(m) = &mut self.screen {
                     m.settings = Some(tab);
+                    m.confirm = false;
                 }
                 if tab != Tab::Voice {
                     self.stop_probe();
@@ -1571,6 +1642,7 @@ impl App {
     fn close_settings(&mut self) {
         if let Screen::Main(m) = &mut self.screen {
             m.settings = None;
+            m.confirm = false;
         }
         self.stop_probe();
     }
@@ -1980,6 +2052,8 @@ impl App {
             devices: None,
             probe: Probe::Off,
             next_probe: 0,
+            monitor: false,
+            confirm: false,
             level: MANUAL_MIN_DB,
             open: false,
             closing: None,
@@ -2152,6 +2226,7 @@ impl Main {
 
     fn stop_probe(&mut self) {
         self.probe = Probe::Off;
+        self.monitor = false;
         self.level = MANUAL_MIN_DB;
         self.open = false;
     }
@@ -2970,6 +3045,8 @@ mod tests {
             );
             let _ = a.update(Msg::ToggleMic);
             assert!(a.config.mic_muted);
+            // Fone desligado, mic ligado, mic desligado.
+            assert_eq!(chimes(), [Effect::Off, Effect::On, Effect::Off]);
         }
     }
 
@@ -3577,6 +3654,68 @@ mod tests {
     }
 
     #[test]
+    fn padrao_volta_o_slider_e_grava() {
+        use crate::audio::{MicGain, Sensitivity};
+        let mut a = voice_tab();
+        let _ = a.update(Msg::Master(30));
+        let _ = a.update(Msg::AutoSensitivity(false));
+        let _ = a.update(Msg::Threshold(-60.0));
+        let _ = a.update(Msg::AutoGain(false));
+        let _ = a.update(Msg::Gain(9.0));
+        let antes = saves();
+        for c in [Control::Master, Control::Threshold, Control::Gain] {
+            let _ = a.update(Msg::Restore(c));
+        }
+        assert_eq!(saves(), antes + 3);
+        assert_eq!(a.config.master_volume, VOLUME_PADRAO);
+        assert_eq!(a.config.sensitivity, Sensitivity::Manual(MANUAL_DEFAULT_DB));
+        assert_eq!(a.config.mic_gain, MicGain::Manual(GAIN_DEFAULT_DB));
+    }
+
+    #[test]
+    fn testar_saida_toca_a_entrada() {
+        let mut a = voice_tab();
+        chimes();
+        let _ = a.update(Msg::TestOutput);
+        assert_eq!(chimes(), [Effect::Join]);
+    }
+
+    #[test]
+    fn ouvir_minha_voz_cai_com_o_motor_de_teste_e_nao_existe_na_call() {
+        let mut a = voice_tab();
+        let _ = a.update(Msg::Monitor(true));
+        assert!(main_of(&mut a).monitor, "espera o motor abrir");
+        let _ = a.update(Msg::OpenSettings(Tab::About));
+        assert!(!main_of(&mut a).monitor, "trocou de aba");
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        let _ = a.update(Msg::Monitor(true));
+        let _ = a.update(Msg::CloseSettings);
+        assert!(!main_of(&mut a).monitor, "fechou o modal");
+
+        let mut a = in_call(&["Ana"]);
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        let _ = a.update(Msg::Monitor(true));
+        assert!(!main_of(&mut a).monitor);
+    }
+
+    #[test]
+    fn sair_e_trocar_servidor_perguntam_antes() {
+        let mut a = voice_app();
+        let _ = a.update(Msg::OpenSettings(Tab::Account));
+        let _ = a.update(Msg::Confirm(true));
+        assert!(main_of(&mut a).confirm);
+        let _ = a.update(Msg::Confirm(false));
+        assert!(!main_of(&mut a).confirm, "cancelou");
+        let _ = a.update(Msg::Confirm(true));
+        let _ = a.update(Msg::OpenSettings(Tab::Server));
+        assert!(!main_of(&mut a).confirm, "outra aba não herda a pergunta");
+        let _ = a.update(Msg::Confirm(true));
+        let _ = a.update(Msg::Escape);
+        let _ = a.update(Msg::OpenSettings(Tab::Server));
+        assert!(!main_of(&mut a).confirm, "reabrir começa sem pergunta");
+    }
+
+    #[test]
     fn ganho_automatico_e_manual_guardam_o_valor() {
         use crate::audio::MicGain;
         let mut a = voice_tab();
@@ -3832,12 +3971,26 @@ mod tests {
         }
 
         fn print_at(a: &App, nome: &str, size: Size) {
+            print_scrolled(a, nome, size, 0.0);
+        }
+
+        /// Rola o painel das configurações `lines` linhas pra baixo antes do print.
+        fn print_scrolled(a: &App, nome: &str, size: Size, lines: f32) {
             let settings = Settings {
                 fonts: theme::FONTS.map(Into::into).to_vec(),
                 default_font: theme::BODY,
                 ..Settings::default()
             };
             let mut ui = Simulator::with_size(settings, size, a.view());
+            if lines > 0.0 {
+                ui.point_at(iced::Point::new(
+                    size.width / 2.0 + 100.0,
+                    size.height / 2.0,
+                ));
+                let _ = ui.simulate([Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -lines },
+                })]);
+            }
             let print = ui.snapshot(&a.theme()).unwrap();
             assert!(
                 print
@@ -3991,6 +4144,34 @@ mod tests {
         voz(&mut a, false, -40.0, -22.0, true);
         main_of(&mut a).probe = Probe::Failed;
         print(&a, "voz-erro");
+        // Fim da aba: Testar, Ouvir minha voz e os botões Padrão, parados no padrão e não.
+        main_of(&mut a).probe = Probe::Off;
+        print_scrolled(&a, "voz-fim-padrao", Size::new(1200.0, 760.0), 30.0);
+        a.config.master_volume = 40;
+        a.config.set_threshold(-55.0);
+        a.config.set_auto_gain(false);
+        a.config.set_gain(6.0);
+        main_of(&mut a).monitor = true;
+        print_scrolled(&a, "voz-fim-mexido", Size::new(1200.0, 760.0), 30.0);
+        a.config.master_volume = VOLUME_PADRAO;
+        a.config.set_threshold(MANUAL_DEFAULT_DB);
+        a.config.set_auto_gain(true);
+        main_of(&mut a).monitor = false;
+
+        // Sair e Trocar servidor esperando a confirmação.
+        main_of(&mut a).confirm = true;
+        main_of(&mut a).settings = Some(Tab::Account);
+        print(&a, "config-conta-confirma");
+        main_of(&mut a).settings = Some(Tab::Server);
+        print(&a, "config-servidor-confirma");
+        let _ = a.update(Msg::JoinChannel("Call".into()));
+        main_of(&mut a).confirm = true;
+        print(&a, "config-servidor-confirma-na-call");
+        print_at(
+            &a,
+            "config-servidor-confirma-janela-minima",
+            Size::new(860.0, 560.0),
+        );
 
         // Palco: 1, 4 e 9 pessoas, com quem fala e quem está mudo.
         let nomes = [

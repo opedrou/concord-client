@@ -13,7 +13,7 @@ use super::{
     AudioPrefs, FRAME, Meter, MicGain, NoiseLevel, Sensitivity,
     device::{self, Opened, Seen},
     mic::MicChain,
-    mixer::{Mixer, VoiceQueue},
+    mixer::{Echo, Mixer, VoiceQueue},
 };
 
 const TICK: Duration = Duration::from_millis(2);
@@ -37,6 +37,10 @@ pub enum Command {
     Input(Option<String>),
     Output(Option<String>),
     Effect(&'static [u8]),
+    /// Toca surdo também: ver [`Mixer::cue`].
+    Cue(&'static [u8]),
+    /// Retorno do mic na saída, no motor de teste.
+    Monitor(bool),
     Voice {
         key: String,
         name: String,
@@ -207,6 +211,7 @@ pub fn run(
     let mut output = Side::new(prefs.output);
     let mut mix = [0f32; FRAME];
     let mut pcm = [0i16; FRAME];
+    let mut echo: Option<Echo> = None;
     // Motor solto com som de saída tocando: só a saída segue, até o som acabar ou o prazo.
     let mut closing: Option<Instant> = None;
     let (seen_tx, seen) = mpsc::channel();
@@ -304,6 +309,16 @@ pub fn run(
                     output.switch(name);
                 }
                 Command::Effect(pcm) => mixer.play(pcm),
+                Command::Cue(pcm) => mixer.cue(pcm),
+                Command::Monitor(on) => {
+                    if echo.is_some() != on {
+                        log!(
+                            "áudio: retorno do mic {}",
+                            if on { "ligado" } else { "desligado" }
+                        );
+                    }
+                    echo = on.then(|| Echo::new(&mut mixer));
+                }
                 Command::Voice { key, name, queue } => mixer.add(key, name, queue),
             }
             next = commands.try_recv().ok();
@@ -354,6 +369,9 @@ pub fn run(
                     *p = (stream.ring.pop().unwrap_or(0.0) * 32767.0) as i16;
                 }
                 if let Some(block) = chain.process(&mut pcm) {
+                    if let Some(echo) = &mut echo {
+                        echo.push(&block);
+                    }
                     // Sala parada perde bloco em vez de acumular atraso.
                     let _ = frames.try_send(block);
                 }

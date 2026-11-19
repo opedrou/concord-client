@@ -69,6 +69,7 @@ pub enum MicGain {
 /// demais: o +20 cobre isso. O -20 desfaz o reforço de mic que o sistema aplica.
 pub const GAIN_MIN_DB: f32 = -20.0;
 pub const GAIN_MAX_DB: f32 = 20.0;
+pub const GAIN_DEFAULT_DB: f32 = 0.0;
 
 /// Quanto o medidor cai por bloco de 10 ms: do topo ao fundo em 600 ms.
 const METER_DECAY_DB: f32 = (MANUAL_MAX_DB - MANUAL_MIN_DB) / 60.0;
@@ -156,6 +157,11 @@ pub fn devices() -> Devices {
 /// 1 dB. Sobe 2 dB: metade da amplitude dos outros, porque toca sozinho ao abrir e assustava
 /// (pico -8,8 dBFS, RMS -29,8 dBFS, 2,6 s):
 /// `ffmpeg -i X.wav -af "volume=2dB" -f s16le -ar 48000 -ac 1 assets/sounds/hello.pcm`
+///
+/// O `on.pcm` e o `off.pcm` são sintetizados: duas notas de 60 e 70 ms, dó e sol, que sobem
+/// ao ligar e descem ao desligar (130 ms, pico -15,5 dBFS, RMS -23 dBFS). `A B` é
+/// `523.25 783.99` no `on` e `783.99 523.25` no `off`:
+/// `ffmpeg -f lavfi -i "aevalsrc='0.178*if(lt(t,0.06),min(1,t/0.004)*(1-t/0.06)*sin(2*PI*A*t),min(1,(t-0.06)/0.004)*(1-(t-0.06)/0.07)*sin(2*PI*B*(t-0.06)))':s=48000:d=0.13" -f s16le -ac 1 assets/sounds/on.pcm`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
     Join,
@@ -166,6 +172,9 @@ pub enum Effect {
     Notify,
     /// Primeira abertura da janela no dia.
     Hello,
+    /// Mic ou fone ligado e desligado: confirmação curta do clique ou do atalho.
+    On,
+    Off,
 }
 
 impl Effect {
@@ -177,6 +186,8 @@ impl Effect {
             Effect::StreamStop => include_bytes!("../../assets/sounds/stream-stop.pcm"),
             Effect::Notify => include_bytes!("../../assets/sounds/notify.pcm"),
             Effect::Hello => include_bytes!("../../assets/sounds/hello.pcm"),
+            Effect::On => include_bytes!("../../assets/sounds/on.pcm"),
+            Effect::Off => include_bytes!("../../assets/sounds/off.pcm"),
         }
     }
 }
@@ -320,10 +331,21 @@ impl Engine {
         self.send(Command::Output(name));
     }
 
-    /// Toca um som de interface. Surdo não ouve: some, como no site. Se o motor cair
+    /// Toca um som de interface. Surdo não ouve: some, como no site. A exceção é a
+    /// confirmação do mic e do fone, que diz justamente que ficou surdo. Se o motor cair
     /// logo depois (sair da call), a thread espera o som acabar.
     pub fn play(&self, effect: Effect) {
-        self.send(Command::Effect(effect.pcm()));
+        self.send(match effect {
+            Effect::On | Effect::Off => Command::Cue(effect.pcm()),
+            _ => Command::Effect(effect.pcm()),
+        });
+    }
+
+    /// Retorno do mic na saída, já tratado, pra pessoa se ouvir. Só no motor de teste da
+    /// aba Voz, que não tem sala: abre o mic junto.
+    pub fn set_monitor(&self, on: bool) {
+        self.send(Command::Mute(!on));
+        self.send(Command::Monitor(on));
     }
 
     /// Fila própria por faixa, identificada por `key`. Soltar o [`VoiceSink`] tira a
@@ -367,13 +389,16 @@ mod tests {
 
     #[test]
     fn efeitos_embutidos_tem_duracao_e_nivel_plausiveis() {
-        for effect in [
-            Effect::Join,
-            Effect::Leave,
-            Effect::StreamStart,
-            Effect::StreamStop,
-            Effect::Notify,
-            Effect::Hello,
+        let (sons, curtos) = (0.3..3.0, 0.1..0.2);
+        for (effect, length) in [
+            (Effect::Join, &sons),
+            (Effect::Leave, &sons),
+            (Effect::StreamStart, &sons),
+            (Effect::StreamStop, &sons),
+            (Effect::Notify, &sons),
+            (Effect::Hello, &sons),
+            (Effect::On, &curtos),
+            (Effect::Off, &curtos),
         ] {
             let pcm = effect.pcm();
             assert_eq!(pcm.len() % 2, 0, "{effect:?}: i16 inteiro");
@@ -384,7 +409,7 @@ mod tests {
                 .map(|&b| i16::from_le_bytes(b) as f32 / 32768.0)
                 .collect();
             let secs = samples.len() as f32 / RATE as f32;
-            assert!((0.3..3.0).contains(&secs), "{effect:?}: {secs} s");
+            assert!(length.contains(&secs), "{effect:?}: {secs} s");
             let peak = samples.iter().fold(0f32, |m, s| m.max(s.abs()));
             let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
             assert!((0.1..=1.0).contains(&peak), "{effect:?}: pico {peak}");

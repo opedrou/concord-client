@@ -14,6 +14,8 @@ const MAX_GAIN: f32 = 2.0;
 const DEFAULT_SLIDER: u8 = 71;
 /// Volume padrão dos sons de interface no site (`DEFAULT_SOUND_VOLUME`).
 const EFFECT_GAIN: f32 = 0.6;
+/// Atraso do [`Echo`], em blocos de 10 ms: meio segundo pra ouvir o que acabou de falar.
+const ECHO_BLOCKS: usize = 50;
 
 /// A fila fica fora do `rtrb` porque só a sala e a thread de áudio tocam nela, nunca
 /// o callback, e descartar o mais antigo exige o lado do produtor mexer na ponta do
@@ -65,6 +67,19 @@ pub struct Mixer {
     /// Sons de interface tocando: PCM `i16` LE e a posição em amostras. Ficam fora do
     /// volume geral e dos de pessoa.
     effects: Vec<(&'static [u8], usize)>,
+    /// Confirmação do mic e do fone, no mesmo formato. Ver [`Mixer::cue`].
+    cue: Option<(&'static [u8], usize)>,
+}
+
+/// Soma um som de interface a partir de `pos`, até o fim do bloco ou do som.
+fn add_effect(out: &mut [f32; FRAME], pcm: &[u8], pos: &mut usize) {
+    for o in out.iter_mut() {
+        let Some(b) = pcm.get(*pos * 2..*pos * 2 + 2) else {
+            break;
+        };
+        *o += i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0 * EFFECT_GAIN;
+        *pos += 1;
+    }
 }
 
 impl Mixer {
@@ -75,6 +90,7 @@ impl Mixer {
             master,
             deafened: false,
             effects: Vec::new(),
+            cue: None,
         }
     }
 
@@ -85,8 +101,14 @@ impl Mixer {
         }
     }
 
+    /// Toca surdo também, que é quando ela diz que o fone desligou. Uma por vez: alternar
+    /// rápido corta a anterior em vez de empilhar.
+    pub fn cue(&mut self, pcm: &'static [u8]) {
+        self.cue = Some((pcm, 0));
+    }
+
     pub fn playing(&self) -> bool {
-        !self.effects.is_empty()
+        !self.effects.is_empty() || self.cue.is_some()
     }
 
     pub fn add(&mut self, key: String, name: String, queue: Arc<VoiceQueue>) {
@@ -156,21 +178,45 @@ impl Mixer {
             }
         }
         for (pcm, pos) in &mut self.effects {
-            for o in out.iter_mut() {
-                let Some(b) = pcm.get(*pos * 2..*pos * 2 + 2) else {
-                    break;
-                };
-                *o += i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0 * EFFECT_GAIN;
-                *pos += 1;
-            }
+            add_effect(out, pcm, pos);
         }
         self.effects.retain(|(pcm, pos)| *pos * 2 < pcm.len());
+        if self.deafened {
+            out.fill(0.0);
+        }
+        if let Some((pcm, pos)) = &mut self.cue {
+            add_effect(out, pcm, pos);
+        }
+        self.cue = self.cue.filter(|(pcm, pos)| *pos * 2 < pcm.len());
         for o in out {
-            *o = if self.deafened {
-                0.0
-            } else {
-                o.clamp(-1.0, 1.0)
-            };
+            *o = o.clamp(-1.0, 1.0);
+        }
+    }
+}
+
+/// Retorno do mic na aba Voz: o som já tratado volta na saída [`ECHO_BLOCKS`] depois, como
+/// uma faixa de voz. Soltar tira a faixa do mixer.
+pub struct Echo {
+    delay: VecDeque<Vec<i16>>,
+    queue: Arc<VoiceQueue>,
+}
+
+impl Echo {
+    pub fn new(mixer: &mut Mixer) -> Self {
+        let queue = Arc::new(VoiceQueue::default());
+        mixer.add("retorno".into(), "retorno do mic".into(), queue.clone());
+        Echo {
+            delay: VecDeque::new(),
+            queue,
+        }
+    }
+
+    pub fn push(&mut self, block: &[i16]) {
+        self.delay.push_back(block.to_vec());
+        if self.delay.len() > ECHO_BLOCKS
+            && let Some(old) = self.delay.pop_front()
+        {
+            self.queue.push(&old);
         }
     }
 }
@@ -296,6 +342,41 @@ mod tests {
         assert!(!m.playing());
         m.deafened = false;
         assert_eq!(mix(&mut m)[0], 0.0);
+    }
+
+    #[test]
+    fn confirmacao_toca_surdo_e_a_nova_corta_a_anterior() {
+        static UM: [u8; 2] = [0x00, 0x40]; // 16384
+        static DOIS: [u8; 4] = [0x00, 0x20, 0x00, 0x20]; // 2 amostras de 8192
+        let mut m = mixer(71);
+        m.deafened = true;
+        let q = voice(&mut m, "a", "ana");
+        q.push(&[10000; FRAME]);
+        m.cue(&UM);
+        m.cue(&DOIS);
+        let out = mix(&mut m);
+        assert!(close(out[0], 0.25 * EFFECT_GAIN), "só a nova, sem a voz");
+        assert!(close(out[1], 0.25 * EFFECT_GAIN) && out[2] == 0.0);
+        assert!(!m.playing());
+    }
+
+    #[test]
+    fn retorno_do_mic_sai_meio_segundo_depois() {
+        let mut m = mixer(71);
+        let mut echo = Echo::new(&mut m);
+        for i in 0..ECHO_BLOCKS {
+            echo.push(&[1000 + i as i16; FRAME]);
+            assert_eq!(mix(&mut m), [0.0; FRAME], "bloco {i} ainda no atraso");
+        }
+        echo.push(&[0; FRAME]);
+        let out = mix(&mut m);
+        assert!(
+            close(out[0], 1000.0 / 32768.0 * gain(71) * gain(71)),
+            "sai o primeiro"
+        );
+        drop(echo);
+        mix(&mut m);
+        assert!(m.tracks.is_empty());
     }
 
     #[test]
