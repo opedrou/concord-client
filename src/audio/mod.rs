@@ -341,6 +341,13 @@ impl Engine {
         });
     }
 
+    /// Retorno do mic na saída, já tratado, pra pessoa se ouvir. Só no motor de teste da
+    /// aba Voz, que não tem sala: abre o mic junto.
+    pub fn set_monitor(&self, on: bool) {
+        self.send(Command::Mute(!on));
+        self.send(Command::Monitor(on));
+    }
+
     /// Fila própria por faixa, identificada por `key`. Soltar o [`VoiceSink`] tira a
     /// faixa do mixer.
     pub fn add_voice(&self, key: String, name: String) -> VoiceSink {

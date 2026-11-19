@@ -464,6 +464,20 @@ fn voice_panel<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
         ),
     ]
     .spacing(2);
+    // Só sem call: o motor de teste é quem leva o mic pra saída.
+    let monitor = (m.call.is_none() && !matches!(m.probe, Probe::Failed)).then(|| {
+        column![
+            toggler(m.monitor)
+                .label("Ouvir minha voz")
+                .on_toggle(Msg::Monitor)
+                .size(20)
+                .text_size(14.4),
+            text("Use fone pra não dar microfonia. Sua voz volta meio segundo depois.")
+                .size(13)
+                .color(FG2),
+        ]
+        .spacing(8)
+    });
     column![
         title("Voz"),
         device_field(
@@ -483,8 +497,9 @@ fn voice_panel<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
         labeled("Redução de ruído", noise),
         sensitivity(m, config),
         mic_gain(config),
-        labeled("Volume geral", master),
     ]
+    .push(monitor)
+    .push(labeled("Volume geral", master))
     .spacing(14)
     .into()
 }

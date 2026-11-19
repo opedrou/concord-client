@@ -14,6 +14,8 @@ const MAX_GAIN: f32 = 2.0;
 const DEFAULT_SLIDER: u8 = 71;
 /// Volume padrão dos sons de interface no site (`DEFAULT_SOUND_VOLUME`).
 const EFFECT_GAIN: f32 = 0.6;
+/// Atraso do [`Echo`], em blocos de 10 ms: meio segundo pra ouvir o que acabou de falar.
+const ECHO_BLOCKS: usize = 50;
 
 /// A fila fica fora do `rtrb` porque só a sala e a thread de áudio tocam nela, nunca
 /// o callback, e descartar o mais antigo exige o lado do produtor mexer na ponta do
@@ -192,6 +194,33 @@ impl Mixer {
     }
 }
 
+/// Retorno do mic na aba Voz: o som já tratado volta na saída [`ECHO_BLOCKS`] depois, como
+/// uma faixa de voz. Soltar tira a faixa do mixer.
+pub struct Echo {
+    delay: VecDeque<Vec<i16>>,
+    queue: Arc<VoiceQueue>,
+}
+
+impl Echo {
+    pub fn new(mixer: &mut Mixer) -> Self {
+        let queue = Arc::new(VoiceQueue::default());
+        mixer.add("retorno".into(), "retorno do mic".into(), queue.clone());
+        Echo {
+            delay: VecDeque::new(),
+            queue,
+        }
+    }
+
+    pub fn push(&mut self, block: &[i16]) {
+        self.delay.push_back(block.to_vec());
+        if self.delay.len() > ECHO_BLOCKS
+            && let Some(old) = self.delay.pop_front()
+        {
+            self.queue.push(&old);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +358,25 @@ mod tests {
         assert!(close(out[0], 0.25 * EFFECT_GAIN), "só a nova, sem a voz");
         assert!(close(out[1], 0.25 * EFFECT_GAIN) && out[2] == 0.0);
         assert!(!m.playing());
+    }
+
+    #[test]
+    fn retorno_do_mic_sai_meio_segundo_depois() {
+        let mut m = mixer(71);
+        let mut echo = Echo::new(&mut m);
+        for i in 0..ECHO_BLOCKS {
+            echo.push(&[1000 + i as i16; FRAME]);
+            assert_eq!(mix(&mut m), [0.0; FRAME], "bloco {i} ainda no atraso");
+        }
+        echo.push(&[0; FRAME]);
+        let out = mix(&mut m);
+        assert!(
+            close(out[0], 1000.0 / 32768.0 * gain(71) * gain(71)),
+            "sai o primeiro"
+        );
+        drop(echo);
+        mix(&mut m);
+        assert!(m.tracks.is_empty());
     }
 
     #[test]

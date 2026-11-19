@@ -153,6 +153,8 @@ struct Main {
     /// Motor de teste da aba Voz; só existe sem call.
     probe: Probe,
     next_probe: u64,
+    /// "Ouvir minha voz" ligado: vale pro motor de teste e cai junto com ele.
+    monitor: bool,
     /// Sair ou Trocar servidor das configurações clicado uma vez, esperando a confirmação.
     confirm: bool,
     /// Última leitura do mic, em dBFS, e se o limitador está aberto.
@@ -301,6 +303,8 @@ pub enum Msg {
     MeterTick,
     /// "Testar" da saída: toca o som de entrada nela.
     TestOutput,
+    /// Interruptor "Ouvir minha voz".
+    Monitor(bool),
     /// Volta um slider da aba Voz ao padrão e grava.
     Restore(Control),
     /// Primeiro clique no Sair ou no Trocar servidor das configurações; `false` cancela.
@@ -390,6 +394,7 @@ fn action(msg: &Msg) -> Option<String> {
             "desligou o ganho automático",
         ),
         Msg::TestOutput => "testou a saída".into(),
+        Msg::Monitor(b) => on(*b, "ligou ouvir minha voz", "desligou ouvir minha voz"),
         Msg::Restore(c) => format!("voltou {c:?} ao padrão"),
         Msg::OpenSettings(tab) => format!("abriu as configurações em {tab:?}"),
         Msg::CloseSettings => "fechou as configurações".into(),
@@ -1003,6 +1008,18 @@ impl App {
                 self.chime(Effect::Join);
                 Task::none()
             }
+            // Clicado com o motor ainda abrindo: liga quando ele abrir.
+            Msg::Monitor(on) => {
+                if let Screen::Main(m) = &mut self.screen
+                    && m.call.is_none()
+                {
+                    m.monitor = on;
+                    if let Probe::On(engine, _) = &m.probe {
+                        engine.set_monitor(on);
+                    }
+                }
+                Task::none()
+            }
             Msg::Restore(control) => {
                 let task = self.handle(match control {
                     Control::Master => Msg::Master(VOLUME_PADRAO),
@@ -1025,6 +1042,9 @@ impl App {
                     // Sem MicFrames, os blocos do mic só são descartados pelo motor.
                     m.probe = match result.ok().and_then(|boot| boot.take()) {
                         Some((engine, _frames)) => {
+                            if m.monitor {
+                                engine.set_monitor(true);
+                            }
                             let meter = engine.meter();
                             Probe::On(engine, meter)
                         }
@@ -1899,6 +1919,7 @@ impl App {
             devices: None,
             probe: Probe::Off,
             next_probe: 0,
+            monitor: false,
             confirm: false,
             level: MANUAL_MIN_DB,
             open: false,
@@ -2069,6 +2090,7 @@ impl Main {
 
     fn stop_probe(&mut self) {
         self.probe = Probe::Off;
+        self.monitor = false;
         self.level = MANUAL_MIN_DB;
         self.open = false;
     }
@@ -3327,6 +3349,24 @@ mod tests {
     }
 
     #[test]
+    fn ouvir_minha_voz_cai_com_o_motor_de_teste_e_nao_existe_na_call() {
+        let mut a = voice_tab();
+        let _ = a.update(Msg::Monitor(true));
+        assert!(main_of(&mut a).monitor, "espera o motor abrir");
+        let _ = a.update(Msg::OpenSettings(Tab::About));
+        assert!(!main_of(&mut a).monitor, "trocou de aba");
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        let _ = a.update(Msg::Monitor(true));
+        let _ = a.update(Msg::CloseSettings);
+        assert!(!main_of(&mut a).monitor, "fechou o modal");
+
+        let mut a = in_call(&["Ana"]);
+        let _ = a.update(Msg::OpenSettings(Tab::Voice));
+        let _ = a.update(Msg::Monitor(true));
+        assert!(!main_of(&mut a).monitor);
+    }
+
+    #[test]
     fn sair_e_trocar_servidor_perguntam_antes() {
         let mut a = voice_app();
         let _ = a.update(Msg::OpenSettings(Tab::Account));
@@ -3772,17 +3812,19 @@ mod tests {
         voz(&mut a, false, -40.0, -22.0, true);
         main_of(&mut a).probe = Probe::Failed;
         print(&a, "voz-erro");
-        // Fim da aba: Testar e os botões Padrão, parados no padrão e não.
+        // Fim da aba: Testar, Ouvir minha voz e os botões Padrão, parados no padrão e não.
         main_of(&mut a).probe = Probe::Off;
         print_scrolled(&a, "voz-fim-padrao", Size::new(1200.0, 760.0), 30.0);
         a.config.master_volume = 40;
         a.config.set_threshold(-55.0);
         a.config.set_auto_gain(false);
         a.config.set_gain(6.0);
+        main_of(&mut a).monitor = true;
         print_scrolled(&a, "voz-fim-mexido", Size::new(1200.0, 760.0), 30.0);
         a.config.master_volume = VOLUME_PADRAO;
         a.config.set_threshold(MANUAL_DEFAULT_DB);
         a.config.set_auto_gain(true);
+        main_of(&mut a).monitor = false;
 
         // Sair e Trocar servidor esperando a confirmação.
         main_of(&mut a).confirm = true;
