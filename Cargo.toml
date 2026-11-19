@@ -26,6 +26,9 @@ rtrb = "0.4"
 sha2 = "0.10"
 # Hora local das mensagens do chat: a std não sabe o fuso. Já vinha compilado pelo livekit.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Imagem no clipboard (Ctrl+V com print anexa): o iced só lê texto. No Linux fala X11, que o
+# XWayland também atende; sem `wayland-data-control`, que o GNOME não tem.
+arboard = { version = "3", default-features = false, features = ["image-data"] }
 # Avisos do livekit, do wgpu e a GPU que o iced escolheu, no log do app (`log::Bridge`). Já vem
 # pelos dois.
 log = "0.4"

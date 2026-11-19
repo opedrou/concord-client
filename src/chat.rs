@@ -301,7 +301,7 @@ fn save(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(part, path)
 }
 
-fn open_with_system(path: &Path) -> std::io::Result<()> {
+fn open_with_system(path: impl AsRef<std::ffi::OsStr>) -> std::io::Result<()> {
     let opener = if cfg!(windows) {
         "explorer"
     } else {
@@ -311,6 +311,119 @@ fn open_with_system(path: &Path) -> std::io::Result<()> {
         .arg(path)
         .status()
         .map(drop)
+}
+
+/// Links `http://` e `https://` do texto, sem repetir e na ordem em que aparecem. O fim sai
+/// sem a pontuação da frase (`.,;:!?`, aspas) e sem `)` ou `]` que não abriu dentro do link.
+pub fn links(text: &str) -> Vec<&str> {
+    let mut found: Vec<&str> = Vec::new();
+    let mut from = 0;
+    while let Some(at) = next_scheme(text, from) {
+        let rest = &text[at..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let link = trim_link(&rest[..end]);
+        from = at + end;
+        // Só vale com alguma coisa depois do `://` e sem letra colada antes (`xhttp://`).
+        let body = link.split_once("://").map_or("", |(_, b)| b);
+        let glued = text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        if body.chars().next().is_some_and(char::is_alphanumeric)
+            && !glued
+            && !found.contains(&link)
+        {
+            found.push(link);
+        }
+    }
+    found
+}
+
+/// Onde começa o próximo `http://` ou `https://` a partir de `from`, sem ligar pra maiúscula.
+fn next_scheme(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    (from..bytes.len()).find(|&i| {
+        ["http://", "https://"].iter().any(|s| {
+            bytes
+                .get(i..i + s.len())
+                .is_some_and(|b| b.eq_ignore_ascii_case(s.as_bytes()))
+        })
+    })
+}
+
+fn trim_link(link: &str) -> &str {
+    let mut link = link;
+    while let Some(last) = link.chars().next_back() {
+        let drop = match last {
+            ')' => link.matches('(').count() < link.matches(')').count(),
+            ']' => link.matches('[').count() < link.matches(']').count(),
+            _ => ".,;:!?'\"}>".contains(last),
+        };
+        if !drop {
+            break;
+        }
+        link = &link[..link.len() - last.len_utf8()];
+    }
+    link
+}
+
+/// O domínio do link, pro botão: sem `www.`, porta, usuário nem caminho.
+pub fn host(link: &str) -> &str {
+    let rest = link.split_once("://").map_or(link, |(_, r)| r);
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let rest = rest.rsplit('@').next().unwrap_or(rest);
+    let rest = rest.split(':').next().unwrap_or(rest);
+    rest.strip_prefix("www.").unwrap_or(rest)
+}
+
+/// Abre o link no navegador padrão.
+pub async fn open_link(link: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || open_with_system(link))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|_| "Nenhum app abriu o link.".to_owned())
+}
+
+/// A imagem do clipboard (um print, por exemplo) como PNG na pasta temporária, pra anexar.
+/// `None`: o clipboard tem texto, não tem imagem, ou o sistema não deixou ler.
+pub async fn clipboard_image() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(|| {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        // Texto manda: planilha e página copiam texto e imagem juntos, e quem cola quer o texto.
+        if clipboard.get_text().is_ok_and(|t| !t.is_empty()) {
+            return None;
+        }
+        let picture = clipboard.get_image().ok()?;
+        let (w, h) = (
+            u32::try_from(picture.width).ok()?,
+            u32::try_from(picture.height).ok()?,
+        );
+        let png = encode_png(w, h, &picture.bytes)?;
+        let dir = std::env::temp_dir().join("concord-anexos");
+        let name = chrono::Local::now().format("captura-%Y%m%d-%H%M%S.png");
+        let path = dir.join(name.to_string());
+        save(&dir, &path, &png).ok()?;
+        Some(path)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// PNG de uma imagem RGBA. `None` se o tamanho dos bytes não bate com a largura e a altura.
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    use image::codecs::png::{CompressionType, FilterType as Filter, PngEncoder};
+    use image::{ExtendedColorType, ImageEncoder};
+    // O codificador dá `assert` com tamanho errado, em vez de erro.
+    if width == 0 || height == 0 || rgba.len() as u64 != u64::from(width) * u64::from(height) * 4 {
+        return None;
+    }
+    let mut png = Vec::new();
+    // Rápido: print de tela cheia não pode demorar a subir, e o servidor aceita até 95 MB.
+    PngEncoder::new_with_quality(&mut png, CompressionType::Fast, Filter::Adaptive)
+        .write_image(rgba, width, height, ExtendedColorType::Rgba8)
+        .ok()?;
+    Some(png)
 }
 
 /// Lê o arquivo escolhido pra anexar: nome e bytes, até 95 MiB.
@@ -588,6 +701,52 @@ mod tests {
                 .count(),
             3999
         );
+    }
+
+    #[test]
+    fn print_do_clipboard_vira_png_que_volta_igual() {
+        // 2x2 com alfa: o que sai do arboard é RGBA, e tem de voltar sem perder canal.
+        let rgba: Vec<u8> = (0..16).map(|i| i * 16).collect();
+        let png = encode_png(2, 2, &rgba).unwrap();
+        let back = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(back.dimensions(), (2, 2));
+        assert_eq!(back.into_raw(), rgba);
+        // Bytes que não fecham com o tamanho não viram arquivo.
+        assert!(encode_png(2, 2, &rgba[..15]).is_none());
+        assert!(encode_png(0, 0, &[]).is_none());
+    }
+
+    #[test]
+    fn acha_links_sem_a_pontuacao_da_frase() {
+        let casos = [
+            ("olha https://a.com/x.", vec!["https://a.com/x"]),
+            ("(veja http://a.com/p_(1))", vec!["http://a.com/p_(1)"]),
+            ("(https://a.com)", vec!["https://a.com"]),
+            (
+                "a https://a.com, b HTTPS://B.com!",
+                vec!["https://a.com", "HTTPS://B.com"],
+            ),
+            ("https://a.com https://a.com", vec!["https://a.com"]),
+            (
+                "https://a.com/?q=1&r=2#topo\nhttp://c.org",
+                vec!["https://a.com/?q=1&r=2#topo", "http://c.org"],
+            ),
+            ("xhttps://a.com http:// https://. ftp://a.com", vec![]),
+            ("sem link, só http e https", vec![]),
+            ("<https://a.com/é>", vec!["https://a.com/é"]),
+        ];
+        for (texto, esperado) in casos {
+            assert_eq!(links(texto), esperado, "{texto}");
+        }
+        for (link, dominio) in [
+            ("https://www.a.com/x?y", "a.com"),
+            ("http://u:p@a.com:8080/", "a.com"),
+            ("https://sub.a.com#z", "sub.a.com"),
+        ] {
+            assert_eq!(host(link), dominio);
+        }
     }
 
     #[test]

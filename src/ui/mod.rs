@@ -326,6 +326,8 @@ pub enum Msg {
     ToggleFullscreen,
     /// Canal de texto, pelo id: respostas de outro canal caem fora.
     Chat(i64, chat::Msg),
+    /// Arquivo solto na janela: anexa, se o chat está aberto.
+    FileDropped(std::path::PathBuf),
     /// Tempo real das notificações: chamado pra call e `@`.
     Notified(Live<NotifyEvent>),
     /// A notificação fechou, e `true` se foi com clique: aí faz o que ela pedia.
@@ -1290,6 +1292,16 @@ impl App {
             Msg::FocusNext => operation::focus_next(),
             Msg::FocusPrevious => operation::focus_previous(),
             Msg::Chat(channel, msg) => self.chat(channel, msg),
+            Msg::FileDropped(path) => {
+                let open = match &self.screen {
+                    Screen::Main(m) => m.chat.as_ref().map(|c| c.channel),
+                    _ => None,
+                };
+                match open {
+                    Some(channel) => self.chat(channel, chat::Msg::Dropped(path)),
+                    None => Task::none(),
+                }
+            }
             Msg::Notified(live) => self.notified(live),
             Msg::NotifyClosed(_, false) => {
                 log!("notificação: fechou sem clique");
@@ -2258,6 +2270,7 @@ fn focus(event: Event, _: event::Status, _: window::Id) -> Option<Msg> {
     match event {
         Event::Window(window::Event::Focused) => Some(Msg::Focus(true)),
         Event::Window(window::Event::Unfocused) => Some(Msg::Focus(false)),
+        Event::Window(window::Event::FileDropped(path)) => Some(Msg::FileDropped(path)),
         Event::Window(window::Event::Resized(s)) => {
             Some(Msg::Minimized(s.width == 0.0 || s.height == 0.0))
         }

@@ -15,15 +15,15 @@ use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::text::Wrapping;
 use iced::widget::text_editor::{Action, Binding, Cursor, Edit, KeyPress, Motion, Position};
 use iced::widget::{
-    Column, button, column, container, image, mouse_area, progress_bar, rich_text, row, scrollable,
-    space, span, stack, text, text_editor,
+    Column, Row, button, column, container, image, mouse_area, progress_bar, rich_text, row,
+    scrollable, space, span, stack, text, text_editor,
 };
 use iced::{
     Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task, Theme,
     border,
 };
 
-use super::sidebar::{CLOSE, HASH, icon};
+use super::sidebar::{CLOSE, HASH, icon, tipped};
 use super::theme::{
     self, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, DANGER_SOFT, FG, FG2, FG3, HOVER, IDLE,
 };
@@ -31,7 +31,12 @@ use super::{Main, Msg as App, avatar};
 use crate::api::{Attachment, Channel, Client, Error, Kind, Member, Message, Page, Uploaded, User};
 use crate::chat::{self as logic, Live, Timeline, Window};
 
+const CLIP: &[u8] = include_bytes!("../../assets/icons/paperclip.svg");
+const TRASH: &[u8] = include_bytes!("../../assets/icons/trash.svg");
+const ARROW_DOWN: &[u8] = include_bytes!("../../assets/icons/arrow-down.svg");
 const LISTA: &str = "chat-lista";
+/// Até quantos pixels do fim a lista ainda conta como "no fim".
+const NO_FIM: f32 = 24.0;
 const COMPOSER: &str = "chat-composer";
 const ROSTO: f32 = 40.0;
 /// Busca do que perdeu que falhou com o tempo real de pé: tenta de novo depois disso.
@@ -70,9 +75,23 @@ pub enum Msg {
     Live(Live),
     /// Tenta de novo a busca do que perdeu.
     Recover,
+    /// Botão "Tentar de novo" da tela de erro, com a lista vazia.
+    Retry,
+    /// A lista rolou: `true` se está no fim, onde chega a mensagem nova.
+    Scrolled(bool),
+    /// Botão "Novas mensagens": desce até o fim.
+    JumpToNew,
     /// Botão de anexar: abre o seletor do sistema.
     Attach,
     Picked(Option<PathBuf>),
+    /// Arquivo solto na janela com o chat aberto.
+    Dropped(PathBuf),
+    /// Ctrl+V no campo.
+    Paste,
+    /// A imagem que estava no clipboard, já num arquivo temporário. `None`: não tinha.
+    Pasted(Option<PathBuf>),
+    /// O texto do clipboard, quando não tinha imagem.
+    PasteText(Option<String>),
     /// Bytes já entregues e o total do upload.
     Progress(u64, u64),
     Uploaded(Result<Uploaded, String>),
@@ -83,6 +102,9 @@ pub enum Msg {
     /// Clique no anexo: baixa e abre no app do sistema.
     OpenFile(i64),
     Opened(i64, Result<(), String>),
+    /// Clique no botão de um link da mensagem: abre no navegador.
+    OpenLink(String),
+    LinkOpened(Result<(), String>),
     /// "Apagar" pede confirmação; o "Apagar" da confirmação manda.
     AskDelete(i64),
     CancelDelete,
@@ -121,6 +143,10 @@ pub struct Chat {
     /// O tempo real caiu e está tentando voltar.
     lost: bool,
     live: bool,
+    /// A lista está no fim: mensagem nova entra à vista e a tela segue descendo.
+    at_bottom: bool,
+    /// Chegou mensagem enquanto a pessoa lia o histórico: mostra "Novas mensagens".
+    unread: bool,
     /// Um anexo por mensagem: sobe assim que escolhe, como na web.
     upload: Upload,
     images: HashMap<i64, Picture>,
@@ -181,6 +207,8 @@ impl Chat {
             hover: None,
             lost: false,
             live: false,
+            at_bottom: true,
+            unread: false,
             upload: Upload::Idle,
             images: HashMap::new(),
             opening: HashSet::new(),
@@ -289,7 +317,12 @@ impl Chat {
     }
 
     pub fn update(&mut self, msg: Msg, client: &Client) -> Task<App> {
+        let newest = self.timeline.newest();
         let task = self.handle(msg, client);
+        // Mensagem mais nova que a da tela, com a lista rolada pra cima: avisa.
+        if newest.is_some() && self.timeline.newest() > newest && !self.at_bottom {
+            self.unread = true;
+        }
         Task::batch([task, self.fetch_images(client)])
     }
 
@@ -314,6 +347,18 @@ impl Chat {
                 });
             }
             Msg::Recover => return self.recover(client),
+            Msg::Retry => {
+                self.error = None;
+                return self.recover(client);
+            }
+            Msg::Scrolled(bottom) => {
+                self.at_bottom = bottom;
+                self.unread &= !bottom;
+            }
+            Msg::JumpToNew => {
+                (self.at_bottom, self.unread) = (true, false);
+                return to_bottom();
+            }
             Msg::Attach => {
                 if !matches!(self.upload, Upload::Idle) || self.sending {
                     return Task::none();
@@ -331,11 +376,25 @@ impl Chat {
                     self.upload = Upload::Idle;
                     return Task::none();
                 };
-                let name = path
-                    .file_name()
-                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-                (self.upload, self.error) = (Upload::sending(name), None);
-                return upload(client.clone(), channel, path);
+                return self.start_upload(path, client, false);
+            }
+            // Arrastado pra janela: mesmo caminho do botão, com o mesmo limite e os mesmos erros.
+            Msg::Dropped(path) => return self.attach(path, client, false),
+            // Ctrl+V: imagem no clipboard anexa; sem imagem, cola o texto como o campo faria.
+            Msg::Paste => {
+                return Task::future(async move {
+                    App::Chat(channel, Msg::Pasted(logic::clipboard_image().await))
+                });
+            }
+            Msg::Pasted(Some(path)) => return self.attach(path, client, true),
+            Msg::Pasted(None) => {
+                return iced::clipboard::read()
+                    .map(move |text| App::Chat(channel, Msg::PasteText(text)));
+            }
+            Msg::PasteText(text) => {
+                if let Some(text) = text {
+                    self.edit(Action::Edit(Edit::Paste(Arc::new(text))));
+                }
             }
             Msg::Progress(now, all) => {
                 if let Upload::Sending { sent, total, .. } = &mut self.upload {
@@ -399,6 +458,16 @@ impl Chat {
             Msg::Deleted(_, Err(e)) => {
                 return self.failed(e, "Não foi possível apagar a mensagem.");
             }
+            Msg::OpenLink(link) => {
+                return Task::future(async move {
+                    App::Chat(channel, Msg::LinkOpened(logic::open_link(link).await))
+                });
+            }
+            Msg::LinkOpened(result) => {
+                if let Err(e) = result {
+                    self.error = Some(e);
+                }
+            }
             Msg::Opened(id, result) => {
                 self.opening.remove(&id);
                 if let Err(e) = result {
@@ -454,6 +523,7 @@ impl Chat {
                         self.upload = Upload::Idle;
                         self.timeline.insert(message);
                         self.sync();
+                        (self.at_bottom, self.unread) = (true, false);
                         return to_bottom();
                     }
                     Err(e) => return self.failed(e, "Não foi possível enviar a mensagem."),
@@ -468,6 +538,27 @@ impl Chat {
             Msg::Open | Msg::Close | Msg::Expired => {}
         }
         Task::none()
+    }
+
+    /// Anexa o que não veio do seletor (arrastado ou colado), só com o campo livre: é um anexo
+    /// por mensagem. `temporary`: arquivo nosso, que some depois de lido.
+    fn attach(&mut self, path: PathBuf, client: &Client, temporary: bool) -> Task<App> {
+        if !matches!(self.upload, Upload::Idle) || self.sending {
+            if temporary {
+                let _ = std::fs::remove_file(&path);
+            }
+            self.error = Some("Só um anexo por mensagem.".to_owned());
+            return Task::none();
+        }
+        self.start_upload(path, client, temporary)
+    }
+
+    fn start_upload(&mut self, path: PathBuf, client: &Client, temporary: bool) -> Task<App> {
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        (self.upload, self.error) = (Upload::sending(name), None);
+        upload(client.clone(), self.channel, path, temporary)
     }
 
     fn failed(&mut self, e: Error, what: &str) -> Task<App> {
@@ -577,11 +668,18 @@ impl Upload {
     }
 }
 
-/// Lê o arquivo fora da thread da interface e sobe, avisando o andamento.
-fn upload(client: Client, channel: i64, path: PathBuf) -> Task<App> {
+/// Lê o arquivo fora da thread da interface e sobe, avisando o andamento. `temporary` apaga o
+/// arquivo assim que lido.
+fn upload(client: Client, channel: i64, path: PathBuf, temporary: bool) -> Task<App> {
     let run = iced::stream::channel(8, async move |mut out| {
         let result = async {
-            let read = tokio::task::spawn_blocking(move || logic::read_attachment(&path));
+            let read = tokio::task::spawn_blocking(move || {
+                let read = logic::read_attachment(&path);
+                if temporary {
+                    let _ = std::fs::remove_file(&path);
+                }
+                read
+            });
             let (name, bytes) = read.await.map_err(|e| e.to_string())??;
             let mut progress = out.clone();
             let sent = move |sent, total| {
@@ -657,7 +755,19 @@ pub fn view<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
     let body = if chat.timeline.messages.is_empty() {
         match (chat.loaded, &chat.error) {
             (false, None) => empty("Carregando mensagens…"),
-            (false, Some(_)) => empty("Não foi possível carregar as mensagens."),
+            (false, Some(error)) => {
+                let retry = button(text("Tentar de novo").size(13.5))
+                    .padding([7, 16])
+                    .style(theme::outline)
+                    .on_press(App::Chat(channel, Msg::Retry));
+                container(
+                    column![text(error).size(14).color(FG2), retry]
+                        .spacing(12)
+                        .align_x(Alignment::Center),
+                )
+                .center(Length::Fill)
+                .into()
+            }
             (true, _) => empty("Nenhuma mensagem ainda."),
         }
     } else {
@@ -708,15 +818,40 @@ fn list<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
         left: 10.0,
     });
     // Pouca mensagem fica embaixo, junto do campo, como no Discord.
-    container(
+    let scroll = container(
         scrollable(items)
             .id(LISTA)
             .anchor_bottom()
+            .on_scroll(move |v| App::Chat(channel, Msg::Scrolled(v.absolute_offset().y <= NO_FIM)))
             .style(theme::thin_scroll),
     )
     .width(Length::Fill)
-    .align_bottom(Length::Fill)
-    .into()
+    .align_bottom(Length::Fill);
+    // A camada de cima fica sempre, vazia sem aviso: o iced liga a posição da rolagem ao lugar
+    // na árvore, e trocar a lista de lugar a mandaria pro fim.
+    let new: Element<'a, App> = if chat.unread {
+        let label = row![
+            icon(ARROW_DOWN, 14.0, FG),
+            text("Novas mensagens").size(13.5).font(theme::SEMIBOLD),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        let jump = button(label)
+            .padding([7, 14])
+            .style(theme::primary)
+            .on_press(App::Chat(channel, Msg::JumpToNew));
+        container(jump)
+            .center_x(Length::Fill)
+            .align_bottom(Length::Fill)
+            .padding(Padding {
+                bottom: 14.0,
+                ..Padding::ZERO
+            })
+            .into()
+    } else {
+        space().into()
+    };
+    stack![scroll, new].into()
 }
 
 fn message_row<'a>(
@@ -748,6 +883,9 @@ fn message_row<'a>(
                 selectable
             ]);
         }
+    }
+    if let Some(links) = link_buttons(channel, &message.content) {
+        body = body.push(links);
     }
     if let Some(attachment) = &message.attachment {
         body = body.push(attachment_view(chat, id, attachment));
@@ -800,6 +938,26 @@ fn message_row<'a>(
     } else {
         cell.into()
     }
+}
+
+/// Links da mensagem como botões "Abrir link · domínio" embaixo dela. O texto vem de um
+/// editor só de leitura, que não sabe de clique em trecho: o botão deixa o texto selecionável.
+fn link_buttons(channel: i64, content: &str) -> Option<Element<'_, App>> {
+    const MAX: usize = 4;
+    let found = logic::links(content);
+    if found.is_empty() {
+        return None;
+    }
+    let buttons = found.into_iter().take(MAX).map(|link| {
+        let host: String = logic::host(link).chars().take(40).collect();
+        let label = button(text(format!("Abrir link · {host}")).size(12.5))
+            .padding([3, 10])
+            .style(theme::outline)
+            .on_press(App::Chat(channel, Msg::OpenLink(link.to_owned())));
+        // O endereço inteiro no tooltip: o domínio sozinho esconde pra onde o link vai.
+        tipped(label.into(), link)
+    });
+    Some(Row::with_children(buttons).spacing(6).wrap().into())
 }
 
 /// Estimativa de que o texto cabe no campo sem rolar: poucas linhas, contando a quebra como
@@ -932,7 +1090,11 @@ fn delete_actions<'a>(channel: i64, id: i64, confirming: bool) -> Element<'a, Ap
             .on_press(App::Chat(channel, msg))
     };
     if !confirming {
-        return small("Apagar", delete_style, Msg::AskDelete(id)).into();
+        let trash = button(container(icon(TRASH, 16.0, FG3)).center(26))
+            .padding(0)
+            .style(delete_style)
+            .on_press(App::Chat(channel, Msg::AskDelete(id)));
+        return tipped(trash.into(), "Apagar mensagem");
     }
     row![
         text("Apagar a mensagem?").size(12.5).color(FG2),
@@ -1037,10 +1199,12 @@ fn composer<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
     let attached = matches!(chat.upload, Upload::Ready(_));
     let typed = !chat.draft.text().trim().is_empty();
     let ready = !chat.sending && (idle || attached) && (typed || attached);
-    let attach = button(text("Anexar").size(14))
-        .padding([8, 10])
+    let enabled = idle && !chat.sending;
+    let attach = button(container(icon(CLIP, 20.0, if enabled { FG2 } else { FG3 })).center(34))
+        .padding(0)
         .style(theme::ghost)
-        .on_press_maybe((idle && !chat.sending).then_some(App::Chat(channel, Msg::Attach)));
+        .on_press_maybe(enabled.then_some(App::Chat(channel, Msg::Attach)));
+    let attach = tipped(attach.into(), "Anexar arquivo");
     let send = button(
         text(if chat.sending {
             "Enviando…"
@@ -1073,9 +1237,12 @@ fn composer<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
         },
         ..Default::default()
     });
+    // Lista vazia e sem carregar: o erro já está no meio da tela, com o botão de tentar de novo.
+    let in_body = !chat.loaded && chat.timeline.messages.is_empty();
     let error = chat
         .error
         .as_deref()
+        .filter(|_| !in_body)
         .map(|e| text(e).size(13.5).color(DANGER));
     let upload: Option<Element<'_, App>> = match &chat.upload {
         Upload::Idle => None,
@@ -1245,7 +1412,11 @@ fn enter_sends(key: KeyPress, channel: i64) -> Option<Binding<App>> {
         Key::Named(Named::Enter) if focused && !key.modifiers.shift() => {
             Some(Binding::Custom(App::Chat(channel, Msg::Send)))
         }
-        _ => Binding::from_key_press(key),
+        // O colar padrão do campo só lê texto: vai por `Msg::Paste`, que olha a imagem antes.
+        _ => match Binding::from_key_press(key) {
+            Some(Binding::Paste) => Some(Binding::Custom(App::Chat(channel, Msg::Paste))),
+            binding => binding,
+        },
     }
 }
 
@@ -1281,19 +1452,22 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// Hora local da mensagem; de outro dia, com a data.
+/// Data e hora local do cabeçalho do grupo: "Hoje 19:13", "Ontem 19:13", ou a data.
 fn when(ms: i64) -> String {
     use chrono::{DateTime, Local};
-    let Some(at) = DateTime::from_timestamp_millis(ms) else {
-        return String::new();
-    };
-    let at = at.with_timezone(&Local);
-    let format = if at.date_naive() == Local::now().date_naive() {
-        "%H:%M"
-    } else {
-        "%d/%m/%Y %H:%M"
-    };
-    at.format(format).to_string()
+    DateTime::from_timestamp_millis(ms)
+        .map(|at| at.with_timezone(&Local).naive_local())
+        .map_or_else(String::new, |at| relative(at, Local::now().date_naive()))
+}
+
+/// `at` e `today` no mesmo fuso, pra o teste não depender do relógio nem do fuso da máquina.
+fn relative(at: chrono::NaiveDateTime, today: chrono::NaiveDate) -> String {
+    let clock = at.format("%H:%M");
+    match (today - at.date()).num_days() {
+        0 => format!("Hoje {clock}"),
+        1 => format!("Ontem {clock}"),
+        _ => at.format("%d/%m/%Y %H:%M").to_string(),
+    }
 }
 
 fn clock(ms: i64) -> String {
@@ -1759,6 +1933,12 @@ mod tests {
         c.lost = true;
         print(&a, "erro");
 
+        // Carga que falhou com a lista vazia: botão de tentar de novo.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let _ = chat(&mut a).update(Msg::Loaded(Err(Error::Offline)), &cliente);
+        print(&a, "erro-carga");
+
         // Anexos: imagem pronta, imagem baixando, vídeo e arquivo.
         let mut a = app();
         let _ = a.update(App::Chat(1, Msg::Open));
@@ -1885,6 +2065,213 @@ mod tests {
         digita(chat(&mut a), "@Ana e @Zé da Silva oi");
         print(&a, "mencoes-campo");
         print_largura(&a, "mencoes-campo-estreito", 560.0);
+
+        // Links: botões embaixo do texto, que segue selecionável.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let lista = vec![
+            msg(
+                1,
+                "Ana",
+                0,
+                "olha isso: https://github.com/opedrou/concord-client/releases.",
+            ),
+            msg(
+                2,
+                "Bruno",
+                1,
+                "dois (https://example.com/a?b=1) e http://www.exemplo.org:8080/x e \
+                 https://um-dominio-bem-comprido-pra-testar-a-quebra.example.com/caminho \
+                 https://quarto.dev https://quinto.dev",
+            ),
+        ];
+        let page = Page {
+            messages: lista,
+            has_more: false,
+        };
+        let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
+        print(&a, "links");
+        print_largura(&a, "links-estreito", 900.0);
+
+        // Datas relativas no cabeçalho, e a lixeira na mensagem sob o mouse.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        // Meio-dia de hoje e de ontem, pra o print não mudar com a hora de gerar.
+        let meio_dia = chrono::Local::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .and_then(|d| d.and_local_timezone(chrono::Local).earliest())
+            .unwrap()
+            .timestamp_millis();
+        let em = |id, autor, atras_ms, texto| Message {
+            created_at: meio_dia - atras_ms,
+            ..msg(id, autor, 0, texto)
+        };
+        let dia = 24 * 3_600_000;
+        let lista = vec![
+            em(1, "Ana", 2 * dia, "faz uns dias"),
+            em(2, "Bruno", dia, "ontem a gente falou disso"),
+            em(3, "Opedro", 0, "e agora é hoje"),
+        ];
+        let page = Page {
+            messages: lista,
+            has_more: false,
+        };
+        let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
+        let _ = a.update(App::Chat(1, Msg::Hover(3, true)));
+        print(&a, "datas");
+
+        // "Novas mensagens" quando chegou mensagem com a lista rolada pra cima.
+        let c = chat(&mut a);
+        c.unread = true;
+        print(&a, "novas");
+    }
+
+    #[test]
+    fn novas_mensagens_so_avisam_com_a_lista_rolada_pra_cima() {
+        use crate::api::ChatEvent::Created;
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let cliente = Client::new("https://a.b", None);
+        let c = chat(&mut a);
+        let page = Page {
+            messages: vec![msg(1, "ana", 0, "a"), msg(2, "ana", 1, "b")],
+            has_more: false,
+        };
+        let _ = c.update(Msg::Loaded(Ok(Window::first(page))), &cliente);
+        let chega = |c: &mut Chat, id| {
+            let message = msg(id, "ana", id, "x");
+            let _ = c.update(Msg::Live(Live::Event(Created { message })), &cliente);
+        };
+        // No fim, a tela desce sozinha: sem aviso.
+        chega(c, 3);
+        assert!(!c.unread);
+        // Rolou pra cima: avisa, e uma mensagem que já estava não conta.
+        let _ = c.update(Msg::Scrolled(false), &cliente);
+        chega(c, 3);
+        assert!(!c.unread);
+        chega(c, 4);
+        assert!(c.unread);
+        // Voltou ao fim rolando: some.
+        let _ = c.update(Msg::Scrolled(true), &cliente);
+        assert!(!c.unread);
+        // O botão desce e também apaga o aviso.
+        let _ = c.update(Msg::Scrolled(false), &cliente);
+        chega(c, 5);
+        assert!(c.unread);
+        let _ = c.update(Msg::JumpToNew, &cliente);
+        assert!(!c.unread && c.at_bottom);
+        // Mandar a própria mensagem com a lista rolada também desce, sem aviso.
+        let _ = c.update(Msg::Scrolled(false), &cliente);
+        let _ = c.update(Msg::Sent(Ok(msg(6, "opedro", 6, "y"))), &cliente);
+        assert!(!c.unread && c.at_bottom);
+    }
+
+    #[test]
+    fn arquivo_solto_anexa_so_com_o_chat_aberto_e_o_campo_livre() {
+        use iced::{Event, event, window};
+        let solto = |p: &str| Event::Window(window::Event::FileDropped(p.into()));
+        let ignora = event::Status::Ignored;
+        // A janela traduz o evento do sistema pra mensagem do app.
+        let msg = super::super::focus(solto("/tmp/x/a.png"), ignora, window::Id::unique());
+        assert!(matches!(msg, Some(App::FileDropped(p)) if p.ends_with("a.png")));
+
+        let mut a = app();
+        // Sem chat aberto, nada acontece.
+        let _ = a.update(App::FileDropped("/tmp/x/a.png".into()));
+        assert!(main(&mut a).chat.is_none());
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let _ = a.update(App::FileDropped("/tmp/x/a.png".into()));
+        let c = chat(&mut a);
+        assert!(matches!(&c.upload, Upload::Sending { name, .. } if name == "a.png"));
+        // Segundo arquivo com o primeiro subindo: um anexo por mensagem, o primeiro segue.
+        let _ = a.update(App::FileDropped("/tmp/x/b.png".into()));
+        let c = chat(&mut a);
+        assert!(matches!(&c.upload, Upload::Sending { name, .. } if name == "a.png"));
+        assert_eq!(c.error.as_deref(), Some("Só um anexo por mensagem."));
+    }
+
+    #[test]
+    fn ctrl_v_do_campo_passa_pelo_msg_paste() {
+        use iced::keyboard::{
+            Modifiers,
+            key::{Code, Physical},
+        };
+        let colar = |modifiers| KeyPress {
+            key: Key::Character("v".into()),
+            modified_key: Key::Character("v".into()),
+            physical_key: Physical::Code(Code::KeyV),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        };
+        let ctrl = if cfg!(target_os = "macos") {
+            Modifiers::LOGO
+        } else {
+            Modifiers::CTRL
+        };
+        assert!(matches!(
+            enter_sends(colar(ctrl), 1),
+            Some(Binding::Custom(App::Chat(1, Msg::Paste)))
+        ));
+        // `v` sozinho não é colar.
+        assert!(!matches!(
+            enter_sends(colar(Modifiers::empty()), 1),
+            Some(Binding::Custom(_))
+        ));
+        // Colar texto: entra no campo como antes.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let cliente = Client::new("https://a.b", None);
+        let c = chat(&mut a);
+        let _ = c.update(Msg::PasteText(Some("oi colado".into())), &cliente);
+        assert_eq!(c.draft.text(), "oi colado");
+        let _ = c.update(Msg::PasteText(None), &cliente);
+        assert_eq!(c.draft.text(), "oi colado");
+        // Imagem colada com um anexo já pronto: erro, e o arquivo temporário vai embora.
+        let tmp = std::env::temp_dir().join("concord-teste-colado.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        c.upload = Upload::Ready(Uploaded {
+            path: "x.png".into(),
+            name: "x.png".into(),
+            mime: "image/png".into(),
+            kind: "image".into(),
+            size: 1,
+        });
+        let _ = c.update(Msg::Pasted(Some(tmp.clone())), &cliente);
+        assert!(!tmp.exists());
+        assert_eq!(c.error.as_deref(), Some("Só um anexo por mensagem."));
+        assert!(matches!(c.upload, Upload::Ready(_)));
+    }
+
+    #[test]
+    fn tentar_de_novo_limpa_o_erro_e_busca_outra_vez() {
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let cliente = Client::new("https://a.b", None);
+        let c = chat(&mut a);
+        let _ = c.update(Msg::Loaded(Err(Error::Server(500))), &cliente);
+        assert!(c.error.is_some() && !c.loaded);
+        let _ = c.update(Msg::Retry, &cliente);
+        assert!(c.error.is_none());
+    }
+
+    #[test]
+    fn data_do_grupo_diz_hoje_e_ontem() {
+        use chrono::NaiveDate;
+        let dia = |m, d| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        let hoje = dia(11, 19);
+        let as_19_13 = |d: NaiveDate| d.and_hms_opt(19, 13, 0).unwrap();
+        assert_eq!(relative(as_19_13(hoje), hoje), "Hoje 19:13");
+        assert_eq!(relative(as_19_13(dia(11, 18)), hoje), "Ontem 19:13");
+        assert_eq!(relative(as_19_13(dia(11, 17)), hoje), "17/11/2026 19:13");
+        // Virada de mês e de ano.
+        assert_eq!(relative(as_19_13(dia(10, 31)), dia(11, 1)), "Ontem 19:13");
+        let ano = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let novo = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert_eq!(relative(as_19_13(ano), novo), "Ontem 19:13");
+        // Mensagem "do futuro" (relógio da máquina atrasado) mostra a data, não "Hoje".
+        assert_eq!(relative(as_19_13(dia(11, 20)), hoje), "20/11/2026 19:13");
     }
 
     #[test]
