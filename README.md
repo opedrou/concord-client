@@ -4,12 +4,12 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.17.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.18.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
 - **Voz:** microfone com cancelamento de eco, limitador de voz automático ou manual,
-  sensibilidade e ganho de entrada. Volume por pessoa e troca de dispositivo no meio da call, e
+  sensibilidade e ganho de entrada. Volume e botão de silenciar por pessoa, troca de dispositivo no meio da call, e
   o fone que cai volta sozinho quando reconecta. Avisa quem não está te ouvindo, call sendo
   gravada e conexão instável.
 - **Transmitir a tela:** tela inteira ou janela, com o som do que está tocando, em estéreo. Dá
@@ -78,37 +78,16 @@ o seletor de tela do sistema (xdg-desktop-portal).
 - No Linux, a bandeja precisa da extensão AppIndicator, que já vem no Ubuntu. Sem ela, o X
   fecha o app.
 
-## Novidades da v0.1.17
+## Novidades da v0.1.18
 
 ### Novo
-- **Notificações:** quando alguém te chama pra uma call ou te marca com `@` no chat, chega um
-  aviso do sistema com som, mesmo com a janela fechada. Clicar no aviso abre a call ou o chat.
-  Dá pra desligar em Configurações › Notificações.
-- **Bandeja e iniciar com o computador:** o X fecha a janela e o Concord segue na bandeja, com
-  "Abrir Concord" e "Sair". Ele pode abrir junto com o sistema, em segundo plano, só escutando
-  os avisos. Abrir de novo traz a janela que já está rodando, em vez de abrir outro.
-- **Chamar pessoas:** botão na call pra escolher quem chamar, como o do site.
-- **Lista de membros:** painel à direita com Online e Offline, quem está em voz e o botão de
-  minimizar.
-- **Menção no chat:** autocompletar do `@` com setas, Tab e Enter, e a menção destacada em roxo
-  na mensagem e na caixa de digitar.
-- **Som de abertura:** toca na primeira vez do dia que a janela abre. Abrir em segundo plano
-  não toca.
+- **Silenciar alguém com um clique:** na call, o quadro de cada pessoa tem um botão de
+  alto-falante no canto. Ele aparece com o mouse em cima e fica vermelho enquanto ela está
+  silenciada. Clicar de novo volta no volume de antes. O painel de volume (clique direito)
+  ganhou o mesmo botão.
 
-### Removido
-- **Chamado pelo WhatsApp:** o servidor não manda mais o chamado pro grupo do WhatsApp. Ele
-  chega como aviso no Concord.
-
-### Interno
-- Uma instância só por usuário, por uma porta local: a segunda abertura passa o pedido pra
-  primeira e sai.
-- Bancada ponta a ponta das notificações contra um servidor local.
-
-### Limites conhecidos
-- Precisa do servidor atualizado: com o servidor antigo não chega aviso e a lista mostra todo
-  mundo offline, menos quem está em voz.
-- Iniciar com o computador não foi testado num boot de verdade, só com o mesmo comando que o
-  sistema roda.
+### Corrigido
+- **Som de abertura mais baixo:** toca com metade do volume.
 
 ## Compilar
 
