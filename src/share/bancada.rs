@@ -157,6 +157,7 @@ impl Banca {
                 let _ = states.send(s);
             },
             |v| println!("AUDIO {v:?}"),
+            |_| {},
         ));
         Self { cmd, estados, room }
     }

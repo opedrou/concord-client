@@ -53,6 +53,10 @@ pub mod ffi {
         type DesktopFrame;
 
         fn new_desktop_capturer(options: DesktopCapturerOptions) -> UniquePtr<DesktopCapturer>;
+        /// Concord: token do portal pra fonte `id`, mandado no `select_source`.
+        fn set_restore_token(id: u64, token: &str);
+        /// Concord: token novo que o portal deu pra `id`, vazio se não deu. Ler apaga.
+        fn take_restore_token(id: u64) -> String;
         fn capture_frame(self: &DesktopCapturer);
         fn get_source_list(self: &DesktopCapturer) -> Vec<Source>;
         fn select_source(self: &DesktopCapturer, id: u64) -> bool;

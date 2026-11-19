@@ -179,6 +179,39 @@ impl Blocks {
 }
 
 /// PID do dono da janela. O id do `DesktopCapturer` no Windows é o próprio HWND.
+/// Nome do executável da janela, em minúsculas: `chrome.exe`. Processo de admin recusa.
+pub(super) fn window_exe(hwnd: u64) -> Option<String> {
+    use windows::{
+        Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{
+                OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+                QueryFullProcessImageNameW,
+            },
+        },
+        core::PWSTR,
+    };
+    let pid = window_pid(hwnd)?;
+    let mut path = [0u16; 1024];
+    let mut len = path.len() as u32;
+    // SAFETY: o handle fecha no fim, e `len` é o tamanho do buffer, que a função não passa.
+    let read = unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let read = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(path.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(process);
+        read.is_ok()
+    };
+    read.then(|| {
+        let path = String::from_utf16_lossy(&path[..len as usize]);
+        path.rsplit('\\').next().unwrap_or_default().to_lowercase()
+    })
+}
+
 fn window_pid(hwnd: u64) -> Option<u32> {
     #[link(name = "user32")]
     unsafe extern "system" {

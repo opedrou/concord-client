@@ -81,7 +81,10 @@ pub struct ActiveCall {
     /// Vazia no Linux. `None` enquanto lê.
     pub share_sources: Option<Vec<(share::Source, Option<image::Handle>)>>,
     /// Escolhida no seletor. Na aba de telas sempre tem uma; na de aplicativos começa vazia.
+    /// No Linux, a lembrada que vai no "Transmitir de novo".
     pub share_source: Option<share::Source>,
+    /// "Escolher outra" no painel com fonte lembrada, ou a lembrada sumiu: o seletor de sempre.
+    pub share_other: bool,
     /// Aba do seletor: `true` em Aplicativos.
     pub share_windows: bool,
     /// Áudio da transmissão no ar, por `Event::ShareAudio`.
@@ -156,6 +159,7 @@ impl ActiveCall {
             share_panel: false,
             share_sources: None,
             share_source: None,
+            share_other: false,
             share_windows: false,
             share_audio: None,
             share_menu: false,
@@ -221,6 +225,7 @@ impl ActiveCall {
             share::State::Off | share::State::Failed => {
                 self.share = share::State::Off;
                 self.share_panel = !self.share_panel;
+                self.share_other = false;
                 self.volume_panel = None;
             }
         }
@@ -247,15 +252,29 @@ impl ActiveCall {
         }
     }
 
-    /// Lista nova do seletor, com as miniaturas já prontas pra tela.
-    pub fn set_share_sources(&mut self, sources: Vec<(share::Source, Option<share::Thumb>)>) {
-        let sources = sources
+    /// Lista nova do seletor, com as miniaturas já prontas pra tela. A lembrada (`last`) já
+    /// vem marcada, na aba dela; se sumiu, fica o seletor de sempre.
+    pub fn set_share_sources(
+        &mut self,
+        sources: Vec<(share::Source, Option<share::Thumb>)>,
+        last: Option<&share::Source>,
+    ) {
+        let sources: Vec<_> = sources
             .into_iter()
             .map(|(s, t)| {
                 let handle = t.map(|t| image::Handle::from_rgba(t.width, t.height, t.rgba));
                 (s, handle)
             })
             .collect();
+        if let Some(last) = last {
+            match share::find(sources.iter().map(|(s, _)| s), last) {
+                Some(s) => {
+                    self.share_windows = s.window;
+                    self.share_source = Some(s.clone());
+                }
+                None => self.share_other = true,
+            }
+        }
         self.share_sources = Some(sources);
         self.fix_share_source();
     }
@@ -629,6 +648,7 @@ mod tests {
             window: id > 1,
             id,
             title: title.into(),
+            ..Default::default()
         };
         let lista = |ids: &[u64]| {
             ids.iter()
@@ -636,22 +656,60 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let mut call = ActiveCall::new(1, "call-tete".into());
-        call.set_share_sources(lista(&[0, 1, 7]));
+        call.set_share_sources(lista(&[0, 1, 7]), None);
         assert_eq!(call.share_source, Some(fonte(0, "0")), "começa na tela 1");
 
         call.set_share_tab(true);
         assert_eq!(call.share_source, None, "aplicativo só no clique");
         call.share_source = Some(fonte(7, "7"));
-        call.set_share_sources(lista(&[0, 1, 7]));
+        call.set_share_sources(lista(&[0, 1, 7]), None);
         assert_eq!(call.share_source, Some(fonte(7, "7")), "lista nova mantém");
-        call.set_share_sources(lista(&[0, 1]));
+        call.set_share_sources(lista(&[0, 1]), None);
         assert_eq!(call.share_source, None, "janela fechou");
 
         call.share_source = Some(fonte(1, "1"));
         call.set_share_tab(false);
         assert_eq!(call.share_source, Some(fonte(1, "1")), "tela 2 fica");
-        call.set_share_sources(lista(&[0]));
+        call.set_share_sources(lista(&[0]), None);
         assert_eq!(call.share_source, Some(fonte(0, "0")), "monitor saiu");
+    }
+
+    #[test]
+    fn seletor_abre_na_lembrada_e_sem_ela_fica_o_de_sempre() {
+        let janela = |id, exe: &str, title: &str| share::Source {
+            window: true,
+            id,
+            title: title.into(),
+            exe: exe.into(),
+            ..Default::default()
+        };
+        let tela = share::Source {
+            id: 9,
+            title: "Tela 1".into(),
+            ..Default::default()
+        };
+        let lista = || {
+            vec![
+                (tela.clone(), None),
+                (janela(40, "chrome.exe", "Concord - Chrome"), None),
+                (janela(41, "code.exe", "a.rs - VS Code"), None),
+            ]
+        };
+        // Reaberta depois: id novo, mesmo executável e título.
+        let mut call = ActiveCall::new(1, "call-tete".into());
+        call.set_share_sources(lista(), Some(&janela(7, "code.exe", "a.rs - VS Code")));
+        assert!(call.share_windows, "abre na aba dela");
+        assert_eq!(call.share_source.as_ref().map(|s| s.id), Some(41));
+        assert!(!call.share_other);
+
+        let mut call = ActiveCall::new(1, "call-tete".into());
+        call.set_share_sources(lista(), Some(&janela(7, "spotify.exe", "Spotify")));
+        assert!(call.share_other, "sumiu: o seletor de sempre");
+        assert_eq!(
+            call.share_source,
+            Some(tela),
+            "nas telas, a primeira, como sem lembrada"
+        );
     }
 
     #[test]

@@ -31,20 +31,29 @@ class Source;
 
 namespace livekit_ffi {
 
+// Concord: avisos do portal persistente (no .cpp).
+class PortalRelay;
+
 class DesktopCapturer : public webrtc::DesktopCapturer::Callback {
  public:
-  explicit DesktopCapturer(std::unique_ptr<webrtc::DesktopCapturer> capturer)
-      : capturer(std::move(capturer)), callback(std::nullopt) {}
+  // Concord: construtores e destrutor no .cpp, onde o PortalRelay é completo. O `relay` é
+  // da captura do portal criada aqui.
+  explicit DesktopCapturer(std::unique_ptr<webrtc::DesktopCapturer> capturer);
+  DesktopCapturer(std::unique_ptr<PortalRelay> relay,
+                  std::unique_ptr<webrtc::DesktopCapturer> capturer);
+  ~DesktopCapturer() override;
 
   void OnCaptureResult(webrtc::DesktopCapturer::Result result,
                        std::unique_ptr<webrtc::DesktopFrame> frame) final;
 
   rust::Vec<Source> get_source_list() const;
-  bool select_source(uint64_t id) const { return capturer->SelectSource(id); }
+  bool select_source(uint64_t id) const;
   void start(rust::Box<DesktopCapturerCallbackWrapper> callback);
   void capture_frame() const { capturer->CaptureFrame(); }
 
  private:
+  // Concord: antes da captura, pra morrer depois dela.
+  std::unique_ptr<PortalRelay> relay;
   std::unique_ptr<webrtc::DesktopCapturer> capturer;
   std::optional<rust::Box<DesktopCapturerCallbackWrapper>> callback;
 };
@@ -69,4 +78,8 @@ class DesktopFrame {
 };
 
 std::unique_ptr<DesktopCapturer> new_desktop_capturer(DesktopCapturerOptions options);
+
+// Concord: token do portal por id de fonte (só o Linux usa).
+void set_restore_token(uint64_t id, rust::Str token);
+rust::String take_restore_token(uint64_t id);
 }  // namespace livekit_ffi

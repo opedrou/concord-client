@@ -939,6 +939,7 @@ dependencies = [
  "tray-icon",
  "uuid",
  "wasapi",
+ "webrtc-sys",
  "windows 0.62.2",
  "winresource",
  "zbus",

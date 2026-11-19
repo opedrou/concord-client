@@ -107,6 +107,8 @@ pub enum Event {
     /// quem assiste, o local primeiro. Só entra quem tem espectador.
     Viewers(HashMap<String, Vec<String>>),
     Share(share::State),
+    /// O que a transmissão mostrou no primeiro quadro, pra lembrar. `None`: esquecer.
+    ShareChosen(Option<share::Source>),
     /// Áudio da transmissão no ar: a escolha e os apps tocando.
     ShareAudio(share::View),
     /// Prévia pequena da transmissão de alguém, pela identity: um quadro só.
@@ -319,7 +321,7 @@ impl Call {
         let (cmd, rx) = mpsc::unbounded_channel();
         let (share, share_rx) = mpsc::unbounded_channel();
         let (room, room_rx) = watch::channel(None);
-        let (states, audio) = (tx.clone(), tx.clone());
+        let (states, audio, chosen) = (tx.clone(), tx.clone(), tx.clone());
         let preview = share::Preview::default();
         let sharing = share::run(
             share_rx,
@@ -331,6 +333,9 @@ impl Call {
             },
             move |view| {
                 let _ = audio.send(Event::ShareAudio(view));
+            },
+            move |source| {
+                let _ = chosen.send(Event::ShareChosen(source));
             },
         );
         let task = Task {
