@@ -33,7 +33,10 @@ use crate::chat::{self as logic, Live, Timeline, Window};
 
 const CLIP: &[u8] = include_bytes!("../../assets/icons/paperclip.svg");
 const TRASH: &[u8] = include_bytes!("../../assets/icons/trash.svg");
+const ARROW_DOWN: &[u8] = include_bytes!("../../assets/icons/arrow-down.svg");
 const LISTA: &str = "chat-lista";
+/// Até quantos pixels do fim a lista ainda conta como "no fim".
+const NO_FIM: f32 = 24.0;
 const COMPOSER: &str = "chat-composer";
 const ROSTO: f32 = 40.0;
 /// Busca do que perdeu que falhou com o tempo real de pé: tenta de novo depois disso.
@@ -72,6 +75,12 @@ pub enum Msg {
     Live(Live),
     /// Tenta de novo a busca do que perdeu.
     Recover,
+    /// Botão "Tentar de novo" da tela de erro, com a lista vazia.
+    Retry,
+    /// A lista rolou: `true` se está no fim, onde chega a mensagem nova.
+    Scrolled(bool),
+    /// Botão "Novas mensagens": desce até o fim.
+    JumpToNew,
     /// Botão de anexar: abre o seletor do sistema.
     Attach,
     Picked(Option<PathBuf>),
@@ -126,6 +135,10 @@ pub struct Chat {
     /// O tempo real caiu e está tentando voltar.
     lost: bool,
     live: bool,
+    /// A lista está no fim: mensagem nova entra à vista e a tela segue descendo.
+    at_bottom: bool,
+    /// Chegou mensagem enquanto a pessoa lia o histórico: mostra "Novas mensagens".
+    unread: bool,
     /// Um anexo por mensagem: sobe assim que escolhe, como na web.
     upload: Upload,
     images: HashMap<i64, Picture>,
@@ -186,6 +199,8 @@ impl Chat {
             hover: None,
             lost: false,
             live: false,
+            at_bottom: true,
+            unread: false,
             upload: Upload::Idle,
             images: HashMap::new(),
             opening: HashSet::new(),
@@ -294,7 +309,12 @@ impl Chat {
     }
 
     pub fn update(&mut self, msg: Msg, client: &Client) -> Task<App> {
+        let newest = self.timeline.newest();
         let task = self.handle(msg, client);
+        // Mensagem mais nova que a da tela, com a lista rolada pra cima: avisa.
+        if newest.is_some() && self.timeline.newest() > newest && !self.at_bottom {
+            self.unread = true;
+        }
         Task::batch([task, self.fetch_images(client)])
     }
 
@@ -319,6 +339,18 @@ impl Chat {
                 });
             }
             Msg::Recover => return self.recover(client),
+            Msg::Retry => {
+                self.error = None;
+                return self.recover(client);
+            }
+            Msg::Scrolled(bottom) => {
+                self.at_bottom = bottom;
+                self.unread &= !bottom;
+            }
+            Msg::JumpToNew => {
+                (self.at_bottom, self.unread) = (true, false);
+                return to_bottom();
+            }
             Msg::Attach => {
                 if !matches!(self.upload, Upload::Idle) || self.sending {
                     return Task::none();
@@ -469,6 +501,7 @@ impl Chat {
                         self.upload = Upload::Idle;
                         self.timeline.insert(message);
                         self.sync();
+                        (self.at_bottom, self.unread) = (true, false);
                         return to_bottom();
                     }
                     Err(e) => return self.failed(e, "Não foi possível enviar a mensagem."),
@@ -672,7 +705,19 @@ pub fn view<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
     let body = if chat.timeline.messages.is_empty() {
         match (chat.loaded, &chat.error) {
             (false, None) => empty("Carregando mensagens…"),
-            (false, Some(_)) => empty("Não foi possível carregar as mensagens."),
+            (false, Some(error)) => {
+                let retry = button(text("Tentar de novo").size(13.5))
+                    .padding([7, 16])
+                    .style(theme::outline)
+                    .on_press(App::Chat(channel, Msg::Retry));
+                container(
+                    column![text(error).size(14).color(FG2), retry]
+                        .spacing(12)
+                        .align_x(Alignment::Center),
+                )
+                .center(Length::Fill)
+                .into()
+            }
             (true, _) => empty("Nenhuma mensagem ainda."),
         }
     } else {
@@ -723,15 +768,40 @@ fn list<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
         left: 10.0,
     });
     // Pouca mensagem fica embaixo, junto do campo, como no Discord.
-    container(
+    let scroll = container(
         scrollable(items)
             .id(LISTA)
             .anchor_bottom()
+            .on_scroll(move |v| App::Chat(channel, Msg::Scrolled(v.absolute_offset().y <= NO_FIM)))
             .style(theme::thin_scroll),
     )
     .width(Length::Fill)
-    .align_bottom(Length::Fill)
-    .into()
+    .align_bottom(Length::Fill);
+    // A camada de cima fica sempre, vazia sem aviso: o iced liga a posição da rolagem ao lugar
+    // na árvore, e trocar a lista de lugar a mandaria pro fim.
+    let new: Element<'a, App> = if chat.unread {
+        let label = row![
+            icon(ARROW_DOWN, 14.0, FG),
+            text("Novas mensagens").size(13.5).font(theme::SEMIBOLD),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        let jump = button(label)
+            .padding([7, 14])
+            .style(theme::primary)
+            .on_press(App::Chat(channel, Msg::JumpToNew));
+        container(jump)
+            .center_x(Length::Fill)
+            .align_bottom(Length::Fill)
+            .padding(Padding {
+                bottom: 14.0,
+                ..Padding::ZERO
+            })
+            .into()
+    } else {
+        space().into()
+    };
+    stack![scroll, new].into()
 }
 
 fn message_row<'a>(
@@ -1117,9 +1187,12 @@ fn composer<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
         },
         ..Default::default()
     });
+    // Lista vazia e sem carregar: o erro já está no meio da tela, com o botão de tentar de novo.
+    let in_body = !chat.loaded && chat.timeline.messages.is_empty();
     let error = chat
         .error
         .as_deref()
+        .filter(|_| !in_body)
         .map(|e| text(e).size(13.5).color(DANGER));
     let upload: Option<Element<'_, App>> = match &chat.upload {
         Upload::Idle => None,
@@ -1806,6 +1879,12 @@ mod tests {
         c.lost = true;
         print(&a, "erro");
 
+        // Carga que falhou com a lista vazia: botão de tentar de novo.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let _ = chat(&mut a).update(Msg::Loaded(Err(Error::Offline)), &cliente);
+        print(&a, "erro-carga");
+
         // Anexos: imagem pronta, imagem baixando, vídeo e arquivo.
         let mut a = app();
         let _ = a.update(App::Chat(1, Msg::Open));
@@ -1962,14 +2041,20 @@ mod tests {
         // Datas relativas no cabeçalho, e a lixeira na mensagem sob o mouse.
         let mut a = app();
         let _ = a.update(App::Chat(1, Msg::Open));
-        let agora = chrono::Utc::now().timestamp_millis();
+        // Meio-dia de hoje e de ontem, pra o print não mudar com a hora de gerar.
+        let meio_dia = chrono::Local::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .and_then(|d| d.and_local_timezone(chrono::Local).earliest())
+            .unwrap()
+            .timestamp_millis();
         let em = |id, autor, atras_ms, texto| Message {
-            created_at: agora - atras_ms,
+            created_at: meio_dia - atras_ms,
             ..msg(id, autor, 0, texto)
         };
         let dia = 24 * 3_600_000;
         let lista = vec![
-            em(1, "Ana", 5 * dia, "faz uns dias"),
+            em(1, "Ana", 2 * dia, "faz uns dias"),
             em(2, "Bruno", dia, "ontem a gente falou disso"),
             em(3, "Opedro", 0, "e agora é hoje"),
         ];
@@ -1980,7 +2065,64 @@ mod tests {
         let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
         let _ = a.update(App::Chat(1, Msg::Hover(3, true)));
         print(&a, "datas");
+
+        // "Novas mensagens" quando chegou mensagem com a lista rolada pra cima.
+        let c = chat(&mut a);
+        c.unread = true;
+        print(&a, "novas");
         print_largura(&a, "links-estreito", 900.0);
+    }
+
+    #[test]
+    fn novas_mensagens_so_avisam_com_a_lista_rolada_pra_cima() {
+        use crate::api::ChatEvent::Created;
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let cliente = Client::new("https://a.b", None);
+        let c = chat(&mut a);
+        let page = Page {
+            messages: vec![msg(1, "ana", 0, "a"), msg(2, "ana", 1, "b")],
+            has_more: false,
+        };
+        let _ = c.update(Msg::Loaded(Ok(Window::first(page))), &cliente);
+        let chega = |c: &mut Chat, id| {
+            let message = msg(id, "ana", id, "x");
+            let _ = c.update(Msg::Live(Live::Event(Created { message })), &cliente);
+        };
+        // No fim, a tela desce sozinha: sem aviso.
+        chega(c, 3);
+        assert!(!c.unread);
+        // Rolou pra cima: avisa, e uma mensagem que já estava não conta.
+        let _ = c.update(Msg::Scrolled(false), &cliente);
+        chega(c, 3);
+        assert!(!c.unread);
+        chega(c, 4);
+        assert!(c.unread);
+        // Voltou ao fim rolando: some.
+        let _ = c.update(Msg::Scrolled(true), &cliente);
+        assert!(!c.unread);
+        // O botão desce e também apaga o aviso.
+        let _ = c.update(Msg::Scrolled(false), &cliente);
+        chega(c, 5);
+        assert!(c.unread);
+        let _ = c.update(Msg::JumpToNew, &cliente);
+        assert!(!c.unread && c.at_bottom);
+        // Mandar a própria mensagem com a lista rolada também desce, sem aviso.
+        let _ = c.update(Msg::Scrolled(false), &cliente);
+        let _ = c.update(Msg::Sent(Ok(msg(6, "opedro", 6, "y"))), &cliente);
+        assert!(!c.unread && c.at_bottom);
+    }
+
+    #[test]
+    fn tentar_de_novo_limpa_o_erro_e_busca_outra_vez() {
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let cliente = Client::new("https://a.b", None);
+        let c = chat(&mut a);
+        let _ = c.update(Msg::Loaded(Err(Error::Server(500))), &cliente);
+        assert!(c.error.is_some() && !c.loaded);
+        let _ = c.update(Msg::Retry, &cliente);
+        assert!(c.error.is_none());
     }
 
     #[test]
