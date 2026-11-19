@@ -744,9 +744,7 @@ fn message_row<'a>(
             // Camada de baixo com o mesmo texto e tamanho, só com o fundo das menções: o editor
             // por cima segue selecionável. As duas quebram linha igual.
             body = body.push(stack![
-                mention_layer(&message.content, &found, |s| s
-                    .background(Background::Color(PILULA))
-                    .border(border::rounded(4))),
+                mention_layer(&message.content, &found, pill),
                 selectable
             ]);
         }
@@ -825,6 +823,12 @@ fn purple(_: &(), _: &Theme) -> iced::advanced::text::highlighter::Format<iced::
 
 /// Texto invisível com o mesmo tamanho do editor, e `marked` aplicado em cada menção: o
 /// fundo ou o sublinhado que o `Format` do editor não faz.
+/// Fundo roxo da menção, na mensagem e no campo.
+fn pill(s: Span<'_, (), iced::Font>) -> Span<'_, (), iced::Font> {
+    s.background(Background::Color(PILULA))
+        .border(border::rounded(4))
+}
+
 fn mention_layer<'a>(
     content: &str,
     found: &[Range<usize>],
@@ -1017,15 +1021,15 @@ fn composer<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
         .padding([9, 0])
         .max_height(140)
         .style(read_only);
-    // Sublinhado por baixo das menções, só com o campo curto: se rolar, desalinharia. O
-    // `stack` fica sempre, com a camada vazia sem menção: o iced liga o estado ao lugar na
-    // árvore, e trocar o editor de lugar tirava o foco no meio da digitação.
+    // Pílula por baixo das menções, igual à da mensagem, só com o campo curto: se rolar,
+    // desalinharia. O `stack` fica sempre, com a camada vazia sem menção: o iced liga o
+    // estado ao lugar na árvore, e trocar o editor de lugar tirava o foco ao digitar.
     let draft = chat.draft.text();
     let found = mention_ranges(&draft, &chat.everyone);
     let under: Element<'_, App> = if found.is_empty() || !short(&draft) {
         space().into()
     } else {
-        let under = mention_layer(&draft, &found, |s| s.underline(true).color(ACCENT2));
+        let under = mention_layer(&draft, &found, pill);
         container(under).padding([9, 0]).into()
     };
     let editor = stack![editor].push_under(under).width(Length::Fill);
