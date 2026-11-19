@@ -15,7 +15,7 @@ use super::theme::{self, ACCENT, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, FG, 
 use super::voice::{self, ActiveCall, GAP, Status};
 use super::{Main, Msg, avatar};
 use crate::call::{Live, MAX_ATTEMPTS};
-use crate::config::{Config, SCREEN as SCREEN_KEY};
+use crate::config::{Config, SCREEN as SCREEN_KEY, VOLUME_PADRAO};
 use crate::share::{Quality, Source, State};
 
 const ALERT: &[u8] = include_bytes!("../../assets/icons/alert-triangle.svg").as_slice();
@@ -382,7 +382,9 @@ fn tile<'a>(
     } else {
         hover(tile, corner)
     };
+    // O botão do canto captura o clique dele: o `mouse_area` só vê o que sobra.
     mouse_area(tile)
+        .on_press(Msg::OpenVolume(name.to_owned()))
         .on_right_press(Msg::OpenVolume(name.to_owned()))
         .into()
 }
@@ -988,6 +990,16 @@ pub(super) fn floating(ring: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// Ganho real da posição do slider: 100 vale 200%. A posição padrão dá 1,0082 e mostra 100%.
+fn percent(slider: u8) -> String {
+    let gain = if slider == VOLUME_PADRAO {
+        1.0
+    } else {
+        crate::audio::gain(slider)
+    };
+    format!("{}%", (gain * 100.0).round())
+}
+
 /// Volume de uma pessoa. Fecha no X, no Escape ou com um clique fora (`overlays`).
 fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> Element<'a, Msg> {
     let volume = config.volume_of(name);
@@ -1019,6 +1031,11 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
             .size(13)
             .color(FG2),
         level,
+        text(percent(volume))
+            .size(13)
+            .color(FG2)
+            .width(42)
+            .align_x(Alignment::End),
     ]
     .spacing(10)
     .align_y(Alignment::Center);
@@ -1056,6 +1073,14 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percentual_e_o_ganho_real_do_slider() {
+        assert_eq!(percent(0), "0%");
+        assert_eq!(percent(71), "100%");
+        assert_eq!(percent(100), "200%");
+        assert_eq!(percent(50), "50%");
+    }
 
     #[test]
     fn nome_comprido_corta_com_reticencias_na_largura() {

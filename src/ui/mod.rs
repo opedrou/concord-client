@@ -3770,6 +3770,8 @@ mod tests {
         let _ = a.update(Msg::ToggleDeafen);
         a.config.volumes.insert("Ana".into(), 40);
         print(&a, "palco-surdo-volume");
+        a.config.volumes.insert("Ana".into(), 100);
+        print(&a, "palco-volume-200");
 
         // Avisos da web: selo de quem não me ouve, gravação e conexão instável (no meu tile).
         let (mut a, id) = palco(4);
