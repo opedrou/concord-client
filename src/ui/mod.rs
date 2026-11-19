@@ -776,12 +776,22 @@ impl App {
                 self.config.toggle_mic();
                 self.persist();
                 self.apply_mute();
+                self.chime(if self.config.mic_muted {
+                    Effect::Off
+                } else {
+                    Effect::On
+                });
                 Task::none()
             }
             Msg::ToggleDeafen => {
                 self.config.toggle_deafen();
                 self.persist();
                 self.apply_mute();
+                self.chime(if self.config.deafened {
+                    Effect::Off
+                } else {
+                    Effect::On
+                });
                 Task::none()
             }
             Msg::JoinChannel(slug) => self.join_channel(slug),
@@ -2643,6 +2653,8 @@ mod tests {
             );
             let _ = a.update(Msg::ToggleMic);
             assert!(a.config.mic_muted);
+            // Fone desligado, mic ligado, mic desligado.
+            assert_eq!(chimes(), [Effect::Off, Effect::On, Effect::Off]);
         }
     }
 

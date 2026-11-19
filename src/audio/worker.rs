@@ -37,6 +37,8 @@ pub enum Command {
     Input(Option<String>),
     Output(Option<String>),
     Effect(&'static [u8]),
+    /// Toca surdo também: ver [`Mixer::cue`].
+    Cue(&'static [u8]),
     Voice {
         key: String,
         name: String,
@@ -304,6 +306,7 @@ pub fn run(
                     output.switch(name);
                 }
                 Command::Effect(pcm) => mixer.play(pcm),
+                Command::Cue(pcm) => mixer.cue(pcm),
                 Command::Voice { key, name, queue } => mixer.add(key, name, queue),
             }
             next = commands.try_recv().ok();
