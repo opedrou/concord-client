@@ -257,6 +257,8 @@ pub enum Msg {
     Fullscreen,
     /// Clique na transmissão assistida: alterna entre o tile e grande com as pessoas do lado.
     FocusScreen,
+    /// Fim da espera de um clique solto na transmissão grande.
+    ScreenUnfocus(u64),
     /// Mouse perto ou longe do pé do palco: mostra ou esconde a barra.
     BarNear(bool),
     /// Mouse no palco: onde está e se está perto do pé.
@@ -355,6 +357,7 @@ fn action(msg: &Msg) -> Option<String> {
         Msg::Watch(None) => "parou de assistir".into(),
         Msg::Fullscreen => "pôs a transmissão em tela cheia".into(),
         Msg::FocusScreen => "clicou na transmissão".into(),
+        Msg::ScreenUnfocus(_) => "voltou a transmissão pro tile".into(),
         Msg::Focus(b) => on(*b, "janela ganhou o foco", "janela perdeu o foco"),
         Msg::RestartForUpdate => "clicou pra abrir a versão nova".into(),
         Msg::Input(d) => format!("escolheu a entrada {}", device(d)),
@@ -1150,11 +1153,21 @@ impl App {
                 Task::none()
             }
             Msg::FocusScreen => {
-                if let Some(call) = self.call_mut().filter(|c| c.watching.is_some()) {
-                    call.view = match call.view {
-                        voice::View::Tile => voice::View::Focus,
-                        _ => voice::View::Tile,
-                    };
+                let seq = self
+                    .call_mut()
+                    .filter(|c| c.watching.is_some())
+                    .and_then(|c| c.screen_click(Instant::now()));
+                match seq {
+                    Some(seq) => Task::future(async move {
+                        tokio::time::sleep(voice::DOUBLE_CLICK).await;
+                        Msg::ScreenUnfocus(seq)
+                    }),
+                    None => Task::none(),
+                }
+            }
+            Msg::ScreenUnfocus(seq) => {
+                if let Some(call) = self.call_mut() {
+                    call.screen_unfocus(seq);
                 }
                 Task::none()
             }
@@ -2843,9 +2856,11 @@ mod tests {
         let _ = a.update(Msg::FocusScreen);
         assert_eq!(
             call_of(&mut a).view,
-            voice::View::Tile,
-            "outro clique volta"
+            voice::View::Full,
+            "dois cliques seguidos: tela cheia"
         );
+        assert!(main_of(&mut a).full_window, "a janela segue a tela cheia");
+        let _ = a.update(Msg::Escape);
 
         let _ = a.update(Msg::Fullscreen);
         assert!(main_of(&mut a).full_window, "a janela segue a tela cheia");

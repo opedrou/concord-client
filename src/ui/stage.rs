@@ -450,7 +450,7 @@ fn screen_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -
         .height(size.height)
         .clip(true)
         .style(rounded_stage);
-    // Clique na assistida aumenta; botão direito abre o volume dela e a tela cheia.
+    // Clique na assistida aumenta, dois ligam a tela cheia; botão direito abre o volume dela.
     let mut area =
         mouse_area(tile).on_right_press(Msg::OpenVolume(Config::screen_key(voice::name_of(p))));
     if watching {
@@ -506,9 +506,14 @@ fn own_tile<'a>(m: &'a Main, call: &'a ActiveCall, p: &'a Live, size: Size) -> E
 }
 
 /// Transmissão assistida em tela cheia, sem a barra lateral. A barra de controles aparece
-/// com o mouse perto do pé, com "Fechar transmissão" no lugar de sair; Esc volta.
+/// com o mouse perto do pé, com "Fechar transmissão" no lugar de sair; Esc ou duplo clique volta.
 pub fn full<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
-    let base = with_bar(call, config, move |_| screen_image(call, 15.0));
+    // Duplo clique sai da tela cheia, como o Esc.
+    let base = with_bar(call, config, move |_| {
+        mouse_area(screen_image(call, 15.0))
+            .on_double_click(Msg::Escape)
+            .into()
+    });
     let mut layers = vec![container(base).style(theme::fill(theme::STAGE)).into()];
     overlays(m, call, config, &mut layers);
     stack(layers).into()
