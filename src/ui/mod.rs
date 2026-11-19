@@ -58,6 +58,9 @@ const TELA: Duration = Duration::from_millis(16);
 const PREVIA: Duration = Duration::from_millis(200);
 /// Relógio das câmeras: 30 por segundo, o ritmo de uma câmera.
 const CAMERA: Duration = Duration::from_millis(33);
+/// Com o "Não incomodar" ligado, de quanto em quanto tempo confere se a hora passou, pra o
+/// menu da bandeja voltar. Pelo relógio de parede: suspender o PC conta.
+const CONFERE_SILENCIO: Duration = Duration::from_secs(20);
 
 // Quantas vezes `persist` rodou nesta thread de teste, e os sons que `chime` tocaria.
 #[cfg(test)]
@@ -170,6 +173,10 @@ struct Main {
     /// A bandeja está na tela. Ela só existe logado, que é quando o segundo plano serve pra
     /// algo; sem ela não tem de onde reabrir, e o X sai do app.
     tray: bool,
+    /// Chegou `@` com a janela sem foco: ponto no ícone da bandeja até a janela ganhar foco.
+    unseen: bool,
+    /// "Não incomodar" da bandeja: até essa hora não sai notificação nem som dela.
+    quiet: Option<chrono::DateTime<chrono::Local>>,
     /// Quem tem conta no servidor, pra chamar pra call e pro `@` do chat.
     members: Vec<Member>,
     /// Usernames online, do polling de presença. Quem está em voz conta de qualquer jeito.
@@ -322,6 +329,8 @@ pub enum Msg {
     /// A notificação fechou, e `true` se foi com clique: aí faz o que ela pedia.
     NotifyClosed(Pending, bool),
     Tray(TrayEvent),
+    /// Relógio do "Não incomodar": desliga quando a hora passa.
+    QuietTick,
     /// Interruptor "Mostrar notificações".
     Notifications(bool),
     /// Interruptor "Iniciar com o computador".
@@ -387,6 +396,9 @@ fn action(msg: &Msg) -> Option<String> {
         Msg::NotifyClosed(_, true) => "clicou na notificação".into(),
         Msg::Tray(TrayEvent::Open) => "abriu pela bandeja".into(),
         Msg::Tray(TrayEvent::Quit) => "saiu pela bandeja".into(),
+        Msg::Tray(TrayEvent::ToggleMic) => "clicou no mic pela bandeja".into(),
+        Msg::Tray(TrayEvent::Leave) => "saiu da call pela bandeja".into(),
+        Msg::Tray(TrayEvent::Quiet) => "clicou em não incomodar pela bandeja".into(),
         Msg::Notifications(b) => on(*b, "ligou as notificações", "desligou as notificações"),
         Msg::Autostart(b) => on(
             *b,
@@ -575,6 +587,9 @@ impl App {
         }
         if let Screen::Main(m) = &self.screen {
             subs.push(Subscription::run(crate::tray::run).map(Msg::Tray));
+            if m.quiet.is_some() {
+                subs.push(time::every(CONFERE_SILENCIO).map(|_| Msg::QuietTick));
+            }
             // Com ou sem janela: é pra isso que o processo fica em segundo plano.
             if self.config.notifications {
                 let key = Inbox(m.client.clone(), m.server.clone(), m.user.id);
@@ -664,7 +679,20 @@ impl App {
             Screen::Main(_) if self.window.is_some() => health::beat(Beat::Ui),
             _ => health::idle(Beat::Ui),
         }
+        crate::tray::set(self.tray_state());
         Task::batch([task, self.sync_window()])
+    }
+
+    /// O que o menu e o ícone da bandeja mostram. O mic é o mesmo estado do botão.
+    fn tray_state(&self) -> crate::tray::State {
+        let Screen::Main(m) = &self.screen else {
+            return Default::default();
+        };
+        crate::tray::State {
+            mic_muted: m.call.as_ref().map(|_| self.config.mic_muted),
+            unseen: m.unseen,
+            quiet: m.quiet,
+        }
     }
 
     /// A janela sai da tela cheia por qualquer caminho que pare de assistir: botão, Esc,
@@ -1145,6 +1173,7 @@ impl App {
                     if focused && let Some(open) = &m.chat {
                         m.mentions.remove(&open.channel);
                     }
+                    m.unseen &= !focused;
                 }
                 if let Some(call) = self.call_mut() {
                     call.set_focus(focused);
@@ -1255,6 +1284,15 @@ impl App {
             }
             Msg::NotifyClosed(pending, true) => self.open_pending(pending),
             Msg::Tray(event) => self.tray(event),
+            Msg::QuietTick => {
+                if let Screen::Main(m) = &mut self.screen
+                    && m.quiet.is_some_and(|until| chrono::Local::now() >= until)
+                {
+                    log!("não incomodar: acabou a hora");
+                    m.quiet = None;
+                }
+                Task::none()
+            }
             Msg::Notifications(on) => {
                 self.config.notifications = on;
                 self.persist();
@@ -1312,6 +1350,25 @@ impl App {
             }
             TrayEvent::Open => self.show(),
             TrayEvent::Quit => self.close(Closing::Quit),
+            TrayEvent::ToggleMic => self.handle(Msg::ToggleMic),
+            TrayEvent::Leave => self.handle(Msg::Leave),
+            TrayEvent::Quiet => {
+                if let Screen::Main(m) = &mut self.screen {
+                    m.quiet = match m.quiet {
+                        Some(_) => None,
+                        None => Some(chrono::Local::now() + chrono::TimeDelta::hours(1)),
+                    };
+                    log!(
+                        "não incomodar: {}",
+                        if m.quiet.is_some() {
+                            "ligou por 1 h"
+                        } else {
+                            "desligou"
+                        }
+                    );
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1347,11 +1404,18 @@ impl App {
             log!("notificação: pulou {kind}, {why}");
             return Task::none();
         }
+        // O ponto da bandeja vale até no "Não incomodar": é o aviso que não incomoda.
+        m.unseen |= !seen && matches!(pending, Pending::Chat(_));
+        if m.quiet.is_some_and(|until| chrono::Local::now() < until) {
+            log!("notificação: pulou {kind}, não incomodar");
+            return Task::none();
+        }
         let (title, body) = crate::notify::text(&event, &m.channels);
         self.chime(Effect::Notify);
         log!("notificação: mostrou {kind}");
         Task::future(async move {
-            let clicked = crate::notify::show(title, body).await;
+            let call = matches!(pending, Pending::Join(_));
+            let clicked = crate::notify::show(title, body, call).await;
             Msg::NotifyClosed(pending, clicked)
         })
     }
@@ -1901,6 +1965,8 @@ impl App {
             // O foco chegou antes, na tela de entrar; muda no próximo evento.
             focused: self.window.is_some(),
             tray: false,
+            unseen: false,
+            quiet: None,
             members: Vec::new(),
             online: HashSet::new(),
             mentions: HashMap::new(),
@@ -2689,6 +2755,65 @@ mod tests {
         a.window = None;
         let _ = a.update(mencao(1));
         assert_eq!(conta(&mut a, 1), 1);
+    }
+
+    #[test]
+    fn ponto_da_bandeja_espera_o_foco_e_nao_incomodar_cala() {
+        let mut a = in_call(&["Ana"]);
+        chimes();
+        let _ = a.update(Msg::Focus(true));
+        let _ = a.update(mencao(7));
+        assert!(!a.tray_state().unseen, "janela com foco: a pessoa viu");
+        let _ = a.update(Msg::Focus(false));
+        let _ = a.update(chamado("jogando"));
+        assert!(!a.tray_state().unseen, "chamado não marca");
+        let _ = a.update(mencao(7));
+        assert!(a.tray_state().unseen);
+        let _ = a.update(Msg::Focus(true));
+        assert!(!a.tray_state().unseen, "a janela ganhou foco");
+        assert_eq!(chimes(), [Effect::Notify; 3]);
+
+        let _ = a.update(Msg::Tray(TrayEvent::Quiet));
+        let ate = a.tray_state().quiet.expect("ligou");
+        assert!(ate > chrono::Local::now() + chrono::TimeDelta::minutes(59));
+        let _ = a.update(Msg::Focus(false));
+        let _ = a.update(chamado("jogando"));
+        let _ = a.update(mencao(7));
+        assert!(chimes().is_empty(), "nem som nem notificação");
+        assert!(a.tray_state().unseen, "o ponto vale no silêncio");
+        let _ = a.update(Msg::QuietTick);
+        assert_eq!(a.tray_state().quiet, Some(ate), "a hora não passou");
+
+        main_of(&mut a).quiet = Some(chrono::Local::now() - chrono::TimeDelta::seconds(1));
+        let _ = a.update(mencao(7));
+        assert_eq!(
+            chimes(),
+            [Effect::Notify],
+            "passou da hora, antes do relógio"
+        );
+        let _ = a.update(Msg::QuietTick);
+        assert!(a.tray_state().quiet.is_none(), "o menu volta");
+        let _ = a.update(Msg::Tray(TrayEvent::Quiet));
+        let _ = a.update(Msg::Tray(TrayEvent::Quiet));
+        assert!(
+            a.tray_state().quiet.is_none(),
+            "o segundo clique desliga antes"
+        );
+    }
+
+    #[test]
+    fn menu_da_bandeja_segue_o_mic_e_sai_da_call() {
+        let a = voice_app();
+        assert_eq!(a.tray_state().mic_muted, None, "fora de call");
+        let mut a = in_call(&["Ana"]);
+        let muted = a.config.mic_muted;
+        assert_eq!(a.tray_state().mic_muted, Some(muted));
+        let _ = a.update(Msg::Tray(TrayEvent::ToggleMic));
+        assert_eq!(a.config.mic_muted, !muted, "o mesmo estado do botão");
+        assert_eq!(a.tray_state().mic_muted, Some(!muted));
+        let _ = a.update(Msg::Tray(TrayEvent::Leave));
+        assert!(main_of(&mut a).call.is_none());
+        assert_eq!(a.tray_state().mic_muted, None);
     }
 
     #[test]
