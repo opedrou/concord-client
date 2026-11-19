@@ -382,6 +382,13 @@ fn action(msg: &Msg) -> Option<String> {
     })
 }
 
+/// `iced::exit` que sai mesmo sem janela aberta (ver `update::win::wake_on_exit`).
+fn exit() -> Task<Msg> {
+    #[cfg(windows)]
+    crate::update::win::wake_on_exit();
+    iced::exit()
+}
+
 /// Telas e janelas pro seletor do Windows. Listar e tirar as miniaturas bloqueia: lê fora
 /// da thread da interface.
 fn read_sources(call: &mut ActiveCall) -> Task<Msg> {
@@ -1614,7 +1621,7 @@ impl App {
     fn finish(&mut self, closing: Closing) -> Task<Msg> {
         match closing {
             // Pelo `iced::exit`, o `main` volta e marca que fechou direito.
-            Closing::Quit => iced::exit(),
+            Closing::Quit => exit(),
             Closing::Window(id) => {
                 // Call que não respondeu a tempo, ou que ainda abria o áudio, não fica sem
                 // janela: o `Ended` dela, se vier, cai fora.
@@ -1657,7 +1664,7 @@ impl App {
                     && crate::update::restart(None, true) =>
             {
                 log!("atualização: reinicia em segundo plano pra versão nova");
-                iced::exit()
+                exit()
             }
             _ => Task::none(),
         }
@@ -1684,7 +1691,7 @@ impl App {
                 // Em segundo plano não tem quem digite a senha.
                 if self.window.is_none() {
                     log!("sessão recusada sem janela: sai");
-                    return forget.chain(iced::exit());
+                    return forget.chain(exit());
                 }
                 self.screen = Screen::Login(LoginForm::new(server, None));
                 Task::batch([forget, operation::focus(ID_USUARIO)])
@@ -1882,7 +1889,7 @@ impl App {
         // Em segundo plano não tem quem digite a senha.
         if self.window.is_none() {
             log!("sessão vencida sem janela: sai");
-            return forget.chain(iced::exit());
+            return forget.chain(exit());
         }
         let error = Some("Sua sessão expirou. Entre de novo.".to_owned());
         self.screen = Screen::Login(LoginForm::new(server, error));

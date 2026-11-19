@@ -64,9 +64,15 @@ pub fn text(event: &NotifyEvent, channels: &[Channel]) -> (String, String) {
 /// Mostra a notificação e espera ela fechar. `true`: a pessoa clicou nela. Sem servidor de
 /// notificação no sistema, `false` e uma linha no log.
 pub async fn show(title: String, body: String) -> bool {
-    tokio::task::spawn_blocking(move || show_blocking(&title, &body))
-        .await
-        .unwrap_or(false)
+    // Thread solta, não `spawn_blocking`: o runtime espera as tarefas bloqueantes ao fechar,
+    // e um aviso que ninguém fecha (o GNOME guarda na lista) seguraria o Sair.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("concord-aviso".into())
+        .spawn(move || {
+            let _ = tx.send(show_blocking(&title, &body));
+        });
+    spawned.is_ok() && rx.await.unwrap_or(false)
 }
 
 fn show_blocking(title: &str, body: &str) -> bool {

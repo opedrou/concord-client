@@ -9,21 +9,24 @@ use std::{
     os::windows::{ffi::OsStringExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use windows::{
     Win32::{
+        Foundation::{LPARAM, WPARAM},
         Storage::EnhancedStorage::PKEY_AppUserModel_ID,
         System::{
             Com::{
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-                CoTaskMemFree, CoUninitialize, IPersistFile, STGM_READ,
+                CoTaskMemFree, CoUninitialize, IPersistFile, STGM_READWRITE,
                 StructuredStorage::{PROPVARIANT, PVCHF_DEFAULT, PropVariantChangeType},
             },
             Registry::{
                 HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
                 RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
             },
+            Threading::GetCurrentThreadId,
             Variant::VT_LPWSTR,
         },
         UI::{
@@ -32,7 +35,10 @@ use windows::{
                 SHGetKnownFolderPath, SLGP_RAWPATH, SetCurrentProcessExplicitAppUserModelID,
                 ShellLink,
             },
-            WindowsAndMessaging::{IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW},
+            WindowsAndMessaging::{
+                IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW, PostThreadMessageW,
+                WM_NULL,
+            },
         },
     },
     core::{HSTRING, Interface, PCWSTR, Result, w},
@@ -104,8 +110,10 @@ pub fn open(exe: &Path) -> bool {
 /// A cada abertura da cópia instalada: refaz o atalho se sumiu e põe a versão atual em
 /// "Aplicativos instalados", que muda depois de atualizar.
 pub fn register(exe: &Path) {
-    if let Some(link) = link() {
-        let _ = shortcut(&link, exe);
+    if let Some(link) = link()
+        && let Err(e) = shortcut(&link, exe)
+    {
+        log!("atalho do Menu Iniciar: não gravou: {e}");
     }
     let _ = uninstall_entry(exe);
 }
@@ -114,6 +122,25 @@ pub fn register(exe: &Path) {
 pub fn set_app_id() {
     // SAFETY: texto com terminador, copiado pelo Windows.
     let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(AUMID)) };
+}
+
+/// O winit do Windows só confere o pedido de sair quando acorda da espera por mensagens. Sem
+/// janela aberta, nada acorda ele depois do `iced::exit`: o app já se desmontou, mas o
+/// processo ficava parado até a próxima mensagem do sistema, minutos depois, e o desinstalar
+/// não apagava o exe. Chamar da thread da interface: uma thread fora do tokio, que o iced
+/// derruba ao sair, manda mensagens vazias pra ela por 2 s.
+pub fn wake_on_exit() {
+    // SAFETY: só lê o id da thread atual.
+    let main = unsafe { GetCurrentThreadId() };
+    let _ = std::thread::Builder::new()
+        .name("concord-sair".into())
+        .spawn(move || {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(200));
+                // SAFETY: só posta uma mensagem vazia; thread que já acabou dá erro, ignorado.
+                let _ = unsafe { PostThreadMessageW(main, WM_NULL, WPARAM(0), LPARAM(0)) };
+            }
+        });
 }
 
 /// `.lnk` pelo COM do Shell. Só grava se faltar, apontar pra outro lugar ou não ter o
@@ -139,7 +166,8 @@ unsafe fn write_shortcut(link: &Path, exe: &Path) -> Result<()> {
         let shell: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         let file: IPersistFile = shell.cast()?;
         let store: IPropertyStore = shell.cast()?;
-        if file.Load(&link, STGM_READ).is_ok() {
+        // Com `STGM_READ` a gravação falhava, e o atalho de instalação antiga ficava sem o AUMID.
+        if file.Load(&link, STGM_READWRITE).is_ok() {
             let mut path = [0u16; 1024];
             shell.GetPath(&mut path, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)?;
             let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
