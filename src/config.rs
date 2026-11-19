@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::audio::{
-    AudioPrefs, GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_DEFAULT_DB, MANUAL_MAX_DB, MANUAL_MIN_DB, MicGain,
-    NoiseLevel, Sensitivity,
+    AudioPrefs, GAIN_DEFAULT_DB, GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_DEFAULT_DB, MANUAL_MAX_DB,
+    MANUAL_MIN_DB, MicGain, NoiseLevel, Sensitivity,
 };
 use crate::share::Quality;
 
@@ -76,7 +76,7 @@ impl Default for Config {
             sensitivity: Sensitivity::default(),
             manual_db: MANUAL_DEFAULT_DB,
             mic_gain: MicGain::default(),
-            manual_gain_db: 0.0,
+            manual_gain_db: GAIN_DEFAULT_DB,
             master_volume: VOLUME_PADRAO,
             volumes: HashMap::new(),
             muted_from: HashMap::new(),

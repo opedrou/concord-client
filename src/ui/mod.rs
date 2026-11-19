@@ -24,9 +24,12 @@ use crate::api::{
     self, AddressError, Channel, ChannelKind, Client, Error, Member, NotifyEvent, Presence, Secret,
     User,
 };
-use crate::audio::{self, Devices, Effect, Engine, MANUAL_MIN_DB, Meter, NoiseLevel};
+use crate::audio::{
+    self, Devices, Effect, Engine, GAIN_DEFAULT_DB, MANUAL_DEFAULT_DB, MANUAL_MIN_DB, Meter,
+    NoiseLevel,
+};
 use crate::call::{self, Call, End};
-use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN};
+use crate::config::{Config, SIDEBAR_MAX, SIDEBAR_MIN, VOLUME_PADRAO};
 use crate::health::{self, Beat};
 use crate::session;
 use crate::share::{Quality, Source, Thumb};
@@ -178,6 +181,14 @@ struct Main {
     online: HashSet<String>,
 }
 
+/// Slider da aba Voz com botão "Padrão".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Control {
+    Master,
+    Threshold,
+    Gain,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tab {
     Server,
@@ -290,6 +301,8 @@ pub enum Msg {
     MeterTick,
     /// "Testar" da saída: toca o som de entrada nela.
     TestOutput,
+    /// Volta um slider da aba Voz ao padrão e grava.
+    Restore(Control),
     /// Primeiro clique no Sair ou no Trocar servidor das configurações; `false` cancela.
     Confirm(bool),
     ProbeStarted(u64, Result<Boot, String>),
@@ -377,6 +390,7 @@ fn action(msg: &Msg) -> Option<String> {
             "desligou o ganho automático",
         ),
         Msg::TestOutput => "testou a saída".into(),
+        Msg::Restore(c) => format!("voltou {c:?} ao padrão"),
         Msg::OpenSettings(tab) => format!("abriu as configurações em {tab:?}"),
         Msg::CloseSettings => "fechou as configurações".into(),
         Msg::CloseNews => "fechou as novidades da versão".into(),
@@ -988,6 +1002,15 @@ impl App {
             Msg::TestOutput => {
                 self.chime(Effect::Join);
                 Task::none()
+            }
+            Msg::Restore(control) => {
+                let task = self.handle(match control {
+                    Control::Master => Msg::Master(VOLUME_PADRAO),
+                    Control::Threshold => Msg::Threshold(MANUAL_DEFAULT_DB),
+                    Control::Gain => Msg::Gain(GAIN_DEFAULT_DB),
+                });
+                self.persist();
+                task
             }
             Msg::Confirm(ask) => {
                 if let Screen::Main(m) = &mut self.screen {
@@ -3277,6 +3300,25 @@ mod tests {
     }
 
     #[test]
+    fn padrao_volta_o_slider_e_grava() {
+        use crate::audio::{MicGain, Sensitivity};
+        let mut a = voice_tab();
+        let _ = a.update(Msg::Master(30));
+        let _ = a.update(Msg::AutoSensitivity(false));
+        let _ = a.update(Msg::Threshold(-60.0));
+        let _ = a.update(Msg::AutoGain(false));
+        let _ = a.update(Msg::Gain(9.0));
+        let antes = saves();
+        for c in [Control::Master, Control::Threshold, Control::Gain] {
+            let _ = a.update(Msg::Restore(c));
+        }
+        assert_eq!(saves(), antes + 3);
+        assert_eq!(a.config.master_volume, VOLUME_PADRAO);
+        assert_eq!(a.config.sensitivity, Sensitivity::Manual(MANUAL_DEFAULT_DB));
+        assert_eq!(a.config.mic_gain, MicGain::Manual(GAIN_DEFAULT_DB));
+    }
+
+    #[test]
     fn testar_saida_toca_a_entrada() {
         let mut a = voice_tab();
         chimes();
@@ -3557,12 +3599,26 @@ mod tests {
         }
 
         fn print_at(a: &App, nome: &str, size: Size) {
+            print_scrolled(a, nome, size, 0.0);
+        }
+
+        /// Rola o painel das configurações `lines` linhas pra baixo antes do print.
+        fn print_scrolled(a: &App, nome: &str, size: Size, lines: f32) {
             let settings = Settings {
                 fonts: theme::FONTS.map(Into::into).to_vec(),
                 default_font: theme::BODY,
                 ..Settings::default()
             };
             let mut ui = Simulator::with_size(settings, size, a.view());
+            if lines > 0.0 {
+                ui.point_at(iced::Point::new(
+                    size.width / 2.0 + 100.0,
+                    size.height / 2.0,
+                ));
+                let _ = ui.simulate([Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -lines },
+                })]);
+            }
             let print = ui.snapshot(&a.theme()).unwrap();
             assert!(
                 print
@@ -3716,6 +3772,18 @@ mod tests {
         voz(&mut a, false, -40.0, -22.0, true);
         main_of(&mut a).probe = Probe::Failed;
         print(&a, "voz-erro");
+        // Fim da aba: Testar e os botões Padrão, parados no padrão e não.
+        main_of(&mut a).probe = Probe::Off;
+        print_scrolled(&a, "voz-fim-padrao", Size::new(1200.0, 760.0), 30.0);
+        a.config.master_volume = 40;
+        a.config.set_threshold(-55.0);
+        a.config.set_auto_gain(false);
+        a.config.set_gain(6.0);
+        print_scrolled(&a, "voz-fim-mexido", Size::new(1200.0, 760.0), 30.0);
+        a.config.master_volume = VOLUME_PADRAO;
+        a.config.set_threshold(MANUAL_DEFAULT_DB);
+        a.config.set_auto_gain(true);
+
         // Sair e Trocar servidor esperando a confirmação.
         main_of(&mut a).confirm = true;
         main_of(&mut a).settings = Some(Tab::Account);

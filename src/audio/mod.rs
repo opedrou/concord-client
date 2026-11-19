@@ -69,6 +69,7 @@ pub enum MicGain {
 /// demais: o +20 cobre isso. O -20 desfaz o reforço de mic que o sistema aplica.
 pub const GAIN_MIN_DB: f32 = -20.0;
 pub const GAIN_MAX_DB: f32 = 20.0;
+pub const GAIN_DEFAULT_DB: f32 = 0.0;
 
 /// Quanto o medidor cai por bloco de 10 ms: do topo ao fundo em 600 ms.
 const METER_DECAY_DB: f32 = (MANUAL_MAX_DB - MANUAL_MIN_DB) / 60.0;
