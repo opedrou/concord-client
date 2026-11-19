@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, Stream, StreamExt};
 
+use iced::advanced::text::Span;
 use iced::keyboard::{Key, key::Named};
 use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::text::Wrapping;
@@ -101,6 +102,8 @@ pub enum Suggest {
     Dismiss,
     /// Clique numa linha da lista.
     At(usize),
+    /// Mouse sobre uma linha: vira a escolhida, pra Tab e Enter aceitarem a que está destacada.
+    Hover(usize),
 }
 
 pub struct Chat {
@@ -257,6 +260,7 @@ impl Chat {
             (Suggest::Prev, _) => self.pick = (current + count - 1) % count,
             (Suggest::Next, _) => self.pick = (current + 1) % count,
             (Suggest::Dismiss, _) => self.dismissed = Some(anchor),
+            (Suggest::Hover(i), _) => self.pick = i.min(count - 1),
             (_, Some(name)) => {
                 // Troca do `@` até o cursor pelo nome exato, que o servidor confere com
                 // maiúscula e minúscula, e deixa o espaço pra seguir escrevendo.
@@ -728,12 +732,7 @@ fn message_row<'a>(
     let mut body = Column::new().spacing(4);
     if let Some(content) = chat.texts.get(&id) {
         let selectable = text_editor(content)
-            .highlight_with::<Mentions>(chat.everyone.clone(), |_, _| {
-                iced::advanced::text::highlighter::Format {
-                    color: Some(ACCENT2),
-                    font: None,
-                }
-            })
+            .highlight_with::<Mentions>(chat.everyone.clone(), purple)
             .on_action(move |action| App::Chat(channel, Msg::Select(id, action)))
             .size(TEXTO)
             .padding(0)
@@ -744,7 +743,12 @@ fn message_row<'a>(
         } else {
             // Camada de baixo com o mesmo texto e tamanho, só com o fundo das menções: o editor
             // por cima segue selecionável. As duas quebram linha igual.
-            body = body.push(stack![pill_layer(&message.content, &found), selectable]);
+            body = body.push(stack![
+                mention_layer(&message.content, &found, |s| s
+                    .background(Background::Color(PILULA))
+                    .border(border::rounded(4))),
+                selectable
+            ]);
         }
     }
     if let Some(attachment) = &message.attachment {
@@ -800,19 +804,38 @@ fn message_row<'a>(
     }
 }
 
-/// Texto invisível com a pílula roxa atrás de cada menção.
-fn pill_layer<'a>(content: &'a str, found: &[Range<usize>]) -> Element<'a, App> {
-    let hidden = |s: &'a str| span(s).color(Color::TRANSPARENT);
+/// Estimativa de que o texto cabe no campo sem rolar: poucas linhas, contando a quebra como
+/// uma a cada `CHARS_LINHA` letras. Janela bem estreita pode errar pra menos.
+fn short(text: &str) -> bool {
+    const CHARS_LINHA: usize = 28;
+    let rows: usize = text
+        .lines()
+        .map(|l| l.chars().count().div_ceil(CHARS_LINHA).max(1))
+        .sum();
+    rows <= 5
+}
+
+/// Cor do `@nome` no editor.
+fn purple(_: &(), _: &Theme) -> iced::advanced::text::highlighter::Format<iced::Font> {
+    iced::advanced::text::highlighter::Format {
+        color: Some(ACCENT2),
+        font: None,
+    }
+}
+
+/// Texto invisível com o mesmo tamanho do editor, e `marked` aplicado em cada menção: o
+/// fundo ou o sublinhado que o `Format` do editor não faz.
+fn mention_layer<'a>(
+    content: &str,
+    found: &[Range<usize>],
+    marked: fn(Span<'a, (), iced::Font>) -> Span<'a, (), iced::Font>,
+) -> Element<'a, App> {
+    let hidden = |s: &str| span(s.to_owned()).color(Color::TRANSPARENT);
     let mut spans = Vec::new();
     let mut from = 0;
     for r in found {
         spans.push(hidden(&content[from..r.start]));
-        spans.push(
-            hidden(&content[r.clone()])
-                .background(Background::Color(PILULA))
-                .border(border::rounded(5))
-                .padding([0, 2]),
-        );
+        spans.push(marked(hidden(&content[r.clone()])));
         from = r.end;
     }
     spans.push(hidden(&content[from..]));
@@ -987,12 +1010,25 @@ fn composer<'a>(m: &'a Main, chat: &'a Chat) -> Element<'a, App> {
     let editor = text_editor(&chat.draft)
         .id(COMPOSER)
         .placeholder(format!("Conversar em #{}", chat.name))
+        .highlight_with::<Mentions>(chat.everyone.clone(), purple)
         .on_action(move |action| App::Chat(channel, Msg::Draft(action)))
         .key_binding(move |key| editor_keys(key, channel, listed))
         .size(TEXTO)
         .padding([9, 0])
         .max_height(140)
         .style(read_only);
+    // Sublinhado por baixo das menções, só com o campo curto: se rolar, desalinharia.
+    let draft = chat.draft.text();
+    let found = mention_ranges(&draft, &chat.everyone);
+    let editor: Element<'_, App> = if found.is_empty() || !short(&draft) {
+        editor.into()
+    } else {
+        let under = mention_layer(&draft, &found, |s| s.underline(true).color(ACCENT2));
+        stack![editor]
+            .push_under(container(under).padding([9, 0]))
+            .width(Length::Fill)
+            .into()
+    };
     let idle = matches!(chat.upload, Upload::Idle);
     let attached = matches!(chat.upload, Upload::Ready(_));
     let typed = !chat.draft.text().trim().is_empty();
@@ -1110,11 +1146,13 @@ fn mention_list<'a>(m: &'a Main, chat: &Chat, names: &[&'a str]) -> Element<'a, 
         ]
         .spacing(10)
         .align_y(Alignment::Center);
-        button(line)
+        let item = button(line)
             .padding([5, 10])
             .width(Length::Fill)
             .style(theme::nav_item(i == current))
-            .on_press(App::Chat(channel, Msg::Mention(Suggest::At(i))))
+            .on_press(App::Chat(channel, Msg::Mention(Suggest::At(i))));
+        mouse_area(item)
+            .on_enter(App::Chat(channel, Msg::Mention(Suggest::Hover(i))))
             .into()
     });
     container(Column::with_children(rows).spacing(2))
@@ -1519,6 +1557,17 @@ mod tests {
         assert!(c.suggestions().is_none(), "terminou em espaço: fechou");
         assert_eq!(c.draft.cursor().position.column, "oi @Ana Maria ".len());
 
+        // Mouse sobre uma linha escolhe ela: Tab e Enter aceitam a destacada.
+        let seguinte = c.draft.text();
+        c.draft = text_editor::Content::new();
+        digita(c, "@");
+        let _ = c.update(Msg::Mention(Suggest::Hover(2)), &cliente);
+        assert_eq!(c.pick, 2);
+        let _ = c.update(Msg::Mention(Suggest::Accept), &cliente);
+        assert_eq!(c.draft.text(), "@Bruno ");
+        c.draft = text_editor::Content::new();
+        digita(c, &seguinte);
+
         // Acento e maiúscula: entra o nome do servidor, não o que foi digitado.
         digita(c, "e @zé");
         let _ = c.update(Msg::Mention(Suggest::At(0)), &cliente);
@@ -1808,6 +1857,7 @@ mod tests {
                 3,
                 "@Fulano não existe, a@Ana é e-mail, @Anabela também não\nmas @Ana\ne @Opedro",
             ),
+            msg(5, "Ana", 4, "@Ana @Bruno @Mariana @Opedro todo mundo junto"),
         ];
         let page = Page {
             messages: lista,
@@ -1820,6 +1870,10 @@ mod tests {
         print(&a, "mencoes");
         print_largura(&a, "mencoes-estreito", 640.0);
         print_largura(&a, "mencoes-estreito2", 560.0);
+        // Menções no campo de digitar: sublinhadas por baixo do texto roxo.
+        digita(chat(&mut a), "@Ana e @Zé da Silva oi");
+        print(&a, "mencoes-campo");
+        print_largura(&a, "mencoes-campo-estreito", 560.0);
     }
 
     #[test]
