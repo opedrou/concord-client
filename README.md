@@ -4,7 +4,7 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.16.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.17.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
@@ -18,7 +18,15 @@ escolhido na primeira abertura.
 - **Assistir** a transmissão dos outros, com o som, também de quem transmite pelo site, vendo
   quem mais está assistindo.
 - **Câmera dos outros** no tile de voz, no lugar da foto.
-- **Chat de texto** nos canais de texto, em tempo real, com anexos.
+- **Chat de texto** nos canais de texto, em tempo real, com anexos. O `@` tem autocompletar
+  (setas e Tab) e a menção aparece destacada em roxo.
+- **Lista de membros** à direita, com quem está online e quem está em cada canal de voz.
+  Minimiza no botão de duas pessoas.
+- **Notificações:** aviso do sistema com som quando alguém te chama pra call (botão "Chamar
+  pessoas", no app ou no site) ou te marca com `@`. Clicar no aviso abre a call ou o chat.
+- **Fica na bandeja:** o X fecha a janela e o Concord segue recebendo avisos. Ele também pode
+  abrir junto com o computador, em segundo plano. As duas opções ficam em Configurações ›
+  Notificações.
 - **Sons** de entrar, sair e começar a transmitir.
 - **Atualiza sozinho:** confere versão nova a cada 15 min, e a seta verde reinicia na nova. O
   arquivo baixado é conferido pelo SHA-256 da release, e se a versão nova não abrir o app volta
@@ -65,27 +73,42 @@ o seletor de tela do sistema (xdg-desktop-portal).
 - No Windows, o vídeo da transmissão é codificado na CPU (VP8).
 - No chat, selecionar e copiar funciona dentro de uma mensagem, não pegando várias de uma vez.
 - O chat manda a foto original; o site encolhe antes de enviar.
+- O aviso só chega com o Concord aberto, mesmo que só na bandeja. Quem estava offline perde o
+  chamado.
+- No Linux, a bandeja precisa da extensão AppIndicator, que já vem no Ubuntu. Sem ela, o X
+  fecha o app.
 
-## Novidades da v0.1.16
+## Novidades da v0.1.17
 
 ### Novo
-- **O que tem de novo:** na primeira abertura depois de atualizar, uma janela mostra o que mudou
-  na versão. Ela aparece uma vez e fecha no OK.
+- **Notificações:** quando alguém te chama pra uma call ou te marca com `@` no chat, chega um
+  aviso do sistema com som, mesmo com a janela fechada. Clicar no aviso abre a call ou o chat.
+  Dá pra desligar em Configurações › Notificações.
+- **Bandeja e iniciar com o computador:** o X fecha a janela e o Concord segue na bandeja, com
+  "Abrir Concord" e "Sair". Ele pode abrir junto com o sistema, em segundo plano, só escutando
+  os avisos. Abrir de novo traz a janela que já está rodando, em vez de abrir outro.
+- **Chamar pessoas:** botão na call pra escolher quem chamar, como o do site.
+- **Lista de membros:** painel à direita com Online e Offline, quem está em voz e o botão de
+  minimizar.
+- **Menção no chat:** autocompletar do `@` com setas, Tab e Enter, e a menção destacada em roxo
+  na mensagem e na caixa de digitar.
+- **Som de abertura:** toca na primeira vez do dia que a janela abre. Abrir em segundo plano
+  não toca.
 
-### Corrigido
-- **Transmissão de tela travava uns segundos quando a rede perdia pacote:** o app não negociava o
-  reenvio de vídeo, então um pacote perdido parava a imagem de quem assiste até o navegador pedir
-  um quadro novo, uns 3 s depois. Agora o pacote perdido é reenviado. Com 5% de perda, o tempo com
-  a imagem parada caiu de mais de 50% pra perto de 3%. Vale pra tela e câmera, nos dois sistemas.
-- **Transmissão no Linux engasgava a cada 5 s:** o codificador da placa de vídeo mandava um quadro
-  completo a cada 5 s, grande demais pra caber na taxa, e a imagem parava um instante. Agora o
-  quadro completo só sai no começo e quando quem assiste pede.
-- **Transmissão no Linux demorava a se ajustar à rede:** a taxa nova só valia no quadro completo
-  seguinte, até 5 s depois. Agora vale no quadro seguinte.
+### Removido
+- **Chamado pelo WhatsApp:** o servidor não manda mais o chamado pro grupo do WhatsApp. Ele
+  chega como aviso no Concord.
 
 ### Interno
-- O log do vídeo enviado mostra os pacotes reenviados e os que se perderam de vez.
-- As bancadas medem perda de pacote sem `sudo` e mudam o teto de taxa no meio da transmissão.
+- Uma instância só por usuário, por uma porta local: a segunda abertura passa o pedido pra
+  primeira e sai.
+- Bancada ponta a ponta das notificações contra um servidor local.
+
+### Limites conhecidos
+- Precisa do servidor atualizado: com o servidor antigo não chega aviso e a lista mostra todo
+  mundo offline, menos quem está em voz.
+- Iniciar com o computador não foi testado num boot de verdade, só com o mesmo comando que o
+  sistema roda.
 
 ## Compilar
 

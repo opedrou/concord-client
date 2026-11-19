@@ -38,14 +38,14 @@ const ASSET: &str = "concord-client-linux-x86_64";
 /// Novidades mostradas uma vez, na primeira abertura depois de atualizar. Só aparecem se a
 /// versão daqui for a do `Cargo.toml`: texto esquecido de uma versão velha não volta como novo.
 pub const NEWS: (&str, &[&str]) = (
-    "0.1.16",
+    "0.1.17",
     &[
-        "Transmissão de tela mais estável em redes com perda de pacotes: o pacote perdido agora é \
-         reenviado, e a imagem não congela mais por alguns segundos.",
-        "Linux: o codificador de vídeo parou de mandar um quadro-chave a cada 5 segundos, que \
-         fazia a imagem parar por um instante.",
-        "A taxa de bits da transmissão se ajusta à rede já no quadro seguinte, em vez de esperar \
-         até 5 segundos.",
+        "Avisos do sistema, com som, quando alguém te chama pra uma call ou te marca com @ no \
+         chat, mesmo com a janela fechada. Dá pra desligar em Configurações › Notificações.",
+        "O X fecha a janela e o Concord segue na bandeja, perto do relógio. Ele também pode \
+         abrir junto com o computador, em segundo plano.",
+        "Lista de membros à direita com quem está online, @ no chat com autocompletar e \
+         destaque roxo, e o botão Chamar pessoas na call.",
     ],
 );
 
