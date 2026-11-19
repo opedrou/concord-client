@@ -123,6 +123,32 @@ struct LoginForm {
     show: bool,
     error: Option<String>,
     busy: bool,
+    /// Bloqueio por tentativas demais: o Entrar volta quando a contagem zera.
+    wait: Option<Wait>,
+}
+
+/// Contagem regressiva: até quando, e quantos segundos faltam pra mostrar na tela.
+#[derive(Clone, Copy, Debug)]
+struct Wait {
+    until: Instant,
+    left: u64,
+}
+
+impl Wait {
+    fn new(secs: u64, now: Instant) -> Self {
+        Self {
+            until: now + Duration::from_secs(secs),
+            left: secs,
+        }
+    }
+
+    /// Atualiza o que falta, arredondando pra cima: nunca mostra 0 antes do fim. `true`
+    /// quando acabou.
+    fn tick(&mut self, now: Instant) -> bool {
+        let rest = self.until.saturating_duration_since(now);
+        self.left = rest.as_secs() + u64::from(rest.subsec_nanos() > 0);
+        rest.is_zero()
+    }
 }
 
 struct Main {
@@ -203,6 +229,8 @@ pub enum Msg {
     Password(Secret),
     /// Olho do campo de senha.
     ShowPassword,
+    /// Relógio de 1 s das contagens regressivas das telas de entrada.
+    Clock(Instant),
     LoginSubmit,
     LoginDone(Result<(Secret, User), Error>),
     VaultSaved(bool),
@@ -501,14 +529,19 @@ fn connect_error(e: Error) -> String {
 fn login_error(e: Error) -> String {
     match e {
         Error::BadCredentials => "Usuário ou senha inválidos.".to_owned(),
-        Error::TooManyAttempts(s) if s > 60 => {
-            format!(
-                "Muitas tentativas. Tente de novo em {} min.",
-                s.div_ceil(60)
-            )
-        }
-        Error::TooManyAttempts(s) => format!("Muitas tentativas. Tente de novo em {s} s."),
+        Error::TooManyAttempts(s) => too_many(s),
         e => connect_error(e),
+    }
+}
+
+fn too_many(secs: u64) -> String {
+    if secs > 60 {
+        format!(
+            "Muitas tentativas. Tente de novo em {} min.",
+            secs.div_ceil(60)
+        )
+    } else {
+        format!("Muitas tentativas. Tente de novo em {secs} s.")
     }
 }
 
@@ -568,6 +601,9 @@ impl App {
             event::listen_with(focus),
             Subscription::run(crate::instance::commands).map(command),
         ];
+        if matches!(&self.screen, Screen::Login(f) if f.wait.is_some()) {
+            subs.push(time::every(Duration::from_secs(1)).map(Msg::Clock));
+        }
         if let Screen::Offline(_) = &self.screen {
             subs.push(time::every(TENTA_DE_NOVO).map(|_| Msg::Retry));
         }
@@ -724,6 +760,7 @@ impl App {
                 }
                 _ => Task::none(),
             },
+            Msg::Clock(now) => self.clock(now),
             Msg::LoginSubmit => self.submit_login(),
             Msg::LoginDone(result) => self.login_done(result),
             Msg::VaultSaved(ok) => {
@@ -1788,7 +1825,7 @@ impl App {
         let Screen::Login(f) = &mut self.screen else {
             return Task::none();
         };
-        if f.busy || f.username.is_empty() || f.password.0.is_empty() {
+        if f.busy || f.wait.is_some() || f.username.is_empty() || f.password.0.is_empty() {
             return Task::none();
         }
         f.busy = true;
@@ -1820,9 +1857,29 @@ impl App {
             }
             Err(e) => {
                 f.busy = false;
+                if let Error::TooManyAttempts(secs) = e {
+                    f.wait = Some(Wait::new(secs, Instant::now()));
+                }
                 f.error = Some(login_error(e));
                 Task::none()
             }
+        }
+    }
+
+    /// Relógio de 1 s das contagens: o bloqueio do login e a nova tentativa do offline.
+    fn clock(&mut self, now: Instant) -> Task<Msg> {
+        match &mut self.screen {
+            Screen::Login(f) => {
+                if let Some(wait) = &mut f.wait {
+                    if wait.tick(now) {
+                        (f.wait, f.error) = (None, None);
+                    } else {
+                        f.error = Some(too_many(wait.left));
+                    }
+                }
+                Task::none()
+            }
+            _ => Task::none(),
         }
     }
 
@@ -1998,6 +2055,7 @@ impl LoginForm {
             show: false,
             error,
             busy: false,
+            wait: None,
         }
     }
 }
@@ -2268,6 +2326,63 @@ mod tests {
             panic!()
         };
         assert!(!f.busy);
+    }
+
+    #[test]
+    fn contagem_arredonda_pra_cima_e_so_zera_no_fim() {
+        let t0 = Instant::now();
+        let mut w = Wait::new(90, t0);
+        assert!(!w.tick(t0 + Duration::from_millis(500)));
+        assert_eq!(w.left, 90, "89,5 s ainda mostra 90");
+        assert!(!w.tick(t0 + Duration::from_secs(89)));
+        assert_eq!(w.left, 1);
+        assert!(w.tick(t0 + Duration::from_secs(90)));
+        assert_eq!(w.left, 0);
+        assert!(w.tick(t0 + Duration::from_secs(500)), "passou do fim");
+    }
+
+    #[test]
+    fn tentativas_demais_bloqueiam_o_entrar_ate_a_contagem_zerar() {
+        let mut a = app(login());
+        let preenche = |a: &mut App| {
+            let _ = a.update(Msg::Username("ana".into()));
+            let _ = a.update(Msg::Password(Secret("x".into())));
+        };
+        fn form(a: &mut App) -> &mut LoginForm {
+            match &mut a.screen {
+                Screen::Login(f) => f,
+                _ => panic!("fora do login"),
+            }
+        }
+        preenche(&mut a);
+        let _ = a.update(Msg::LoginDone(Err(Error::TooManyAttempts(90))));
+        let wait = form(&mut a).wait.expect("sem contagem");
+        assert_eq!(
+            form(&mut a).error.as_deref(),
+            Some("Muitas tentativas. Tente de novo em 2 min.")
+        );
+        // Bloqueado, o Entrar não envia.
+        let _ = a.update(Msg::LoginSubmit);
+        assert!(!form(&mut a).busy);
+        // A contagem desce, e a unidade troca de min pra s em 60.
+        let _ = a.update(Msg::Clock(wait.until - Duration::from_secs(60)));
+        assert_eq!(
+            form(&mut a).error.as_deref(),
+            Some("Muitas tentativas. Tente de novo em 60 s.")
+        );
+        let _ = a.update(Msg::Clock(wait.until - Duration::from_secs(5)));
+        assert_eq!(
+            form(&mut a).error.as_deref(),
+            Some("Muitas tentativas. Tente de novo em 5 s.")
+        );
+        // No zero o aviso some e o Entrar volta.
+        let _ = a.update(Msg::Clock(wait.until));
+        assert!(form(&mut a).wait.is_none() && form(&mut a).error.is_none());
+        let _ = a.update(Msg::LoginSubmit);
+        assert!(form(&mut a).busy);
+        // Erro comum não cria contagem.
+        let _ = a.update(Msg::LoginDone(Err(Error::BadCredentials)));
+        assert!(form(&mut a).wait.is_none());
     }
 
     #[test]
@@ -3564,6 +3679,12 @@ mod tests {
         l.password = Secret("segredo".into());
         l.show = true;
         print(&app(Screen::Login(l)), "login-senha-visivel");
+        let mut l = LoginForm::new("https://call.exemplo.com".into(), None);
+        l.username = "Opedro".into();
+        l.password = Secret("segredo".into());
+        l.error = Some(too_many(90));
+        l.wait = Some(Wait::new(90, Instant::now()));
+        print(&app(Screen::Login(l)), "login-bloqueado");
         print(
             &app(Screen::Offline("https://call.exemplo.com".into())),
             "offline",

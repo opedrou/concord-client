@@ -141,7 +141,7 @@ pub fn login(f: &LoginForm) -> Element<'_, Msg> {
             .push(error_line(f.error.as_deref()))
             .push(primary(
                 if f.busy { "Entrando…" } else { "Entrar" },
-                (!f.busy).then_some(Msg::LoginSubmit),
+                (!f.busy && f.wait.is_none()).then_some(Msg::LoginSubmit),
             ))
             .push(
                 text(&f.server)
