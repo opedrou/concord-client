@@ -8,7 +8,9 @@ use iced::{Alignment, Color, Element, Length, Theme};
 use super::sidebar::{CLOSE, icon, mark, tipped};
 use super::theme::{self, BG, DANGER, FG, FG2, FG3, GREEN, IDLE};
 use super::voice::Probe;
-use super::{ID_SENHA, ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avatar};
+use super::{
+    ID_SENHA, ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, Offline, ServerForm, Tab, avatar,
+};
 use crate::api::Secret;
 use crate::audio::{
     GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_MAX_DB, MANUAL_MIN_DB, MicGain, NoiseLevel, Sensitivity,
@@ -88,9 +90,16 @@ fn error_line<'a>(error: Option<&'a str>) -> Option<Element<'a, Msg>> {
     error.map(|e| text(e).size(14).color(DANGER).into())
 }
 
-pub fn connecting<'a>() -> Element<'a, Msg> {
+/// `stuck`: passou do tempo de espera, e dá pra desistir.
+pub fn connecting<'a>(stuck: bool) -> Element<'a, Msg> {
     page(
         column![mark(76.0), text("Conectando…").size(15).color(FG2)]
+            .push(stuck.then(|| {
+                column![
+                    space().height(6),
+                    action("Cancelar", Msg::CancelConnect, theme::outline)
+                ]
+            }))
             .spacing(8)
             .align_x(Alignment::Center),
     )
@@ -158,13 +167,16 @@ pub fn login(f: &LoginForm) -> Element<'_, Msg> {
     )
 }
 
-pub fn offline(server: &str) -> Element<'_, Msg> {
+pub fn offline(o: &Offline) -> Element<'_, Msg> {
     branded(
         column![
             text("Sem conexão").size(20).font(theme::SEMIBOLD),
-            text(format!("Não foi possível falar com {server}."))
+            text(format!("Não foi possível falar com {}.", o.server))
                 .size(14)
                 .color(FG2),
+            text(format!("Tentando de novo em {} s…", o.wait.left))
+                .size(13)
+                .color(FG3),
             primary("Tentar de novo", Some(Msg::Retry)),
             link("Trocar servidor", Some(Msg::ChangeServer)),
         ]

@@ -48,6 +48,8 @@ const ESPERA_AO_FECHAR: Duration = Duration::from_secs(2);
 /// Na tela de sem conexão, de quanto em quanto tempo tenta de novo sozinho: o autostart
 /// pode abrir antes de a rede subir.
 const TENTA_DE_NOVO: Duration = Duration::from_secs(30);
+/// Quanto o "Conectando…" espera antes de oferecer o Cancelar.
+const SEM_RESPOSTA: Duration = Duration::from_secs(5);
 /// Relógio do anel de fala: o hold é de 400 ms, então 100 ms apaga sem atraso visível.
 const QUADRO: Duration = Duration::from_millis(100);
 /// Relógio do medidor de entrada: uns 30 quadros por segundo.
@@ -103,10 +105,25 @@ pub enum Closing {
 
 enum Screen {
     Connecting,
+    /// Conectando há mais de [`SEM_RESPOSTA`]: a tela ganha o Cancelar.
+    Stuck,
     Server(ServerForm),
     Login(LoginForm),
-    Offline(String),
+    Offline(Offline),
     Main(Box<Main>),
+}
+
+/// Sem conexão: o endereço e a contagem pra tentar de novo sozinho.
+struct Offline {
+    server: String,
+    wait: Wait,
+}
+
+impl Offline {
+    fn new(server: String) -> Self {
+        let wait = Wait::new(TENTA_DE_NOVO.as_secs(), Instant::now());
+        Self { server, wait }
+    }
 }
 
 struct ServerForm {
@@ -231,6 +248,10 @@ pub enum Msg {
     ShowPassword,
     /// Relógio de 1 s das contagens regressivas das telas de entrada.
     Clock(Instant),
+    /// O "Conectando…" passou de [`SEM_RESPOSTA`].
+    Stuck,
+    /// "Cancelar" do "Conectando…": volta pro formulário do servidor.
+    CancelConnect,
     LoginSubmit,
     LoginDone(Result<(Secret, User), Error>),
     VaultSaved(bool),
@@ -601,11 +622,16 @@ impl App {
             event::listen_with(focus),
             Subscription::run(crate::instance::commands).map(command),
         ];
-        if matches!(&self.screen, Screen::Login(f) if f.wait.is_some()) {
+        let counting = match &self.screen {
+            Screen::Offline(_) => true,
+            Screen::Login(f) => f.wait.is_some(),
+            _ => false,
+        };
+        if counting {
             subs.push(time::every(Duration::from_secs(1)).map(Msg::Clock));
         }
-        if let Screen::Offline(_) = &self.screen {
-            subs.push(time::every(TENTA_DE_NOVO).map(|_| Msg::Retry));
+        if let Screen::Connecting = &self.screen {
+            subs.push(time::every(SEM_RESPOSTA).map(|_| Msg::Stuck));
         }
         if let Screen::Main(m) = &self.screen {
             subs.push(Subscription::run(crate::tray::run).map(Msg::Tray));
@@ -652,10 +678,11 @@ impl App {
 
     fn page(&self) -> Element<'_, Msg> {
         match &self.screen {
-            Screen::Connecting => screens::connecting(),
+            Screen::Connecting => screens::connecting(false),
+            Screen::Stuck => screens::connecting(true),
             Screen::Server(f) => screens::server(f),
             Screen::Login(f) => screens::login(f),
-            Screen::Offline(server) => screens::offline(server),
+            Screen::Offline(o) => screens::offline(o),
             Screen::Main(m) => {
                 if let Some(call) = m.call.as_ref().filter(|c| c.fullscreen()) {
                     return stage::full(m, call, &self.config);
@@ -732,13 +759,20 @@ impl App {
             }
             Msg::ServerSubmit => self.submit_server(),
             Msg::Retry => match &self.screen {
-                Screen::Offline(server) => {
-                    let server = server.clone();
+                Screen::Offline(o) => {
+                    let server = o.server.clone();
                     self.screen = Screen::Connecting;
                     connect(server)
                 }
                 _ => Task::none(),
             },
+            Msg::Stuck => {
+                if let Screen::Connecting = &self.screen {
+                    self.screen = Screen::Stuck;
+                }
+                Task::none()
+            }
+            Msg::CancelConnect => self.cancel_connect(),
             Msg::ChangeServer => self.change_server(),
             Msg::Username(username) => {
                 if let Screen::Login(f) = &mut self.screen {
@@ -1751,6 +1785,10 @@ impl App {
         cookie: Option<Secret>,
         result: Result<User, Error>,
     ) -> Task<Msg> {
+        // Formulário parado: a pessoa cancelou a tentativa que acaba de responder.
+        if matches!(&self.screen, Screen::Server(f) if !f.busy) {
+            return Task::none();
+        }
         let from_form = matches!(self.screen, Screen::Server(_));
         match result {
             Ok(user) => {
@@ -1779,10 +1817,25 @@ impl App {
                 Task::none()
             }
             Err(_) => {
-                self.screen = Screen::Offline(server);
+                self.screen = Screen::Offline(Offline::new(server));
                 Task::none()
             }
         }
+    }
+
+    /// Sai do "Conectando…" pro formulário, com o endereço de agora. A resposta da tentativa
+    /// cancelada, que ainda chega, cai fora em [`App::connected`].
+    fn cancel_connect(&mut self) -> Task<Msg> {
+        if !matches!(self.screen, Screen::Connecting | Screen::Stuck) {
+            return Task::none();
+        }
+        let input = self.config.server.clone().unwrap_or_default();
+        self.screen = Screen::Server(ServerForm {
+            input,
+            error: None,
+            busy: false,
+        });
+        operation::focus(ID_SERVIDOR)
     }
 
     fn submit_server(&mut self) -> Task<Msg> {
@@ -1809,7 +1862,7 @@ impl App {
         self.leave_call();
         let input = match &self.screen {
             Screen::Login(f) => f.server.clone(),
-            Screen::Offline(server) => server.clone(),
+            Screen::Offline(o) => o.server.clone(),
             Screen::Main(m) => m.server.clone(),
             _ => return Task::none(),
         };
@@ -1869,6 +1922,12 @@ impl App {
     /// Relógio de 1 s das contagens: o bloqueio do login e a nova tentativa do offline.
     fn clock(&mut self, now: Instant) -> Task<Msg> {
         match &mut self.screen {
+            Screen::Offline(o) => {
+                if o.wait.tick(now) {
+                    return self.handle(Msg::Retry);
+                }
+                Task::none()
+            }
             Screen::Login(f) => {
                 if let Some(wait) = &mut f.wait {
                     if wait.tick(now) {
@@ -1970,7 +2029,7 @@ impl App {
             (_, Screen::Main(m)) => {
                 let server = m.server.clone();
                 self.leave_call();
-                self.screen = Screen::Offline(server);
+                self.screen = Screen::Offline(Offline::new(server));
                 Task::none()
             }
             _ => Task::none(),
@@ -2297,9 +2356,62 @@ mod tests {
             cookie: None,
             result: Err(Error::Offline),
         });
-        assert!(matches!(&a.screen, Screen::Offline(s) if s == "https://a.b"));
+        assert!(matches!(&a.screen, Screen::Offline(o) if o.server == "https://a.b"));
         let _ = a.update(Msg::Retry);
         assert!(matches!(a.screen, Screen::Connecting));
+    }
+
+    #[test]
+    fn offline_conta_os_segundos_e_tenta_de_novo_no_zero() {
+        let mut a = app(Screen::Offline(Offline::new("https://a.b".into())));
+        let ate = |a: &App| match &a.screen {
+            Screen::Offline(o) => (o.wait.until, o.wait.left),
+            _ => panic!("saiu do offline"),
+        };
+        let (until, left) = ate(&a);
+        assert_eq!(left, TENTA_DE_NOVO.as_secs());
+        let _ = a.update(Msg::Clock(until - Duration::from_secs(23)));
+        assert_eq!(ate(&a).1, 23);
+        let _ = a.update(Msg::Clock(until));
+        assert!(matches!(a.screen, Screen::Connecting), "zerou: tenta");
+        // Falhou de novo: volta a contar do começo.
+        let _ = a.update(Msg::Connected {
+            server: "https://a.b".into(),
+            cookie: None,
+            result: Err(Error::Offline),
+        });
+        assert_eq!(ate(&a).1, TENTA_DE_NOVO.as_secs());
+    }
+
+    #[test]
+    fn conectando_demorado_oferece_cancelar_e_ignora_a_resposta_tardia() {
+        let mut a = app(Screen::Connecting);
+        a.config.server = Some("https://a.b".into());
+        // O relógio de 5 s só vale no "Conectando…".
+        let _ = a.update(Msg::Stuck);
+        assert!(matches!(a.screen, Screen::Stuck));
+        let mut fora = app(login());
+        let _ = fora.update(Msg::Stuck);
+        assert!(matches!(fora.screen, Screen::Login(_)));
+        let _ = fora.update(Msg::CancelConnect);
+        assert!(
+            matches!(fora.screen, Screen::Login(_)),
+            "só cancela o conectando"
+        );
+
+        let _ = a.update(Msg::CancelConnect);
+        let Screen::Server(f) = &a.screen else {
+            panic!("não voltou pro formulário")
+        };
+        assert_eq!(f.input, "https://a.b", "endereço de agora preenchido");
+        assert!(!f.busy && f.error.is_none());
+        // A resposta da tentativa cancelada não tira a pessoa do formulário.
+        let _ = a.update(Msg::Connected {
+            server: "https://a.b".into(),
+            cookie: None,
+            result: Ok(user()),
+        });
+        assert!(matches!(a.screen, Screen::Server(_)));
     }
 
     #[test]
@@ -3685,11 +3797,11 @@ mod tests {
         l.error = Some(too_many(90));
         l.wait = Some(Wait::new(90, Instant::now()));
         print(&app(Screen::Login(l)), "login-bloqueado");
-        print(
-            &app(Screen::Offline("https://call.exemplo.com".into())),
-            "offline",
-        );
+        let mut o = Offline::new("https://call.exemplo.com".into());
+        o.wait.left = 23;
+        print(&app(Screen::Offline(o)), "offline");
         print(&app(Screen::Connecting), "conectando");
+        print(&app(Screen::Stuck), "conectando-cancelar");
 
         let canal = |id, name: &str, kind| Channel {
             id,
