@@ -185,9 +185,15 @@ impl ActiveCall {
         self.watching.is_some() && self.view == View::Full
     }
 
+    /// Na grade a barra fica sempre no pé do palco; só o Foco e a tela cheia a escondem.
+    pub fn bar_docked(&self) -> bool {
+        self.watching.is_none() || self.view == View::Tile
+    }
+
     /// A barra fica com o mouse perto, ou enquanto algo dela está aberto.
     pub fn bar_visible(&self) -> bool {
-        self.bar_near
+        self.bar_docked()
+            || self.bar_near
             || self.share_panel
             || self.share_menu
             || self.people.is_some()
@@ -755,6 +761,21 @@ mod tests {
                 t.width * cols as f32 + GAP * (cols - 1) as f32 <= area.width - 2.0 * PAD_X + 0.5
             );
             assert!(t.height * rows as f32 + GAP * (rows - 1) as f32 <= area.height);
+        }
+    }
+
+    #[test]
+    fn barra_fixa_na_grade_e_so_no_mouse_no_foco_e_na_tela_cheia() {
+        let mut call = ActiveCall::new(1, "call-tete".into());
+        assert!(call.bar_visible(), "grade sem transmissão");
+        call.watching = Some("Ana__1".into());
+        assert!(call.bar_visible(), "transmissão no tile da grade");
+        for view in [View::Focus, View::Full] {
+            call.view = view;
+            call.bar_near = false;
+            assert!(!call.bar_visible(), "{view:?} esconde");
+            call.bar_near = true;
+            assert!(call.bar_visible(), "{view:?} com o mouse no pé");
         }
     }
 

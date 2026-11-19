@@ -37,8 +37,10 @@ const THUMB_NAME: f32 = 180.0;
 const THUMB_NAME_SIZE: f32 = 12.0;
 /// Barra de controles com a margem dela, pra os avisos abrirem logo acima.
 const ABOVE_BAR: f32 = 94.0;
-/// Faixa do pé do palco onde o mouse faz a barra aparecer.
+/// Faixa do pé do palco onde o mouse faz a barra aparecer (Foco e tela cheia).
 const BAR_ZONE: f32 = 140.0;
+/// Altura que a barra fixa da grade toma do palco: os tiles não ficam por baixo dela.
+const BAR_DOCK: f32 = 74.0;
 /// Espectadores desenhados no tile da transmissão: o resto vira "+N". Como no site.
 const MAX_VIEWERS: usize = 3;
 const VIEWER_FACE: f32 = 18.0;
@@ -105,17 +107,20 @@ fn overlays<'a>(
     }));
 }
 
-/// Palco com a barra de controles por cima, só com o mouse perto do pé.
+/// Palco com a barra de controles. Na grade ela é fixa e o corpo cede o lugar dela; no Foco e
+/// na tela cheia ela vem por cima, só com o mouse perto do pé.
 fn with_bar<'a>(
     call: &'a ActiveCall,
     config: &'a Config,
     body: impl Fn(Size) -> Element<'a, Msg> + 'a,
 ) -> Element<'a, Msg> {
     responsive(move |area| {
+        let dock = if call.bar_docked() { BAR_DOCK } else { 0.0 };
         let mut layers = stack![
-            container(body(area))
+            container(body(Size::new(area.width, area.height - dock)))
                 .width(Length::Fill)
                 .height(Length::Fill)
+                .padding(Padding::ZERO.bottom(dock))
         ];
         if call.bar_visible() {
             layers = layers.push(
