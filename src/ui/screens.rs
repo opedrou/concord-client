@@ -5,10 +5,10 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Length, Theme};
 
-use super::sidebar::{CLOSE, icon, mark};
+use super::sidebar::{CLOSE, icon, mark, tipped};
 use super::theme::{self, BG, DANGER, FG, FG2, FG3, GREEN, IDLE};
 use super::voice::Probe;
-use super::{ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avatar};
+use super::{ID_SENHA, ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avatar};
 use crate::api::Secret;
 use crate::audio::{
     GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_MAX_DB, MANUAL_MIN_DB, MicGain, NoiseLevel, Sensitivity,
@@ -20,6 +20,9 @@ use crate::update::Check;
 const PADRAO: &str = "Padrão do sistema";
 
 const COLUNA: f32 = 400.0;
+
+const EYE: &[u8] = include_bytes!("../../assets/icons/eye.svg");
+const EYE_OFF: &[u8] = include_bytes!("../../assets/icons/eye-off.svg");
 
 fn page<'a>(content: impl Into<Element<'a, Msg>>) -> Element<'a, Msg> {
     container(center(content)).style(theme::fill(BG)).into()
@@ -113,13 +116,26 @@ pub fn server(f: &ServerForm) -> Element<'_, Msg> {
 
 pub fn login(f: &LoginForm) -> Element<'_, Msg> {
     let mut username = input("", &f.username, ID_USUARIO);
-    let mut password = input("", &f.password.0, "campo-senha").secure(true);
+    let mut password = input("", &f.password.0, ID_SENHA).secure(!f.show);
     if !f.busy {
         username = username.on_input(Msg::Username).on_submit(Msg::LoginSubmit);
         password = password
             .on_input(|s| Msg::Password(Secret(s)))
             .on_submit(Msg::LoginSubmit);
     }
+    let eye = button(container(icon(if f.show { EYE_OFF } else { EYE }, 18.0, FG2)).center(42))
+        .padding(0)
+        .style(theme::ghost)
+        .on_press(Msg::ShowPassword);
+    let eye = tipped(
+        eye.into(),
+        if f.show {
+            "Esconder a senha"
+        } else {
+            "Mostrar a senha"
+        },
+    );
+    let password = row![password, eye].spacing(6).align_y(Alignment::Center);
     branded(
         column![labeled("Usuário", username), labeled("Senha", password)]
             .push(error_line(f.error.as_deref()))

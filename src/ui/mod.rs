@@ -68,6 +68,7 @@ thread_local! {
 
 const ID_SERVIDOR: &str = "campo-servidor";
 const ID_USUARIO: &str = "campo-usuario";
+const ID_SENHA: &str = "campo-senha";
 
 pub struct App {
     config: Config,
@@ -118,6 +119,8 @@ struct LoginForm {
     server: String,
     username: String,
     password: Secret,
+    /// Olho do campo: mostra a senha em vez dos pontos.
+    show: bool,
     error: Option<String>,
     busy: bool,
 }
@@ -198,6 +201,8 @@ pub enum Msg {
     ChangeServer,
     Username(String),
     Password(Secret),
+    /// Olho do campo de senha.
+    ShowPassword,
     LoginSubmit,
     LoginDone(Result<(Secret, User), Error>),
     VaultSaved(bool),
@@ -711,6 +716,14 @@ impl App {
                 }
                 Task::none()
             }
+            Msg::ShowPassword => match &mut self.screen {
+                Screen::Login(f) => {
+                    f.show = !f.show;
+                    // O clique no botão tira o foco do campo.
+                    operation::focus(ID_SENHA)
+                }
+                _ => Task::none(),
+            },
             Msg::LoginSubmit => self.submit_login(),
             Msg::LoginDone(result) => self.login_done(result),
             Msg::VaultSaved(ok) => {
@@ -1982,6 +1995,7 @@ impl LoginForm {
             server,
             username: String::new(),
             password: Secret(String::new()),
+            show: false,
             error,
             busy: false,
         }
@@ -2254,6 +2268,20 @@ mod tests {
             panic!()
         };
         assert!(!f.busy);
+    }
+
+    #[test]
+    fn olho_mostra_e_esconde_a_senha_so_no_login() {
+        let mut a = app(login());
+        let mostra = |a: &App| matches!(&a.screen, Screen::Login(f) if f.show);
+        assert!(!mostra(&a), "abre escondida");
+        let _ = a.update(Msg::ShowPassword);
+        assert!(mostra(&a));
+        let _ = a.update(Msg::ShowPassword);
+        assert!(!mostra(&a));
+        let mut fora = app(Screen::Connecting);
+        let _ = fora.update(Msg::ShowPassword);
+        assert!(matches!(fora.screen, Screen::Connecting));
     }
 
     #[test]
@@ -3531,6 +3559,11 @@ mod tests {
         l.username = "Opedro".into();
         l.password = Secret("segredo".into());
         print(&app(Screen::Login(l)), "login");
+        let mut l = LoginForm::new("https://call.exemplo.com".into(), None);
+        l.username = "Opedro".into();
+        l.password = Secret("segredo".into());
+        l.show = true;
+        print(&app(Screen::Login(l)), "login-senha-visivel");
         print(
             &app(Screen::Offline("https://call.exemplo.com".into())),
             "offline",
