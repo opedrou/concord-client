@@ -15,15 +15,15 @@ use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::text::Wrapping;
 use iced::widget::text_editor::{Action, Binding, Cursor, Edit, KeyPress, Motion, Position};
 use iced::widget::{
-    Column, button, column, container, image, mouse_area, progress_bar, rich_text, row, scrollable,
-    space, span, stack, text, text_editor,
+    Column, Row, button, column, container, image, mouse_area, progress_bar, rich_text, row,
+    scrollable, space, span, stack, text, text_editor,
 };
 use iced::{
     Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task, Theme,
     border,
 };
 
-use super::sidebar::{CLOSE, HASH, icon};
+use super::sidebar::{CLOSE, HASH, icon, tipped};
 use super::theme::{
     self, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, DANGER_SOFT, FG, FG2, FG3, HOVER, IDLE,
 };
@@ -83,6 +83,9 @@ pub enum Msg {
     /// Clique no anexo: baixa e abre no app do sistema.
     OpenFile(i64),
     Opened(i64, Result<(), String>),
+    /// Clique no botão de um link da mensagem: abre no navegador.
+    OpenLink(String),
+    LinkOpened(Result<(), String>),
     /// "Apagar" pede confirmação; o "Apagar" da confirmação manda.
     AskDelete(i64),
     CancelDelete,
@@ -398,6 +401,16 @@ impl Chat {
             }
             Msg::Deleted(_, Err(e)) => {
                 return self.failed(e, "Não foi possível apagar a mensagem.");
+            }
+            Msg::OpenLink(link) => {
+                return Task::future(async move {
+                    App::Chat(channel, Msg::LinkOpened(logic::open_link(link).await))
+                });
+            }
+            Msg::LinkOpened(result) => {
+                if let Err(e) = result {
+                    self.error = Some(e);
+                }
             }
             Msg::Opened(id, result) => {
                 self.opening.remove(&id);
@@ -749,6 +762,9 @@ fn message_row<'a>(
             ]);
         }
     }
+    if let Some(links) = link_buttons(channel, &message.content) {
+        body = body.push(links);
+    }
     if let Some(attachment) = &message.attachment {
         body = body.push(attachment_view(chat, id, attachment));
     }
@@ -800,6 +816,26 @@ fn message_row<'a>(
     } else {
         cell.into()
     }
+}
+
+/// Links da mensagem como botões "Abrir link · domínio" embaixo dela. O texto vem de um
+/// editor só de leitura, que não sabe de clique em trecho: o botão deixa o texto selecionável.
+fn link_buttons(channel: i64, content: &str) -> Option<Element<'_, App>> {
+    const MAX: usize = 4;
+    let found = logic::links(content);
+    if found.is_empty() {
+        return None;
+    }
+    let buttons = found.into_iter().take(MAX).map(|link| {
+        let host: String = logic::host(link).chars().take(40).collect();
+        let label = button(text(format!("Abrir link · {host}")).size(12.5))
+            .padding([3, 10])
+            .style(theme::outline)
+            .on_press(App::Chat(channel, Msg::OpenLink(link.to_owned())));
+        // O endereço inteiro no tooltip: o domínio sozinho esconde pra onde o link vai.
+        tipped(label.into(), link)
+    });
+    Some(Row::with_children(buttons).spacing(6).wrap().into())
 }
 
 /// Estimativa de que o texto cabe no campo sem rolar: poucas linhas, contando a quebra como
@@ -1885,6 +1921,33 @@ mod tests {
         digita(chat(&mut a), "@Ana e @Zé da Silva oi");
         print(&a, "mencoes-campo");
         print_largura(&a, "mencoes-campo-estreito", 560.0);
+
+        // Links: botões embaixo do texto, que segue selecionável.
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let lista = vec![
+            msg(
+                1,
+                "Ana",
+                0,
+                "olha isso: https://github.com/opedrou/concord-client/releases.",
+            ),
+            msg(
+                2,
+                "Bruno",
+                1,
+                "dois (https://example.com/a?b=1) e http://www.exemplo.org:8080/x e \
+                 https://um-dominio-bem-comprido-pra-testar-a-quebra.example.com/caminho \
+                 https://quarto.dev https://quinto.dev",
+            ),
+        ];
+        let page = Page {
+            messages: lista,
+            has_more: false,
+        };
+        let _ = a.update(App::Chat(1, Msg::Loaded(Ok(Window::first(page)))));
+        print(&a, "links");
+        print_largura(&a, "links-estreito", 900.0);
     }
 
     #[test]
