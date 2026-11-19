@@ -78,9 +78,7 @@ pub fn retry_minutes(secs: u64) -> u64 {
 
 fn finished(result: Result<(u32, u32), Error>) -> State {
     match result {
-        Ok((called, delivered)) => State::Done(format!(
-            "Chamado enviado: {delivered} de {called} com o Concord aberto"
-        )),
+        Ok(_) => State::Done("Chamado enviado".to_owned()),
         Err(Error::TooManyAttempts(secs)) => State::Failed(format!(
             "Muitos chamados. Tenta de novo em {} min",
             retry_minutes(secs)
@@ -302,10 +300,7 @@ mod tests {
 
     #[test]
     fn resposta_vira_aviso() {
-        assert_eq!(
-            finished(Ok((3, 2))),
-            State::Done("Chamado enviado: 2 de 3 com o Concord aberto".into())
-        );
+        assert_eq!(finished(Ok((3, 2))), State::Done("Chamado enviado".into()));
         assert_eq!(
             finished(Err(Error::TooManyAttempts(90))),
             State::Failed("Muitos chamados. Tenta de novo em 2 min".into())

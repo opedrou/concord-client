@@ -3349,7 +3349,7 @@ mod tests {
         let _ = a.update(pessoas(people::Msg::Sent(id + 1, Ok((1, 1)))));
         assert!(estado(&mut a).contains("Sending"));
         let _ = a.update(pessoas(people::Msg::Sent(id, Ok((1, 1)))));
-        assert!(estado(&mut a).contains("Chamado enviado: 1 de 1 com o Concord aberto"));
+        assert!(estado(&mut a).contains("Chamado enviado"));
         let _ = a.update(pessoas(people::Msg::Finish(id + 1)));
         assert!(call_of(&mut a).people.is_some());
         let _ = a.update(pessoas(people::Msg::Finish(id)));
