@@ -191,6 +191,8 @@ struct Main {
     next_call: u64,
     /// Aviso curto na home: motivo de a call ter acabado ou de não ter aberto.
     notice: Option<String>,
+    /// Canal (slug) que o aviso oferece tentar de novo, quando a call desistiu de reconectar.
+    notice_retry: Option<String>,
     /// Lista do sistema, lida ao abrir a aba Voz.
     devices: Option<Devices>,
     /// Motor de teste da aba Voz; só existe sem call.
@@ -252,6 +254,8 @@ pub enum Msg {
     Stuck,
     /// "Cancelar" do "Conectando…": volta pro formulário do servidor.
     CancelConnect,
+    /// X do aviso da home.
+    DismissNotice,
     LoginSubmit,
     LoginDone(Result<(Secret, User), Error>),
     VaultSaved(bool),
@@ -690,7 +694,7 @@ impl App {
                 let content = match (&m.chat, &m.call) {
                     (Some(open), _) => chat::view(m, open),
                     (None, Some(call)) => stage::view(m, call, &self.config),
-                    (None, None) => screens::home(&m.user.username, m.notice.as_deref()),
+                    (None, None) => screens::home(m, &self.config),
                 };
                 let base = row![
                     sidebar::view(m, &self.config),
@@ -773,6 +777,12 @@ impl App {
                 Task::none()
             }
             Msg::CancelConnect => self.cancel_connect(),
+            Msg::DismissNotice => {
+                if let Screen::Main(m) = &mut self.screen {
+                    (m.notice, m.notice_retry) = (None, None);
+                }
+                Task::none()
+            }
             Msg::ChangeServer => self.change_server(),
             Msg::Username(username) => {
                 if let Screen::Login(f) = &mut self.screen {
@@ -1593,13 +1603,18 @@ impl App {
         if let Some(old) = m.call.take() {
             old.leave();
         }
-        m.notice = None;
+        (m.notice, m.notice_retry) = (None, None);
         // Dois motores abertos ao mesmo tempo brigam pelo mic.
         m.stop_probe();
         m.next_call += 1;
         let id = m.next_call;
-        m.call = Some(ActiveCall::new(id, slug));
+        m.call = Some(ActiveCall::new(id, slug.clone()));
         let prefs = self.config.audio_prefs();
+        // O "Voltar pra" da home.
+        if self.config.last_voice.as_deref() != Some(slug.as_str()) {
+            self.config.last_voice = Some(slug);
+            self.persist();
+        }
         // `Engine::start` bloqueia: abre o áudio fora da thread da interface.
         Task::future(async move {
             let started = tokio::task::spawn_blocking(move || Engine::start(prefs))
@@ -1683,9 +1698,11 @@ impl App {
         {
             engine.play(Effect::Leave);
         }
+        let slug = m.call.as_ref().map(|c| c.slug.clone());
         m.call = None;
         let closing = m.closing.take();
         m.notice = voice::end_notice(end).map(str::to_owned);
+        m.notice_retry = slug.filter(|_| end == End::GaveUp);
         let (expired, probe) = match end {
             End::Unauthorized => (self.session_expired(), Task::none()),
             // Configurações abertas na aba Voz voltam a medir o mic.
@@ -1973,6 +1990,7 @@ impl App {
             full_window: false,
             next_call: 0,
             notice: None,
+            notice_retry: None,
             devices: None,
             probe: Probe::Off,
             next_probe: 0,
@@ -2842,6 +2860,77 @@ mod tests {
         let _ = a.update(Msg::JoinChannel("geral".into()));
         let _ = a.update(Msg::JoinChannel("nao-existe".into()));
         assert!(main_of(&mut a).call.is_none());
+    }
+
+    #[test]
+    fn home_lista_so_voz_com_gente_sem_repetir_quem_tem_sessao_fantasma() {
+        let mut a = voice_app();
+        let pessoa = |name: &str| Participant {
+            identity: format!("{name}__1"),
+            name: name.into(),
+            muted: false,
+            camera: false,
+            screen_share: false,
+        };
+        main_of(&mut a).presence = Presence::from([
+            (
+                "call".to_owned(),
+                vec![pessoa("Ana"), pessoa("Bruno"), pessoa("Ana")],
+            ),
+            ("jogando".to_owned(), vec![]),
+            // Chave de canal de texto não vira cartão.
+            ("geral".to_owned(), vec![pessoa("Carla")]),
+        ]);
+        let m = main_of(&mut a);
+        let live = screens::live_voice(m);
+        assert_eq!(live.len(), 1);
+        let (canal, quem) = &live[0];
+        assert_eq!(canal.slug, "call");
+        let nomes: Vec<_> = quem.iter().map(|p| p.display_name()).collect();
+        assert_eq!(nomes, ["Ana", "Bruno"]);
+        m.presence.clear();
+        assert!(
+            screens::live_voice(m).is_empty(),
+            "sem ninguém, volta o texto"
+        );
+    }
+
+    #[test]
+    fn entrar_numa_call_guarda_o_canal_pro_voltar_pra() {
+        let mut a = voice_app();
+        assert_eq!(a.config.last_voice, None);
+        let _ = a.update(Msg::JoinChannel("geral".into()));
+        assert_eq!(a.config.last_voice, None, "texto não conta");
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        assert_eq!(a.config.last_voice.as_deref(), Some("call"));
+        let _ = a.update(Msg::JoinChannel("jogando".into()));
+        assert_eq!(a.config.last_voice.as_deref(), Some("jogando"));
+        // Sair não apaga: é o que a home oferece depois.
+        let _ = a.update(Msg::Leave);
+        assert_eq!(a.config.last_voice.as_deref(), Some("jogando"));
+    }
+
+    #[test]
+    fn desistir_de_reconectar_oferece_tentar_de_novo_e_o_x_dispensa_o_aviso() {
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::GaveUp)));
+        let m = main_of(&mut a);
+        assert!(m.call.is_none() && m.notice.is_some());
+        assert_eq!(m.notice_retry.as_deref(), Some("call"));
+        // Tentar de novo entra no mesmo canal e leva o aviso.
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        let m = main_of(&mut a);
+        assert!(m.notice.is_none() && m.notice_retry.is_none());
+        assert_eq!(call_of(&mut a).slug, "call");
+
+        // Outros avisos não oferecem; o X leva o aviso embora.
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::RoomClosed)));
+        let m = main_of(&mut a);
+        assert!(m.notice.is_some() && m.notice_retry.is_none());
+        let _ = a.update(Msg::DismissNotice);
+        assert!(main_of(&mut a).notice.is_none());
     }
 
     #[test]
@@ -4178,5 +4267,20 @@ mod tests {
         let id = call_id(&mut a);
         let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::RoomClosed)));
         print(&a, "home-aviso");
+
+        // Home com gente em voz: cartão com "+N" e o "Voltar pra" de um canal vazio; depois o
+        // aviso de desistência, com "Tentar de novo" no lugar do "Voltar pra".
+        let mut a = voice_app();
+        a.config.last_voice = Some("jogando".into());
+        let na_call = nomes[..8].iter().map(|n| pessoa(n, false, false, false));
+        main_of(&mut a).presence = Presence::from([
+            ("call".to_owned(), na_call.collect()),
+            ("jogando".to_owned(), vec![]),
+        ]);
+        print(&a, "home-cartoes");
+        let m = main_of(&mut a);
+        m.notice = Some("Não foi possível reconectar à call.".into());
+        m.notice_retry = Some("call".into());
+        print(&a, "home-tentar-de-novo");
     }
 }
