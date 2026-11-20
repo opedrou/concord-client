@@ -16,7 +16,7 @@ use crate::api::{Error, Member};
 /// Quantas pessoas cabem num chamado, como no servidor.
 pub const MAX: usize = 10;
 /// Quanto o aviso de sucesso fica na tela antes de o painel fechar.
-const SUCCESS_FOR: Duration = Duration::from_millis(1200);
+pub(super) const SUCCESS_FOR: Duration = Duration::from_millis(1200);
 const WIDTH: f32 = 340.0;
 const FACE: f32 = 28.0;
 /// Altura de uma linha da lista (rosto, margem e espaço entre elas) e da lista toda.
@@ -36,7 +36,7 @@ pub enum Msg {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-enum State {
+pub(super) enum State {
     #[default]
     Idle,
     Sending,
@@ -76,7 +76,7 @@ pub fn retry_minutes(secs: u64) -> u64 {
     secs.div_ceil(60).max(1)
 }
 
-fn finished(result: Result<(u32, u32), Error>) -> State {
+pub(super) fn finished(result: Result<(u32, u32), Error>) -> State {
     match result {
         Ok(_) => State::Done("Chamado enviado".to_owned()),
         Err(Error::TooManyAttempts(secs)) => State::Failed(format!(

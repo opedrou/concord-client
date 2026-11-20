@@ -16,7 +16,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{image, operation, row, stack};
+use iced::widget::{image, mouse_area, operation, row, stack};
 use iced::{Color, Element, Event, Subscription, Task, Theme, event, mouse, time, window};
 use voice::{ActiveCall, Boot, Probe};
 
@@ -220,6 +220,8 @@ struct Main {
     tray: bool,
     /// Quem tem conta no servidor, pra chamar pra call e pro `@` do chat.
     members: Vec<Member>,
+    /// Menu aberto na linha de um membro da lista da direita.
+    member_menu: Option<members::Menu>,
     /// Usernames online, do polling de presença. Quem está em voz conta de qualquer jeito.
     online: HashSet<String>,
 }
@@ -380,6 +382,8 @@ pub enum Msg {
     Autostart(bool),
     // Chamar pessoas pra call.
     People(people::Msg),
+    /// Menu de uma pessoa na lista de membros.
+    Member(members::Msg),
 }
 
 /// O que a pessoa fez, pro log: cliques e escolhas, nunca texto digitado nem título de
@@ -445,6 +449,7 @@ fn action(msg: &Msg) -> Option<String> {
             "desligou iniciar com o computador",
         ),
         Msg::People(msg) => return people::action(msg),
+        Msg::Member(msg) => return members::action(msg),
         _ => return None,
     })
 }
@@ -702,6 +707,13 @@ impl App {
                     content,
                     members::view(m),
                 ];
+                // Clique fora do menu de um membro fecha ele: o que captura o clique (botões,
+                // campos) não passa por aqui. Sempre no mesmo lugar da árvore, pro campo do
+                // chat não perder o foco quando o menu abre e fecha.
+                let mut base = mouse_area(base);
+                if m.member_menu.is_some() {
+                    base = base.on_press(Msg::Member(members::Msg::Close));
+                }
                 match m.settings {
                     _ if self.news => stack![base, screens::news()].into(),
                     Some(tab) => stack![base, screens::settings(m, &self.config, tab)].into(),
@@ -1167,6 +1179,7 @@ impl App {
                             c.view = voice::View::Focus;
                         }
                     }
+                    Screen::Main(m) if m.member_menu.is_some() => m.member_menu = None,
                     _ => self.close_volume(),
                 }
                 Task::none()
@@ -1325,6 +1338,10 @@ impl App {
             }
             Msg::People(msg) => match &mut self.screen {
                 Screen::Main(m) => people::update(m, msg),
+                _ => Task::none(),
+            },
+            Msg::Member(msg) => match &mut self.screen {
+                Screen::Main(m) => members::update(m, msg),
                 _ => Task::none(),
             },
         }
@@ -2005,6 +2022,7 @@ impl App {
             focused: self.window.is_some(),
             tray: false,
             members: Vec::new(),
+            member_menu: None,
             online: HashSet::new(),
         };
         let avatars = main.fetch_avatars();
@@ -3776,6 +3794,79 @@ mod tests {
     }
 
     #[test]
+    fn menu_de_membro_oferece_chamar_e_mencionar_conforme_o_caso() {
+        let mut a = in_call(&["Ana"]);
+        com_membros(&mut a);
+        let oferta = |a: &mut App, quem: &str| {
+            let o = members::items(main_of(a), quem);
+            (o.call, o.mention)
+        };
+        assert_eq!(oferta(&mut a, "Ana"), (None, false), "já está na call");
+        assert_eq!(oferta(&mut a, "Bruno"), (Some(3), false));
+        assert_eq!(oferta(&mut a, "Opedro"), (None, false), "eu mesmo");
+        assert_eq!(oferta(&mut a, "Zé"), (None, false), "sem conta na lista");
+        // Com um chat aberto, dá pra mencionar (menos eu).
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        assert_eq!(oferta(&mut a, "Ana"), (None, true));
+        assert_eq!(oferta(&mut a, "Bruno"), (Some(3), true));
+        assert_eq!(oferta(&mut a, "Opedro"), (None, false));
+        // Sem call, só mencionar.
+        let _ = a.update(Msg::Leave);
+        assert_eq!(oferta(&mut a, "Bruno"), (None, true));
+        let _ = a.update(Msg::Chat(1, chat::Msg::Close));
+        assert_eq!(oferta(&mut a, "Bruno"), (None, false));
+    }
+
+    #[test]
+    fn menu_de_membro_abre_fecha_chama_e_ignora_resposta_de_outro() {
+        use members::Msg as M;
+        let mut a = in_call(&["Ana"]);
+        com_membros(&mut a);
+        let menu = |a: &mut App| main_of(a).member_menu.as_ref().map(|x| x.name.clone());
+        let estado = |a: &mut App| format!("{:?}", main_of(a).member_menu.as_ref().unwrap().state);
+        let membro = Msg::Member;
+
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        assert_eq!(menu(&mut a).as_deref(), Some("Bruno"));
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        assert_eq!(menu(&mut a), None, "clicar de novo fecha");
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        let _ = a.update(Msg::Escape);
+        assert_eq!(menu(&mut a), None, "Esc fecha");
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        let _ = a.update(membro(M::Close));
+        assert_eq!(menu(&mut a), None, "clique fora fecha");
+
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        let _ = a.update(membro(M::Call(3)));
+        assert_eq!(estado(&mut a), "Sending");
+        // Resposta de outro menu cai fora; a certa mostra o aviso e depois fecha.
+        let _ = a.update(membro(M::Sent("Ana".into(), Ok((1, 1)))));
+        assert_eq!(estado(&mut a), "Sending");
+        let _ = a.update(membro(M::Sent("Bruno".into(), Ok((1, 1)))));
+        assert_eq!(estado(&mut a), "Done(\"Chamado enviado\")");
+        let _ = a.update(membro(M::Finish("Ana".into())));
+        assert!(menu(&mut a).is_some());
+        let _ = a.update(membro(M::Finish("Bruno".into())));
+        assert_eq!(menu(&mut a), None);
+
+        // Erro: mesma mensagem do painel de chamar, e dá pra tentar de novo.
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        let _ = a.update(membro(M::Call(3)));
+        let espera = Err(Error::TooManyAttempts(1500));
+        let _ = a.update(membro(M::Sent("Bruno".into(), espera)));
+        assert!(estado(&mut a).contains("Muitos chamados. Tenta de novo em 25 min"));
+        let _ = a.update(membro(M::Call(3)));
+        assert_eq!(estado(&mut a), "Sending");
+
+        // Mencionar fecha o menu.
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        let _ = a.update(membro(M::Open("Ana".into())));
+        let _ = a.update(membro(M::Mention("Ana".into())));
+        assert_eq!(menu(&mut a), None);
+    }
+
+    #[test]
     fn chamar_pessoas_abre_manda_fecha_e_ignora_resposta_velha() {
         let mut a = in_call(&["Ana"]);
         com_membros(&mut a);
@@ -4183,6 +4274,38 @@ mod tests {
         let espera = Err(Error::TooManyAttempts(1500));
         let _ = a.update(Msg::People(people::Msg::Sent(id, espera)));
         print(&a, "chamar-limite-de-chamados");
+
+        // Menu de um membro, com call e chat abertos: chamar, mencionar, enviando e erro.
+        let (mut a, id) = palco(4);
+        let _ = id;
+        main_of(&mut a).members = [
+            "Ana",
+            "Bruno com nome bem comprido demais pra caber",
+            "Opedro",
+            "Zé da Silva",
+            "carlos",
+            "Dani",
+        ]
+        .iter()
+        .zip(1..)
+        .map(|(username, id)| Member {
+            id,
+            username: (*username).into(),
+            avatar_url: None,
+        })
+        .collect();
+        main_of(&mut a).presence = Presence::from([(
+            "Jogando".to_owned(),
+            vec![pessoa("Zé da Silva", false, false, false)],
+        )]);
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        let _ = a.update(Msg::Member(members::Msg::Open("Dani".into())));
+        print(&a, "membros-menu");
+        let _ = a.update(Msg::Member(members::Msg::Call(6)));
+        print(&a, "membros-menu-chamando");
+        let espera = Err(Error::TooManyAttempts(1500));
+        let _ = a.update(Msg::Member(members::Msg::Sent("Dani".into(), espera)));
+        print(&a, "membros-menu-erro");
 
         // Transmissão: painel de qualidade, seletor do sistema, no ar e falha.
         let (mut a, id) = palco(4);
