@@ -69,6 +69,9 @@ tray-icon = { version = "0.26", default-features = false }
 [target.'cfg(not(windows))'.dependencies]
 cpal = { version = "0.18", features = ["pulseaudio"] }
 livekit = { version = "0.10", features = ["glib-main-loop"] }
+# O token do portal que reabre a mesma tela (`share::desktop`). Já vem pelo livekit, e é a
+# cópia em `vendor/webrtc-sys`.
+webrtc-sys = "0.3"
 
 # Resolução dos monitores pelo Mutter, pra saber se a transmissão é tela ou janela. Já vem
 # compilado pelo `keyring`.

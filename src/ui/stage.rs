@@ -703,7 +703,7 @@ fn banner<'a>(attempt: u32) -> Element<'a, Msg> {
 /// O que a transmissão mostra logo acima da barra: nunca mais de um por vez.
 fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element<'a, Msg>> {
     let content = match call.share {
-        State::Choosing => choosing(),
+        State::Choosing => choosing(call),
         State::Failed => {
             let label = text("Não foi possível transmitir a tela.")
                 .size(13.5)
@@ -723,8 +723,10 @@ fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element
         State::Live if call.share_panel && cfg!(windows) => picker(call, config),
         State::Live if call.share_menu => share_menu(call),
         State::Live => return None,
-        _ if call.share_panel && cfg!(windows) => picker(call, config),
-        _ if call.share_panel => share_card(config),
+        _ if call.share_panel && cfg!(windows) && again(call, config).is_none() => {
+            picker(call, config)
+        }
+        _ if call.share_panel => share_card(call, config),
         _ => return None,
     };
     Some(
@@ -736,13 +738,18 @@ fn share_overlay<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<Element
     )
 }
 
-fn choosing<'a>() -> Element<'a, Msg> {
+fn choosing(call: &ActiveCall) -> Element<'_, Msg> {
     let cancel = button(text("Cancelar").size(13).font(theme::SEMIBOLD))
         .padding([5, 12])
         .style(theme::outline)
         .on_press(Msg::ShareStop);
-    // No Windows o alvo já veio do nosso seletor: só falta o primeiro quadro.
-    let label = if cfg!(windows) {
+    // No Windows o alvo já veio do nosso seletor, e no Linux o token reabre a lembrada: só
+    // falta o primeiro quadro.
+    let restoring = call
+        .share_source
+        .as_ref()
+        .is_some_and(|s| s.token.is_some());
+    let label = if cfg!(windows) || restoring {
         "Abrindo a captura…"
     } else {
         "Escolha a tela na janela do sistema…"
@@ -756,8 +763,22 @@ fn choosing<'a>() -> Element<'a, Msg> {
         .into()
 }
 
-/// Qualidade da próxima transmissão. Sem fundo clicável, como o painel de volume.
-fn share_card(config: &Config) -> Element<'_, Msg> {
+/// Fonte lembrada que o painel oferece transmitir de novo, com o nome atual. No Linux só com
+/// o token; no Windows, até a lista mostrar que ela sumiu ou a pessoa pedir outra.
+fn again<'a>(call: &'a ActiveCall, config: &'a Config) -> Option<&'a Source> {
+    let last = config.share_last.as_ref()?;
+    if call.share_other || (!cfg!(windows) && last.token.is_none()) {
+        return None;
+    }
+    match (&call.share_sources, &call.share_source) {
+        (Some(_), Some(found)) if cfg!(windows) => Some(found),
+        _ => Some(last),
+    }
+}
+
+/// Qualidade da próxima transmissão. Sem fundo clicável, como o painel de volume. Com fonte
+/// lembrada, transmitir ela de novo é a ação principal, e "Escolher outra" abre o seletor.
+fn share_card<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(28))
         .padding(0)
         .style(theme::ghost)
@@ -787,26 +808,47 @@ fn share_card(config: &Config) -> Element<'_, Msg> {
             .on_press(Msg::ShareQuality(quality))
             .into()
     });
-    let start = button(
-        text("Transmitir")
-            .size(14.5)
-            .font(theme::BOLD)
-            .center()
-            .width(Length::Fill),
-    )
-    .padding(10)
-    .width(Length::Fill)
-    .style(theme::primary)
-    .on_press(Msg::ShareStart);
-    // Etapa 4: o áudio por app do Windows ainda não existe.
-    let audio: Option<Element<'_, Msg>> = cfg!(target_os = "linux").then(|| {
-        toggler(config.share_audio)
-            .label("Transmitir áudio")
-            .on_toggle(Msg::ShareAudio)
-            .size(20)
-            .text_size(14.4)
-            .into()
-    });
+    let wide = |label: String, style: fn(&Theme, button::Status) -> button::Style, msg| {
+        // Sobra do painel e do botão: 12 de cada lado em cada um.
+        let label = ellipsize(&label, 14.5, SHARE_PANEL - 48.0);
+        button(
+            text(label)
+                .size(14.5)
+                .font(theme::BOLD)
+                .center()
+                .width(Length::Fill),
+        )
+        .padding(10)
+        .width(Length::Fill)
+        .style(style)
+        .on_press_maybe(msg)
+    };
+    let start = match again(call, config) {
+        // No Windows a lista ainda pode estar chegando: o clique espera ela achar a fonte.
+        Some(last) => column![
+            wide(
+                format!("Transmitir de novo: {last}"),
+                theme::primary,
+                (!cfg!(windows) || call.share_sources.is_some()).then_some(Msg::ShareStart),
+            ),
+            wide(
+                "Escolher outra".into(),
+                theme::outline,
+                Some(Msg::ShareOther)
+            ),
+        ]
+        .spacing(6),
+        None => column![wide(
+            "Transmitir".into(),
+            theme::primary,
+            Some(Msg::ShareStart)
+        )],
+    };
+    let audio = toggler(config.share_audio)
+        .label("Transmitir áudio")
+        .on_toggle(Msg::ShareAudio)
+        .size(20)
+        .text_size(14.4);
 
     let body = column![head, Column::with_children(options).spacing(2)]
         .push(audio)

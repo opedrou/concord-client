@@ -127,14 +127,57 @@ pub enum State {
     Failed,
 }
 
-/// Tela ou janela escolhida no nosso seletor, pelo id do WebRTC. Só o Windows usa: no Linux
-/// quem escolhe é o portal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Tela ou janela a transmitir. No Windows vem do nosso seletor, pelo id do WebRTC. No Linux
+/// quem escolhe é o portal, e ela só existe lembrada, pelo token dele.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Source {
     pub window: bool,
     pub id: u64,
     pub title: String,
+    /// Executável da janela, como `chrome.exe`: o id muda quando ela reabre. Só no Windows.
+    pub exe: String,
+    /// Token do portal que reabre a mesma tela ou janela sem perguntar. Só no Linux.
+    pub token: Option<String>,
+}
+
+impl Source {
+    /// Escolha do portal, lembrada pelo token. O portal não diz o nome da janela.
+    #[cfg_attr(windows, allow(dead_code))]
+    fn portal(token: String, screen: bool) -> Self {
+        Self {
+            window: !screen,
+            title: if screen {
+                "Tela inteira"
+            } else {
+                "A mesma janela"
+            }
+            .into(),
+            token: Some(token),
+            ..Self::default()
+        }
+    }
+}
+
+/// A fonte lembrada na lista de agora. Tela pelo id. Janela pelo executável e pelo título; com
+/// o título mudado (a aba do navegador), vale se for a única janela daquele executável.
+pub fn find<'a, I>(list: I, last: &Source) -> Option<&'a Source>
+where
+    I: IntoIterator<Item = &'a Source>,
+    I::IntoIter: Clone,
+{
+    let mut same = list.into_iter().filter(|s| s.window == last.window);
+    if !last.window {
+        return same.find(|s| s.id == last.id);
+    }
+    let mut same = same.filter(|s| s.exe == last.exe);
+    if let Some(s) = same.clone().find(|s| s.title == last.title) {
+        return Some(s);
+    }
+    match (same.next(), same.next()) {
+        (Some(s), None) if !last.exe.is_empty() => Some(s),
+        _ => None,
+    }
 }
 
 impl std::fmt::Display for Source {
@@ -233,6 +276,12 @@ pub fn sources() -> Vec<(Source, Option<Thumb>)> {
                     } else {
                         format!("Tela {}", i + 1)
                     },
+                    exe: if window {
+                        loopback::window_exe(s.id()).unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
+                    token: None,
                 };
                 let thumb = snapshot(kind, source.id);
                 (source, thumb)
@@ -250,8 +299,8 @@ pub fn sources() -> Vec<(Source, Option<Thumb>)> {
 }
 
 pub enum Cmd {
-    /// Qualidade, se leva o áudio junto e, no Windows, o que transmitir (`None`: a
-    /// primeira tela).
+    /// Qualidade, se leva o áudio junto e o que transmitir: no Windows o alvo do seletor
+    /// (`None`: a primeira tela); no Linux a lembrada, com o token (`None`: o portal pergunta).
     Start(Quality, bool, Option<Source>),
     /// Troca o que sai sem despublicar: no Windows, o alvo do seletor; no Linux, `None` abre
     /// o portal de novo.
@@ -275,6 +324,9 @@ enum Note {
     Ready(NativeVideoSource, (u32, u32)),
     /// Não há capturador neste sistema. Fim normal é a thread soltar o canal.
     Failed,
+    /// O que saiu no primeiro quadro, pra próxima transmissão começar nele. `None`: nada a
+    /// lembrar (o portal não deu token).
+    Chosen(Option<Source>),
 }
 
 /// Largura da prévia própria, perto da de um tile.
@@ -302,7 +354,7 @@ impl Preview {
 }
 
 /// Saída da thread de captura: reduz cada quadro e entrega à fonte de vídeo. Leva junto o
-/// alvo escolhido no seletor do Windows.
+/// alvo do [`Cmd::Start`].
 pub struct Feed {
     limit: Option<(u32, u32)>,
     /// Na troca já vem com a fonte publicada: a faixa segue a mesma.
@@ -316,7 +368,6 @@ pub struct Feed {
 }
 
 impl Feed {
-    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn target(&self) -> Option<&Source> {
         self.target.as_ref()
     }
@@ -384,14 +435,19 @@ impl Feed {
     pub fn fail(&self) {
         let _ = self.notes.send(Note::Failed);
     }
+
+    pub fn chose(&self, source: Option<Source>) {
+        let _ = self.notes.send(Note::Chosen(source));
+    }
 }
 
 /// Corpo da thread de captura: fps, pedido de parar e saída dos quadros. Retornar encerra
 /// a transmissão.
 pub type Capturer = fn(u32, &AtomicBool, Feed);
 
-/// Captura de verdade. No Linux, `Generic` sem alvo abre o seletor do portal sozinho. No
-/// Windows vai o alvo do nosso seletor, achado pelo id num capturador desta thread.
+/// Captura de verdade. No Linux, `Generic` abre o seletor do portal sozinho, ou reabre a
+/// lembrada pelo token. No Windows vai o alvo do nosso seletor, achado pelo id num capturador
+/// desta thread. O primeiro quadro avisa o que saiu, pra próxima vez.
 pub fn desktop(fps: u32, stop: &AtomicBool, mut feed: Feed) {
     #[cfg(windows)]
     let kind = if feed.target().is_some_and(|t| t.window) {
@@ -421,13 +477,30 @@ pub fn desktop(fps: u32, stop: &AtomicBool, mut feed: Feed) {
         }
         found
     };
+    // O portal tem uma fonte só, com um id nosso. Com o token lembrado nela, reabre a mesma
+    // tela ou janela sem perguntar; token vencido só faz o portal perguntar de novo.
     #[cfg(not(windows))]
-    let target = None;
+    let target = capturer.get_source_list().into_iter().next();
+    #[cfg(not(windows))]
+    let portal = target.as_ref().map(|s| s.id());
+    #[cfg(not(windows))]
+    if let (Some(id), Some(token)) = (portal, feed.target().and_then(|t| t.token.as_deref())) {
+        webrtc_sys::desktop_capturer::ffi::set_restore_token(id, token);
+    }
 
     let ended = Arc::new(AtomicBool::new(false));
     let flag = ended.clone();
     capturer.start_capture(target, move |result| match result {
-        Ok(f) => feed.frame(f.data(), f.stride(), f.width() as u32, f.height() as u32),
+        Ok(f) => {
+            let (w, h) = (f.width() as u32, f.height() as u32);
+            if !feed.started {
+                #[cfg(not(windows))]
+                feed.chose(portal.and_then(|id| chosen(id, (w, h))));
+                #[cfg(windows)]
+                feed.chose(feed.target().cloned());
+            }
+            feed.frame(f.data(), f.stride(), w, h)
+        }
         // Portal recusado, cancelado ou encerrado por fora.
         Err(CaptureError::Permanent) => flag.store(true, Ordering::Relaxed),
         // É o que vem enquanto a pessoa não escolhe.
@@ -437,6 +510,18 @@ pub fn desktop(fps: u32, stop: &AtomicBool, mut feed: Feed) {
         capturer.capture_frame();
         !stop.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed)
     });
+}
+
+/// O token novo que o portal deu à fonte `id`, com o nome pra mostrar. Sem token novo (o
+/// portal não lembrou a escolha) não há o que lembrar.
+#[cfg(not(windows))]
+fn chosen(id: u64, frame: (u32, u32)) -> Option<Source> {
+    let token = webrtc_sys::desktop_capturer::ffi::take_restore_token(id);
+    if token.is_empty() {
+        return None;
+    }
+    let screen = app_audio::is_screen(frame, app_audio::monitors());
+    Some(Source::portal(token, screen))
 }
 
 /// Roda `step` no ritmo do fps, descontando o tempo gasto nele, até devolver `false`.
@@ -650,7 +735,8 @@ async fn stop(share: &mut Option<Running>, room: &watch::Receiver<Option<LocalPa
 
 /// Dono da transmissão durante a call. `room` é a sala atual, `None` entre uma conexão e
 /// outra. Só [`Cmd::Start`] e [`Cmd::Swap`] abrem captura, e eles só vêm do clique da
-/// pessoa. `audio` recebe o estado do áudio, de outra thread; `preview`, a prévia própria.
+/// pessoa. `audio` recebe o estado do áudio, de outra thread; `preview`, a prévia própria;
+/// `remember`, o que saiu, pra próxima vez começar nele.
 pub async fn run(
     mut cmds: UnboundedReceiver<Cmd>,
     mut room: watch::Receiver<Option<LocalParticipant>>,
@@ -658,6 +744,7 @@ pub async fn run(
     preview: Preview,
     notify: impl Fn(State),
     audio: impl Fn(View) + Clone + Send + 'static,
+    remember: impl Fn(Option<Source>),
 ) {
     let mut share: Option<Running> = None;
     loop {
@@ -666,6 +753,7 @@ pub async fn run(
             // fonte.
             biased;
             note = next_note(&mut share) => match note {
+                (_, Some(Note::Chosen(source))) => remember(source),
                 (false, Some(Note::Ready(source, frame))) => {
                     if let Some(r) = &mut share {
                         r.source = Some(source);
@@ -808,12 +896,126 @@ mod tests {
             window: true,
             id: 1,
             title: title.into(),
+            ..Default::default()
         };
         assert_eq!(janela("Tela 1").to_string(), "Tela 1");
         let longo = "á".repeat(60);
         let curto = janela(&longo).to_string();
         assert_eq!(curto.chars().count(), 48);
         assert!(curto.ends_with('…'));
+    }
+
+    #[test]
+    fn acha_a_lembrada_na_lista_de_agora() {
+        let janela = |id, exe: &str, title: &str| Source {
+            window: true,
+            id,
+            title: title.into(),
+            exe: exe.into(),
+            ..Default::default()
+        };
+        let tela = |id| Source {
+            id,
+            title: format!("Tela {id}"),
+            ..Default::default()
+        };
+        let lista = [
+            tela(1),
+            tela(2),
+            janela(2, "chrome.exe", "Concord - Chrome"),
+            janela(30, "code.exe", "a.rs - VS Code"),
+            janela(31, "code.exe", "b.rs - VS Code"),
+        ];
+        let acha = |last: &Source| find(&lista, last).map(|s| (s.window, s.id));
+        assert_eq!(acha(&tela(2)), Some((false, 2)), "tela pelo id");
+        assert_eq!(acha(&tela(3)), None, "monitor saiu");
+        // Janela reaberta: o id muda, o executável e o título ficam.
+        assert_eq!(
+            acha(&janela(9, "code.exe", "b.rs - VS Code")),
+            Some((true, 31))
+        );
+        assert_eq!(
+            acha(&janela(9, "chrome.exe", "Outra aba - Chrome")),
+            Some((true, 2)),
+            "título mudou, única do executável"
+        );
+        assert_eq!(
+            acha(&janela(9, "code.exe", "c.rs - VS Code")),
+            None,
+            "título mudou e há duas: nenhuma"
+        );
+        assert_eq!(acha(&janela(9, "spotify.exe", "Spotify")), None);
+        assert_eq!(
+            acha(&janela(9, "", "Outra")),
+            None,
+            "sem executável, só pelo título"
+        );
+    }
+
+    #[test]
+    fn escolha_do_portal_leva_o_token_e_um_nome() {
+        let tela = Source::portal("t1".into(), true);
+        assert_eq!((tela.window, tela.title.as_str()), (false, "Tela inteira"));
+        assert_eq!(tela.token.as_deref(), Some("t1"));
+        let janela = Source::portal("t2".into(), false);
+        assert_eq!(
+            (janela.window, janela.to_string()),
+            (true, "A mesma janela".into())
+        );
+    }
+
+    /// O token vai e volta pelo RestoreTokenManager do libwebrtc, pelo id da fonte, e ler
+    /// apaga: o portal só aceita cada um uma vez.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn token_do_portal_vai_e_volta_pelo_id() {
+        use webrtc_sys::desktop_capturer::ffi::{set_restore_token, take_restore_token};
+        let id = u64::MAX - 7;
+        assert_eq!(take_restore_token(id), "", "sem token");
+        set_restore_token(id, "abc");
+        set_restore_token(id + 1, "outro");
+        assert_eq!(take_restore_token(id), "abc");
+        assert_eq!(take_restore_token(id), "", "ler apaga");
+        assert_eq!(take_restore_token(id + 1), "outro");
+    }
+
+    /// O que a captura escolheu chega a quem lembra, da primeira e da troca.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escolha_da_captura_e_da_troca_chega_pra_lembrar() {
+        static ABERTAS: AtomicUsize = AtomicUsize::new(0);
+        static PRONTA: AtomicBool = AtomicBool::new(false);
+        fn tela(_: u32, stop: &AtomicBool, mut feed: Feed) {
+            let n = ABERTAS.fetch_add(1, Ordering::SeqCst);
+            feed.chose(Some(Source::portal(format!("t{n}"), true)));
+            quadro(&mut feed);
+            PRONTA.store(true, Ordering::SeqCst);
+            espera_parar(stop);
+        }
+        let (cmd, cmds) = mpsc::unbounded_channel();
+        let (states, mut estados) = mpsc::unbounded_channel();
+        let (lembra, mut lembradas) = mpsc::unbounded_channel();
+        let (_room, room) = watch::channel(None);
+        let _t = tokio::spawn(async move {
+            let _room = _room;
+            let states = move |s| {
+                let _ = states.send(s);
+            };
+            let lembra = move |s: Option<Source>| {
+                let _ = lembra.send(s.and_then(|s| s.token));
+            };
+            run(cmds, room, tela, Preview::default(), states, |_| {}, lembra).await;
+        });
+        cmd.send(Cmd::Start(Quality::Alta, false, None)).unwrap();
+        assert_eq!(proximo(&mut estados).await, State::Choosing);
+        let token = timeout(ESPERA, lembradas.recv()).await.unwrap().unwrap();
+        assert_eq!(token.as_deref(), Some("t0"));
+        // Trocar só vale com a fonte criada, no primeiro quadro.
+        ate(|| PRONTA.load(Ordering::SeqCst)).await;
+        cmd.send(Cmd::Swap(None)).unwrap();
+        let token = timeout(ESPERA, lembradas.recv()).await.unwrap().unwrap();
+        assert_eq!(token.as_deref(), Some("t1"), "o token novo substitui");
+        cmd.send(Cmd::Stop).unwrap();
+        assert_eq!(proximo(&mut estados).await, State::Off);
     }
 
     /// Lista as fontes de verdade com o tempo das miniaturas, um quadro de cada:
@@ -931,6 +1133,7 @@ mod tests {
                 move |s| {
                     let _ = states.send(s);
                 },
+                |_| {},
                 |_| {},
             )
             .await;

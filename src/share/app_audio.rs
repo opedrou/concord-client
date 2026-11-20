@@ -218,7 +218,7 @@ fn pw_link(args: &[String]) {
 ///
 /// ponytail: janela em tela cheia tem o tamanho do monitor e é vista como tela. Saber a
 /// janela de verdade exige o restore data do portal, que o libwebrtc não expõe.
-fn is_screen(frame: (u32, u32), monitors: Option<Vec<(u32, u32)>>) -> bool {
+pub(super) fn is_screen(frame: (u32, u32), monitors: Option<Vec<(u32, u32)>>) -> bool {
     match monitors.filter(|m| !m.is_empty()) {
         Some(m) => m.iter().any(|&(w, h)| frame == (w, h) || frame == (h, w)),
         None => true,
@@ -236,7 +236,7 @@ fn initial(screen: bool, apps: &[String]) -> (Choice, bool) {
 
 /// Resolução atual de cada monitor, pelo Mutter. `None` fora do GNOME.
 #[cfg(target_os = "linux")]
-fn monitors() -> Option<Vec<(u32, u32)>> {
+pub(super) fn monitors() -> Option<Vec<(u32, u32)>> {
     use zbus::zvariant::OwnedValue;
     type Props = HashMap<String, OwnedValue>;
     type Mode = (String, i32, i32, f64, f64, Vec<f64>, Props);
@@ -274,7 +274,7 @@ fn monitors() -> Option<Vec<(u32, u32)>> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn monitors() -> Option<Vec<(u32, u32)>> {
+pub(super) fn monitors() -> Option<Vec<(u32, u32)>> {
     None
 }
 

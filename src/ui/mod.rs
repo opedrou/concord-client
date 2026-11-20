@@ -315,6 +315,8 @@ pub enum Msg {
     /// Interruptor "Transmitir áudio".
     ShareAudio(bool),
     ShareStart,
+    /// "Escolher outra" no painel com fonte lembrada: o seletor de sempre.
+    ShareOther,
     ShareStop,
     /// "Trocar" no tile da própria transmissão: outra tela sem parar.
     ShareSwap,
@@ -451,6 +453,7 @@ fn action(msg: &Msg) -> Option<String> {
             "desligou o áudio da transmissão",
         ),
         Msg::ShareStart => "começou a transmitir".into(),
+        Msg::ShareOther => "clicou em Escolher outra".into(),
         Msg::ShareStop => "parou de transmitir".into(),
         Msg::ShareSwap => "trocou o que transmite".into(),
         Msg::ShareSource(s) => on(s.window, "escolheu uma janela", "escolheu uma tela"),
@@ -1042,6 +1045,8 @@ impl App {
                     return Task::none();
                 };
                 if !cfg!(windows) {
+                    // Sem o token: o portal tem que perguntar.
+                    call.share_source = None;
                     call.swap_share();
                     return Task::none();
                 }
@@ -1051,8 +1056,9 @@ impl App {
                 read_sources(call)
             }
             Msg::ShareSources(sources) => {
+                let last = self.config.share_last.clone();
                 if let Some(call) = self.call_mut() {
-                    call.set_share_sources(sources);
+                    call.set_share_sources(sources, last.as_ref());
                 }
                 Task::none()
             }
@@ -1081,8 +1087,26 @@ impl App {
             Msg::ShareStart => {
                 let quality = self.config.share_quality;
                 let audio = self.config.share_audio;
+                let last = self.config.share_last.clone();
                 if let Some(call) = self.call_mut() {
+                    // No Linux o que sai é a lembrada: o token reabre ela sem o portal.
+                    if !cfg!(windows) {
+                        call.share_source = last;
+                    }
                     call.start_share(quality, audio);
+                }
+                Task::none()
+            }
+            Msg::ShareOther => {
+                let quality = self.config.share_quality;
+                let audio = self.config.share_audio;
+                if let Some(call) = self.call_mut() {
+                    if cfg!(windows) {
+                        call.share_other = true;
+                    } else {
+                        call.share_source = None;
+                        call.start_share(quality, audio);
+                    }
                 }
                 Task::none()
             }
@@ -1901,6 +1925,16 @@ impl App {
             call::Event::Unstable(on) => active.unstable = on,
             call::Event::Participants(list) => active.participants(list, Instant::now()),
             call::Event::Share(state) => active.set_share(state),
+            call::Event::ShareChosen(source) => {
+                // Sem o título: o log vai pra quem ajuda a investigar.
+                match &source {
+                    Some(s) if s.window => log!("transmissão: lembrou a janela"),
+                    Some(_) => log!("transmissão: lembrou a tela"),
+                    None => log!("transmissão: o portal não deu token, nada lembrado"),
+                }
+                self.config.share_last = source;
+                self.persist();
+            }
             call::Event::ShareAudio(view) => active.set_share_audio(view),
             call::Event::Viewers(viewers) => active.viewers = viewers,
             call::Event::Preview(identity, picture) => active.set_preview(identity, picture),
@@ -3708,6 +3742,57 @@ mod tests {
         assert!(!call_of(&mut a).share_panel);
     }
 
+    /// O token muda a cada uso: o último que o portal deu fica, e `None` esquece.
+    #[test]
+    fn fonte_lembrada_grava_troca_e_esquece() {
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        let fonte = |token: &str| crate::share::Source {
+            title: "Tela inteira".into(),
+            token: Some(token.into()),
+            ..Default::default()
+        };
+        let antes = saves();
+        for (chosen, esperado) in [
+            (Some(fonte("a")), Some(fonte("a"))),
+            (Some(fonte("b")), Some(fonte("b"))),
+            (None, None),
+        ] {
+            let _ = a.update(Msg::CallEvent(id, call::Event::ShareChosen(chosen)));
+            assert_eq!(a.config.share_last, esperado);
+        }
+        assert_eq!(saves(), antes + 3);
+    }
+
+    /// No Linux o "Transmitir de novo" leva o token; "Escolher outra" e o Trocar vão sem ele,
+    /// e o portal pergunta.
+    #[cfg(not(windows))]
+    #[test]
+    fn transmitir_de_novo_leva_o_token_e_trocar_nao() {
+        let mut a = in_call(&["Ana"]);
+        let lembrada = crate::share::Source {
+            token: Some("t".into()),
+            ..Default::default()
+        };
+        a.config.share_last = Some(lembrada.clone());
+        let _ = a.update(Msg::ShareButton);
+        let _ = a.update(Msg::ShareStart);
+        assert_eq!(call_of(&mut a).share_source, Some(lembrada));
+        share(&mut a, ShareState::Live);
+        let _ = a.update(Msg::ShareSwap);
+        assert_eq!(call_of(&mut a).share_source, None, "Trocar sem token");
+
+        share(&mut a, ShareState::Off);
+        let _ = a.update(Msg::ShareButton);
+        let _ = a.update(Msg::ShareOther);
+        assert_eq!(
+            call_of(&mut a).share_source,
+            None,
+            "Escolher outra sem token"
+        );
+        assert!(!call_of(&mut a).share_panel);
+    }
+
     fn audio(a: &mut App, choice: Choice, apps: &[&str], ask: bool) {
         let id = call_id(a);
         let apps = apps.iter().map(|s| s.to_string()).collect();
@@ -4828,6 +4913,23 @@ mod tests {
         let _ = a.update(Msg::ShareButton);
         print(&a, "tela-painel");
         print_at(&a, "tela-painel-janela-minima", Size::new(860.0, 560.0));
+        // Com fonte lembrada: a do portal (Linux) e uma janela de título longo (Windows).
+        for (title, nome) in [
+            ("A mesma janela", "tela-painel-de-novo"),
+            (
+                "Concord - chamada de voz self-hosted, sem anúncio - Google Chrome",
+                "tela-painel-de-novo-longo",
+            ),
+        ] {
+            a.config.share_last = Some(crate::share::Source {
+                window: true,
+                title: title.into(),
+                token: Some("t".into()),
+                ..Default::default()
+            });
+            print(&a, nome);
+        }
+        a.config.share_last = None;
         // Clique de verdade: a camada do painel não pode tampar a barra de baixo.
         let settings = Settings {
             fonts: theme::FONTS.map(Into::into).to_vec(),
@@ -4840,19 +4942,23 @@ mod tests {
                 window: true,
                 id,
                 title: title.into(),
+                ..Default::default()
             };
             (source, None)
         };
         call_of(&mut a).set_share_tab(true);
-        call_of(&mut a).set_share_sources(vec![
-            janela(
-                1,
-                "Concord - chamada de voz self-hosted, sem anúncio - Google Chrome",
-            ),
-            janela(2, "Spotify"),
-            janela(3, "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"),
-            janela(4, "Planilha de gastos de novembro.xlsx - Excel"),
-        ]);
+        call_of(&mut a).set_share_sources(
+            vec![
+                janela(
+                    1,
+                    "Concord - chamada de voz self-hosted, sem anúncio - Google Chrome",
+                ),
+                janela(2, "Spotify"),
+                janela(3, "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"),
+                janela(4, "Planilha de gastos de novembro.xlsx - Excel"),
+            ],
+            None,
+        );
         if let Screen::Main(m) = &a.screen {
             let seletor = stage::picker(m.call.as_ref().unwrap(), &a.config);
             let mut ui = Simulator::with_size(settings.clone(), Size::new(660.0, 480.0), seletor);

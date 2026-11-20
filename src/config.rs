@@ -9,7 +9,7 @@ use crate::audio::{
     AudioPrefs, GAIN_DEFAULT_DB, GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_DEFAULT_DB, MANUAL_MAX_DB,
     MANUAL_MIN_DB, MicGain, NoiseLevel, Sensitivity,
 };
-use crate::share::Quality;
+use crate::share::{Quality, Source};
 
 pub const SIDEBAR_MIN: f32 = 200.0;
 pub const SIDEBAR_MAX: f32 = 480.0;
@@ -50,6 +50,9 @@ pub struct Config {
     pub share_quality: Quality,
     /// Interruptor "Transmitir áudio". Só no Linux por enquanto.
     pub share_audio: bool,
+    /// Última tela ou janela transmitida, pro "Transmitir de novo". No Linux leva o token do
+    /// portal.
+    pub share_last: Option<Source>,
     /// Versão cujas novidades já foram vistas, ou a instalada do zero.
     pub seen_version: Option<String>,
     /// Interruptor "Notificações": chamados e menções viram aviso do sistema.
@@ -84,6 +87,7 @@ impl Default for Config {
             muted_from: HashMap::new(),
             share_quality: Quality::default(),
             share_audio: true,
+            share_last: None,
             seen_version: None,
             notifications: true,
             autostart: true,
