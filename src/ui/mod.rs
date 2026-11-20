@@ -16,7 +16,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{image, operation, row, stack};
+use iced::widget::{image, mouse_area, operation, row, stack};
 use iced::{Color, Element, Event, Subscription, Task, Theme, event, mouse, time, window};
 use voice::{ActiveCall, Boot, Probe};
 
@@ -51,6 +51,8 @@ const ESPERA_AO_FECHAR: Duration = Duration::from_secs(2);
 /// Na tela de sem conexão, de quanto em quanto tempo tenta de novo sozinho: o autostart
 /// pode abrir antes de a rede subir.
 const TENTA_DE_NOVO: Duration = Duration::from_secs(30);
+/// Quanto o "Conectando…" espera antes de oferecer o Cancelar.
+const SEM_RESPOSTA: Duration = Duration::from_secs(5);
 /// Relógio do anel de fala: o hold é de 400 ms, então 100 ms apaga sem atraso visível.
 const QUADRO: Duration = Duration::from_millis(100);
 /// Relógio do medidor de entrada: uns 30 quadros por segundo.
@@ -74,6 +76,7 @@ thread_local! {
 
 const ID_SERVIDOR: &str = "campo-servidor";
 const ID_USUARIO: &str = "campo-usuario";
+const ID_SENHA: &str = "campo-senha";
 
 pub struct App {
     config: Config,
@@ -108,10 +111,25 @@ pub enum Closing {
 
 enum Screen {
     Connecting,
+    /// Conectando há mais de [`SEM_RESPOSTA`]: a tela ganha o Cancelar.
+    Stuck,
     Server(ServerForm),
     Login(LoginForm),
-    Offline(String),
+    Offline(Offline),
     Main(Box<Main>),
+}
+
+/// Sem conexão: o endereço e a contagem pra tentar de novo sozinho.
+struct Offline {
+    server: String,
+    wait: Wait,
+}
+
+impl Offline {
+    fn new(server: String) -> Self {
+        let wait = Wait::new(TENTA_DE_NOVO.as_secs(), Instant::now());
+        Self { server, wait }
+    }
 }
 
 struct ServerForm {
@@ -124,8 +142,36 @@ struct LoginForm {
     server: String,
     username: String,
     password: Secret,
+    /// Olho do campo: mostra a senha em vez dos pontos.
+    show: bool,
     error: Option<String>,
     busy: bool,
+    /// Bloqueio por tentativas demais: o Entrar volta quando a contagem zera.
+    wait: Option<Wait>,
+}
+
+/// Contagem regressiva: até quando, e quantos segundos faltam pra mostrar na tela.
+#[derive(Clone, Copy, Debug)]
+struct Wait {
+    until: Instant,
+    left: u64,
+}
+
+impl Wait {
+    fn new(secs: u64, now: Instant) -> Self {
+        Self {
+            until: now + Duration::from_secs(secs),
+            left: secs,
+        }
+    }
+
+    /// Atualiza o que falta, arredondando pra cima: nunca mostra 0 antes do fim. `true`
+    /// quando acabou.
+    fn tick(&mut self, now: Instant) -> bool {
+        let rest = self.until.saturating_duration_since(now);
+        self.left = rest.as_secs() + u64::from(rest.subsec_nanos() > 0);
+        rest.is_zero()
+    }
 }
 
 struct Main {
@@ -151,6 +197,8 @@ struct Main {
     next_call: u64,
     /// Aviso curto na home: motivo de a call ter acabado ou de não ter aberto.
     notice: Option<String>,
+    /// Canal (slug) que o aviso oferece tentar de novo, quando a call desistiu de reconectar.
+    notice_retry: Option<String>,
     /// Lista do sistema, lida ao abrir a aba Voz.
     devices: Option<Devices>,
     /// Motor de teste da aba Voz; só existe sem call.
@@ -186,6 +234,8 @@ struct Main {
     quiet: Option<chrono::DateTime<chrono::Local>>,
     /// Quem tem conta no servidor, pra chamar pra call e pro `@` do chat.
     members: Vec<Member>,
+    /// Menu aberto na linha de um membro da lista da direita.
+    member_menu: Option<members::Menu>,
     /// Usernames online, do polling de presença. Quem está em voz conta de qualquer jeito.
     online: HashSet<String>,
     /// Canal de texto -> menções ainda não vistas, na pílula da sidebar. Só na memória.
@@ -222,6 +272,16 @@ pub enum Msg {
     ChangeServer,
     Username(String),
     Password(Secret),
+    /// Olho do campo de senha.
+    ShowPassword,
+    /// Relógio de 1 s das contagens regressivas das telas de entrada.
+    Clock(Instant),
+    /// O "Conectando…" passou de [`SEM_RESPOSTA`].
+    Stuck,
+    /// "Cancelar" do "Conectando…": volta pro formulário do servidor.
+    CancelConnect,
+    /// X do aviso da home.
+    DismissNotice,
     LoginSubmit,
     LoginDone(Result<(Secret, User), Error>),
     VaultSaved(bool),
@@ -364,6 +424,8 @@ pub enum Msg {
     Autostart(bool),
     // Chamar pessoas pra call.
     People(people::Msg),
+    /// Menu de uma pessoa na lista de membros.
+    Member(members::Msg),
 }
 
 /// O que a pessoa fez, pro log: cliques e escolhas, nunca texto digitado nem título de
@@ -437,6 +499,7 @@ fn action(msg: &Msg) -> Option<String> {
             "desligou iniciar com o computador",
         ),
         Msg::People(msg) => return people::action(msg),
+        Msg::Member(msg) => return members::action(msg),
         _ => return None,
     })
 }
@@ -546,14 +609,19 @@ fn connect_error(e: Error) -> String {
 fn login_error(e: Error) -> String {
     match e {
         Error::BadCredentials => "Usuário ou senha inválidos.".to_owned(),
-        Error::TooManyAttempts(s) if s > 60 => {
-            format!(
-                "Muitas tentativas. Tente de novo em {} min.",
-                s.div_ceil(60)
-            )
-        }
-        Error::TooManyAttempts(s) => format!("Muitas tentativas. Tente de novo em {s} s."),
+        Error::TooManyAttempts(s) => too_many(s),
         e => connect_error(e),
+    }
+}
+
+fn too_many(secs: u64) -> String {
+    if secs > 60 {
+        format!(
+            "Muitas tentativas. Tente de novo em {} min.",
+            secs.div_ceil(60)
+        )
+    } else {
+        format!("Muitas tentativas. Tente de novo em {secs} s.")
     }
 }
 
@@ -613,8 +681,16 @@ impl App {
             event::listen_with(focus),
             Subscription::run(crate::instance::commands).map(command),
         ];
-        if let Screen::Offline(_) = &self.screen {
-            subs.push(time::every(TENTA_DE_NOVO).map(|_| Msg::Retry));
+        let counting = match &self.screen {
+            Screen::Offline(_) => true,
+            Screen::Login(f) => f.wait.is_some(),
+            _ => false,
+        };
+        if counting {
+            subs.push(time::every(Duration::from_secs(1)).map(Msg::Clock));
+        }
+        if let Screen::Connecting = &self.screen {
+            subs.push(time::every(SEM_RESPOSTA).map(|_| Msg::Stuck));
         }
         if let Screen::Main(m) = &self.screen {
             subs.push(Subscription::run(crate::tray::run).map(Msg::Tray));
@@ -671,10 +747,11 @@ impl App {
 
     fn page(&self) -> Element<'_, Msg> {
         match &self.screen {
-            Screen::Connecting => screens::connecting(),
+            Screen::Connecting => screens::connecting(false),
+            Screen::Stuck => screens::connecting(true),
             Screen::Server(f) => screens::server(f),
             Screen::Login(f) => screens::login(f),
-            Screen::Offline(server) => screens::offline(server),
+            Screen::Offline(o) => screens::offline(o),
             Screen::Main(m) => {
                 if let Some(call) = m.call.as_ref().filter(|c| c.fullscreen()) {
                     return stage::full(m, call, &self.config);
@@ -682,7 +759,7 @@ impl App {
                 let content = match (&m.chat, &m.call) {
                     (Some(open), _) => chat::view(m, open),
                     (None, Some(call)) => stage::view(m, call, &self.config),
-                    (None, None) => screens::home(&m.user.username, m.notice.as_deref()),
+                    (None, None) => screens::home(m, &self.config),
                 };
                 let base = row![
                     sidebar::view(m, &self.config),
@@ -690,6 +767,13 @@ impl App {
                     content,
                     members::view(m),
                 ];
+                // Clique fora do menu de um membro fecha ele: o que captura o clique (botões,
+                // campos) não passa por aqui. Sempre no mesmo lugar da árvore, pro campo do
+                // chat não perder o foco quando o menu abre e fecha.
+                let mut base = mouse_area(base);
+                if m.member_menu.is_some() {
+                    base = base.on_press(Msg::Member(members::Msg::Close));
+                }
                 match m.settings {
                     _ if self.news => stack![base, screens::news()].into(),
                     Some(tab) => stack![base, screens::settings(m, &self.config, tab)].into(),
@@ -764,13 +848,26 @@ impl App {
             }
             Msg::ServerSubmit => self.submit_server(),
             Msg::Retry => match &self.screen {
-                Screen::Offline(server) => {
-                    let server = server.clone();
+                Screen::Offline(o) => {
+                    let server = o.server.clone();
                     self.screen = Screen::Connecting;
                     connect(server)
                 }
                 _ => Task::none(),
             },
+            Msg::Stuck => {
+                if let Screen::Connecting = &self.screen {
+                    self.screen = Screen::Stuck;
+                }
+                Task::none()
+            }
+            Msg::CancelConnect => self.cancel_connect(),
+            Msg::DismissNotice => {
+                if let Screen::Main(m) = &mut self.screen {
+                    (m.notice, m.notice_retry) = (None, None);
+                }
+                Task::none()
+            }
             Msg::ChangeServer => self.change_server(),
             Msg::Username(username) => {
                 if let Screen::Login(f) = &mut self.screen {
@@ -784,6 +881,15 @@ impl App {
                 }
                 Task::none()
             }
+            Msg::ShowPassword => match &mut self.screen {
+                Screen::Login(f) => {
+                    f.show = !f.show;
+                    // O clique no botão tira o foco do campo.
+                    operation::focus(ID_SENHA)
+                }
+                _ => Task::none(),
+            },
+            Msg::Clock(now) => self.clock(now),
             Msg::LoginSubmit => self.submit_login(),
             Msg::LoginDone(result) => self.login_done(result),
             Msg::VaultSaved(ok) => {
@@ -1196,6 +1302,7 @@ impl App {
                             c.view = voice::View::Focus;
                         }
                     }
+                    Screen::Main(m) if m.member_menu.is_some() => m.member_menu = None,
                     _ => self.close_volume(),
                 }
                 Task::none()
@@ -1402,6 +1509,10 @@ impl App {
             }
             Msg::People(msg) => match &mut self.screen {
                 Screen::Main(m) => people::update(m, msg),
+                _ => Task::none(),
+            },
+            Msg::Member(msg) => match &mut self.screen {
+                Screen::Main(m) => members::update(m, msg),
                 _ => Task::none(),
             },
         }
@@ -1714,13 +1825,18 @@ impl App {
         if let Some(old) = m.call.take() {
             old.leave();
         }
-        m.notice = None;
+        (m.notice, m.notice_retry) = (None, None);
         // Dois motores abertos ao mesmo tempo brigam pelo mic.
         m.stop_probe();
         m.next_call += 1;
         let id = m.next_call;
-        m.call = Some(ActiveCall::new(id, slug));
+        m.call = Some(ActiveCall::new(id, slug.clone()));
         let prefs = self.config.audio_prefs();
+        // O "Voltar pra" da home.
+        if self.config.last_voice.as_deref() != Some(slug.as_str()) {
+            self.config.last_voice = Some(slug);
+            self.persist();
+        }
         // `Engine::start` bloqueia: abre o áudio fora da thread da interface.
         Task::future(async move {
             let started = tokio::task::spawn_blocking(move || Engine::start(prefs))
@@ -1804,9 +1920,11 @@ impl App {
         {
             engine.play(Effect::Leave);
         }
+        let slug = m.call.as_ref().map(|c| c.slug.clone());
         m.call = None;
         let closing = m.closing.take();
         m.notice = voice::end_notice(end).map(str::to_owned);
+        m.notice_retry = slug.filter(|_| end == End::GaveUp);
         let (expired, probe) = match end {
             End::Unauthorized => (self.session_expired(), Task::none()),
             // Configurações abertas na aba Voz voltam a medir o mic.
@@ -1906,6 +2024,10 @@ impl App {
         cookie: Option<Secret>,
         result: Result<User, Error>,
     ) -> Task<Msg> {
+        // Formulário parado: a pessoa cancelou a tentativa que acaba de responder.
+        if matches!(&self.screen, Screen::Server(f) if !f.busy) {
+            return Task::none();
+        }
         let from_form = matches!(self.screen, Screen::Server(_));
         match result {
             Ok(user) => {
@@ -1934,10 +2056,25 @@ impl App {
                 Task::none()
             }
             Err(_) => {
-                self.screen = Screen::Offline(server);
+                self.screen = Screen::Offline(Offline::new(server));
                 Task::none()
             }
         }
+    }
+
+    /// Sai do "Conectando…" pro formulário, com o endereço de agora. A resposta da tentativa
+    /// cancelada, que ainda chega, cai fora em [`App::connected`].
+    fn cancel_connect(&mut self) -> Task<Msg> {
+        if !matches!(self.screen, Screen::Connecting | Screen::Stuck) {
+            return Task::none();
+        }
+        let input = self.config.server.clone().unwrap_or_default();
+        self.screen = Screen::Server(ServerForm {
+            input,
+            error: None,
+            busy: false,
+        });
+        operation::focus(ID_SERVIDOR)
     }
 
     fn submit_server(&mut self) -> Task<Msg> {
@@ -1964,7 +2101,7 @@ impl App {
         self.leave_call();
         let input = match &self.screen {
             Screen::Login(f) => f.server.clone(),
-            Screen::Offline(server) => server.clone(),
+            Screen::Offline(o) => o.server.clone(),
             Screen::Main(m) => m.server.clone(),
             _ => return Task::none(),
         };
@@ -1980,7 +2117,7 @@ impl App {
         let Screen::Login(f) = &mut self.screen else {
             return Task::none();
         };
-        if f.busy || f.username.is_empty() || f.password.0.is_empty() {
+        if f.busy || f.wait.is_some() || f.username.is_empty() || f.password.0.is_empty() {
             return Task::none();
         }
         f.busy = true;
@@ -2012,9 +2149,35 @@ impl App {
             }
             Err(e) => {
                 f.busy = false;
+                if let Error::TooManyAttempts(secs) = e {
+                    f.wait = Some(Wait::new(secs, Instant::now()));
+                }
                 f.error = Some(login_error(e));
                 Task::none()
             }
+        }
+    }
+
+    /// Relógio de 1 s das contagens: o bloqueio do login e a nova tentativa do offline.
+    fn clock(&mut self, now: Instant) -> Task<Msg> {
+        match &mut self.screen {
+            Screen::Offline(o) => {
+                if o.wait.tick(now) {
+                    return self.handle(Msg::Retry);
+                }
+                Task::none()
+            }
+            Screen::Login(f) => {
+                if let Some(wait) = &mut f.wait {
+                    if wait.tick(now) {
+                        (f.wait, f.error) = (None, None);
+                    } else {
+                        f.error = Some(too_many(wait.left));
+                    }
+                }
+                Task::none()
+            }
+            _ => Task::none(),
         }
     }
 
@@ -2049,6 +2212,7 @@ impl App {
             full_window: false,
             next_call: 0,
             notice: None,
+            notice_retry: None,
             devices: None,
             probe: Probe::Off,
             next_probe: 0,
@@ -2067,6 +2231,7 @@ impl App {
             unseen: false,
             quiet: None,
             members: Vec::new(),
+            member_menu: None,
             online: HashSet::new(),
             mentions: HashMap::new(),
         };
@@ -2110,7 +2275,7 @@ impl App {
             (_, Screen::Main(m)) => {
                 let server = m.server.clone();
                 self.leave_call();
-                self.screen = Screen::Offline(server);
+                self.screen = Screen::Offline(Offline::new(server));
                 Task::none()
             }
             _ => Task::none(),
@@ -2192,8 +2357,10 @@ impl LoginForm {
             server,
             username: String::new(),
             password: Secret(String::new()),
+            show: false,
             error,
             busy: false,
+            wait: None,
         }
     }
 }
@@ -2455,9 +2622,62 @@ mod tests {
             cookie: None,
             result: Err(Error::Offline),
         });
-        assert!(matches!(&a.screen, Screen::Offline(s) if s == "https://a.b"));
+        assert!(matches!(&a.screen, Screen::Offline(o) if o.server == "https://a.b"));
         let _ = a.update(Msg::Retry);
         assert!(matches!(a.screen, Screen::Connecting));
+    }
+
+    #[test]
+    fn offline_conta_os_segundos_e_tenta_de_novo_no_zero() {
+        let mut a = app(Screen::Offline(Offline::new("https://a.b".into())));
+        let ate = |a: &App| match &a.screen {
+            Screen::Offline(o) => (o.wait.until, o.wait.left),
+            _ => panic!("saiu do offline"),
+        };
+        let (until, left) = ate(&a);
+        assert_eq!(left, TENTA_DE_NOVO.as_secs());
+        let _ = a.update(Msg::Clock(until - Duration::from_secs(23)));
+        assert_eq!(ate(&a).1, 23);
+        let _ = a.update(Msg::Clock(until));
+        assert!(matches!(a.screen, Screen::Connecting), "zerou: tenta");
+        // Falhou de novo: volta a contar do começo.
+        let _ = a.update(Msg::Connected {
+            server: "https://a.b".into(),
+            cookie: None,
+            result: Err(Error::Offline),
+        });
+        assert_eq!(ate(&a).1, TENTA_DE_NOVO.as_secs());
+    }
+
+    #[test]
+    fn conectando_demorado_oferece_cancelar_e_ignora_a_resposta_tardia() {
+        let mut a = app(Screen::Connecting);
+        a.config.server = Some("https://a.b".into());
+        // O relógio de 5 s só vale no "Conectando…".
+        let _ = a.update(Msg::Stuck);
+        assert!(matches!(a.screen, Screen::Stuck));
+        let mut fora = app(login());
+        let _ = fora.update(Msg::Stuck);
+        assert!(matches!(fora.screen, Screen::Login(_)));
+        let _ = fora.update(Msg::CancelConnect);
+        assert!(
+            matches!(fora.screen, Screen::Login(_)),
+            "só cancela o conectando"
+        );
+
+        let _ = a.update(Msg::CancelConnect);
+        let Screen::Server(f) = &a.screen else {
+            panic!("não voltou pro formulário")
+        };
+        assert_eq!(f.input, "https://a.b", "endereço de agora preenchido");
+        assert!(!f.busy && f.error.is_none());
+        // A resposta da tentativa cancelada não tira a pessoa do formulário.
+        let _ = a.update(Msg::Connected {
+            server: "https://a.b".into(),
+            cookie: None,
+            result: Ok(user()),
+        });
+        assert!(matches!(a.screen, Screen::Server(_)));
     }
 
     #[test]
@@ -2484,6 +2704,77 @@ mod tests {
             panic!()
         };
         assert!(!f.busy);
+    }
+
+    #[test]
+    fn contagem_arredonda_pra_cima_e_so_zera_no_fim() {
+        let t0 = Instant::now();
+        let mut w = Wait::new(90, t0);
+        assert!(!w.tick(t0 + Duration::from_millis(500)));
+        assert_eq!(w.left, 90, "89,5 s ainda mostra 90");
+        assert!(!w.tick(t0 + Duration::from_secs(89)));
+        assert_eq!(w.left, 1);
+        assert!(w.tick(t0 + Duration::from_secs(90)));
+        assert_eq!(w.left, 0);
+        assert!(w.tick(t0 + Duration::from_secs(500)), "passou do fim");
+    }
+
+    #[test]
+    fn tentativas_demais_bloqueiam_o_entrar_ate_a_contagem_zerar() {
+        let mut a = app(login());
+        let preenche = |a: &mut App| {
+            let _ = a.update(Msg::Username("ana".into()));
+            let _ = a.update(Msg::Password(Secret("x".into())));
+        };
+        fn form(a: &mut App) -> &mut LoginForm {
+            match &mut a.screen {
+                Screen::Login(f) => f,
+                _ => panic!("fora do login"),
+            }
+        }
+        preenche(&mut a);
+        let _ = a.update(Msg::LoginDone(Err(Error::TooManyAttempts(90))));
+        let wait = form(&mut a).wait.expect("sem contagem");
+        assert_eq!(
+            form(&mut a).error.as_deref(),
+            Some("Muitas tentativas. Tente de novo em 2 min.")
+        );
+        // Bloqueado, o Entrar não envia.
+        let _ = a.update(Msg::LoginSubmit);
+        assert!(!form(&mut a).busy);
+        // A contagem desce, e a unidade troca de min pra s em 60.
+        let _ = a.update(Msg::Clock(wait.until - Duration::from_secs(60)));
+        assert_eq!(
+            form(&mut a).error.as_deref(),
+            Some("Muitas tentativas. Tente de novo em 60 s.")
+        );
+        let _ = a.update(Msg::Clock(wait.until - Duration::from_secs(5)));
+        assert_eq!(
+            form(&mut a).error.as_deref(),
+            Some("Muitas tentativas. Tente de novo em 5 s.")
+        );
+        // No zero o aviso some e o Entrar volta.
+        let _ = a.update(Msg::Clock(wait.until));
+        assert!(form(&mut a).wait.is_none() && form(&mut a).error.is_none());
+        let _ = a.update(Msg::LoginSubmit);
+        assert!(form(&mut a).busy);
+        // Erro comum não cria contagem.
+        let _ = a.update(Msg::LoginDone(Err(Error::BadCredentials)));
+        assert!(form(&mut a).wait.is_none());
+    }
+
+    #[test]
+    fn olho_mostra_e_esconde_a_senha_so_no_login() {
+        let mut a = app(login());
+        let mostra = |a: &App| matches!(&a.screen, Screen::Login(f) if f.show);
+        assert!(!mostra(&a), "abre escondida");
+        let _ = a.update(Msg::ShowPassword);
+        assert!(mostra(&a));
+        let _ = a.update(Msg::ShowPassword);
+        assert!(!mostra(&a));
+        let mut fora = app(Screen::Connecting);
+        let _ = fora.update(Msg::ShowPassword);
+        assert!(matches!(fora.screen, Screen::Connecting));
     }
 
     #[test]
@@ -2989,6 +3280,77 @@ mod tests {
         let _ = a.update(Msg::JoinChannel("geral".into()));
         let _ = a.update(Msg::JoinChannel("nao-existe".into()));
         assert!(main_of(&mut a).call.is_none());
+    }
+
+    #[test]
+    fn home_lista_so_voz_com_gente_sem_repetir_quem_tem_sessao_fantasma() {
+        let mut a = voice_app();
+        let pessoa = |name: &str| Participant {
+            identity: format!("{name}__1"),
+            name: name.into(),
+            muted: false,
+            camera: false,
+            screen_share: false,
+        };
+        main_of(&mut a).presence = Presence::from([
+            (
+                "call".to_owned(),
+                vec![pessoa("Ana"), pessoa("Bruno"), pessoa("Ana")],
+            ),
+            ("jogando".to_owned(), vec![]),
+            // Chave de canal de texto não vira cartão.
+            ("geral".to_owned(), vec![pessoa("Carla")]),
+        ]);
+        let m = main_of(&mut a);
+        let live = screens::live_voice(m);
+        assert_eq!(live.len(), 1);
+        let (canal, quem) = &live[0];
+        assert_eq!(canal.slug, "call");
+        let nomes: Vec<_> = quem.iter().map(|p| p.display_name()).collect();
+        assert_eq!(nomes, ["Ana", "Bruno"]);
+        m.presence.clear();
+        assert!(
+            screens::live_voice(m).is_empty(),
+            "sem ninguém, volta o texto"
+        );
+    }
+
+    #[test]
+    fn entrar_numa_call_guarda_o_canal_pro_voltar_pra() {
+        let mut a = voice_app();
+        assert_eq!(a.config.last_voice, None);
+        let _ = a.update(Msg::JoinChannel("geral".into()));
+        assert_eq!(a.config.last_voice, None, "texto não conta");
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        assert_eq!(a.config.last_voice.as_deref(), Some("call"));
+        let _ = a.update(Msg::JoinChannel("jogando".into()));
+        assert_eq!(a.config.last_voice.as_deref(), Some("jogando"));
+        // Sair não apaga: é o que a home oferece depois.
+        let _ = a.update(Msg::Leave);
+        assert_eq!(a.config.last_voice.as_deref(), Some("jogando"));
+    }
+
+    #[test]
+    fn desistir_de_reconectar_oferece_tentar_de_novo_e_o_x_dispensa_o_aviso() {
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::GaveUp)));
+        let m = main_of(&mut a);
+        assert!(m.call.is_none() && m.notice.is_some());
+        assert_eq!(m.notice_retry.as_deref(), Some("call"));
+        // Tentar de novo entra no mesmo canal e leva o aviso.
+        let _ = a.update(Msg::JoinChannel("call".into()));
+        let m = main_of(&mut a);
+        assert!(m.notice.is_none() && m.notice_retry.is_none());
+        assert_eq!(call_of(&mut a).slug, "call");
+
+        // Outros avisos não oferecem; o X leva o aviso embora.
+        let id = call_id(&mut a);
+        let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::RoomClosed)));
+        let m = main_of(&mut a);
+        assert!(m.notice.is_some() && m.notice_retry.is_none());
+        let _ = a.update(Msg::DismissNotice);
+        assert!(main_of(&mut a).notice.is_none());
     }
 
     #[test]
@@ -3903,6 +4265,79 @@ mod tests {
     }
 
     #[test]
+    fn menu_de_membro_oferece_chamar_e_mencionar_conforme_o_caso() {
+        let mut a = in_call(&["Ana"]);
+        com_membros(&mut a);
+        let oferta = |a: &mut App, quem: &str| {
+            let o = members::items(main_of(a), quem);
+            (o.call, o.mention)
+        };
+        assert_eq!(oferta(&mut a, "Ana"), (None, false), "já está na call");
+        assert_eq!(oferta(&mut a, "Bruno"), (Some(3), false));
+        assert_eq!(oferta(&mut a, "Opedro"), (None, false), "eu mesmo");
+        assert_eq!(oferta(&mut a, "Zé"), (None, false), "sem conta na lista");
+        // Com um chat aberto, dá pra mencionar (menos eu).
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        assert_eq!(oferta(&mut a, "Ana"), (None, true));
+        assert_eq!(oferta(&mut a, "Bruno"), (Some(3), true));
+        assert_eq!(oferta(&mut a, "Opedro"), (None, false));
+        // Sem call, só mencionar.
+        let _ = a.update(Msg::Leave);
+        assert_eq!(oferta(&mut a, "Bruno"), (None, true));
+        let _ = a.update(Msg::Chat(1, chat::Msg::Close));
+        assert_eq!(oferta(&mut a, "Bruno"), (None, false));
+    }
+
+    #[test]
+    fn menu_de_membro_abre_fecha_chama_e_ignora_resposta_de_outro() {
+        use members::Msg as M;
+        let mut a = in_call(&["Ana"]);
+        com_membros(&mut a);
+        let menu = |a: &mut App| main_of(a).member_menu.as_ref().map(|x| x.name.clone());
+        let estado = |a: &mut App| format!("{:?}", main_of(a).member_menu.as_ref().unwrap().state);
+        let membro = Msg::Member;
+
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        assert_eq!(menu(&mut a).as_deref(), Some("Bruno"));
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        assert_eq!(menu(&mut a), None, "clicar de novo fecha");
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        let _ = a.update(Msg::Escape);
+        assert_eq!(menu(&mut a), None, "Esc fecha");
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        let _ = a.update(membro(M::Close));
+        assert_eq!(menu(&mut a), None, "clique fora fecha");
+
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        let _ = a.update(membro(M::Call(3)));
+        assert_eq!(estado(&mut a), "Sending");
+        // Resposta de outro menu cai fora; a certa mostra o aviso e depois fecha.
+        let _ = a.update(membro(M::Sent("Ana".into(), Ok((1, 1)))));
+        assert_eq!(estado(&mut a), "Sending");
+        let _ = a.update(membro(M::Sent("Bruno".into(), Ok((1, 1)))));
+        assert_eq!(estado(&mut a), "Done(\"Chamado enviado\")");
+        let _ = a.update(membro(M::Finish("Ana".into())));
+        assert!(menu(&mut a).is_some());
+        let _ = a.update(membro(M::Finish("Bruno".into())));
+        assert_eq!(menu(&mut a), None);
+
+        // Erro: mesma mensagem do painel de chamar, e dá pra tentar de novo.
+        let _ = a.update(membro(M::Open("Bruno".into())));
+        let _ = a.update(membro(M::Call(3)));
+        let espera = Err(Error::TooManyAttempts(1500));
+        let _ = a.update(membro(M::Sent("Bruno".into(), espera)));
+        assert!(estado(&mut a).contains("Muitos chamados. Tenta de novo em 25 min"));
+        let _ = a.update(membro(M::Call(3)));
+        assert_eq!(estado(&mut a), "Sending");
+
+        // Mencionar fecha o menu.
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        let _ = a.update(membro(M::Open("Ana".into())));
+        let _ = a.update(membro(M::Mention("Ana".into())));
+        assert_eq!(menu(&mut a), None);
+    }
+
+    #[test]
     fn chamar_pessoas_abre_manda_fecha_e_ignora_resposta_velha() {
         let mut a = in_call(&["Ana"]);
         com_membros(&mut a);
@@ -4016,11 +4451,22 @@ mod tests {
         l.username = "Opedro".into();
         l.password = Secret("segredo".into());
         print(&app(Screen::Login(l)), "login");
-        print(
-            &app(Screen::Offline("https://call.exemplo.com".into())),
-            "offline",
-        );
+        let mut l = LoginForm::new("https://call.exemplo.com".into(), None);
+        l.username = "Opedro".into();
+        l.password = Secret("segredo".into());
+        l.show = true;
+        print(&app(Screen::Login(l)), "login-senha-visivel");
+        let mut l = LoginForm::new("https://call.exemplo.com".into(), None);
+        l.username = "Opedro".into();
+        l.password = Secret("segredo".into());
+        l.error = Some(too_many(90));
+        l.wait = Some(Wait::new(90, Instant::now()));
+        print(&app(Screen::Login(l)), "login-bloqueado");
+        let mut o = Offline::new("https://call.exemplo.com".into());
+        o.wait.left = 23;
+        print(&app(Screen::Offline(o)), "offline");
         print(&app(Screen::Connecting), "conectando");
+        print(&app(Screen::Stuck), "conectando-cancelar");
 
         let canal = |id, name: &str, kind| Channel {
             id,
@@ -4344,6 +4790,38 @@ mod tests {
         let _ = a.update(Msg::People(people::Msg::Sent(id, espera)));
         print(&a, "chamar-limite-de-chamados");
 
+        // Menu de um membro, com call e chat abertos: chamar, mencionar, enviando e erro.
+        let (mut a, id) = palco(4);
+        let _ = id;
+        main_of(&mut a).members = [
+            "Ana",
+            "Bruno com nome bem comprido demais pra caber",
+            "Opedro",
+            "Zé da Silva",
+            "carlos",
+            "Dani",
+        ]
+        .iter()
+        .zip(1..)
+        .map(|(username, id)| Member {
+            id,
+            username: (*username).into(),
+            avatar_url: None,
+        })
+        .collect();
+        main_of(&mut a).presence = Presence::from([(
+            "Jogando".to_owned(),
+            vec![pessoa("Zé da Silva", false, false, false)],
+        )]);
+        let _ = a.update(Msg::Chat(1, chat::Msg::Open));
+        let _ = a.update(Msg::Member(members::Msg::Open("Dani".into())));
+        print(&a, "membros-menu");
+        let _ = a.update(Msg::Member(members::Msg::Call(6)));
+        print(&a, "membros-menu-chamando");
+        let espera = Err(Error::TooManyAttempts(1500));
+        let _ = a.update(Msg::Member(members::Msg::Sent("Dani".into(), espera)));
+        print(&a, "membros-menu-erro");
+
         // Transmissão: painel de qualidade, seletor do sistema, no ar e falha.
         let (mut a, id) = palco(4);
         a.config.share_quality = Quality::Media;
@@ -4442,6 +4920,21 @@ mod tests {
         let id = call_id(&mut a);
         let _ = a.update(Msg::CallEvent(id, call::Event::Ended(End::RoomClosed)));
         print(&a, "home-aviso");
+
+        // Home com gente em voz: cartão com "+N" e o "Voltar pra" de um canal vazio; depois o
+        // aviso de desistência, com "Tentar de novo" no lugar do "Voltar pra".
+        let mut a = voice_app();
+        a.config.last_voice = Some("jogando".into());
+        let na_call = nomes[..8].iter().map(|n| pessoa(n, false, false, false));
+        main_of(&mut a).presence = Presence::from([
+            ("call".to_owned(), na_call.collect()),
+            ("jogando".to_owned(), vec![]),
+        ]);
+        print(&a, "home-cartoes");
+        let m = main_of(&mut a);
+        m.notice = Some("Não foi possível reconectar à call.".into());
+        m.notice_retry = Some("call".into());
+        print(&a, "home-tentar-de-novo");
 
         // Sidebar com call e chat aberto: bloco "Em call", pílula de `@` e mudo por pessoa.
         let (mut a, id) = palco(4);

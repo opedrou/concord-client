@@ -5,11 +5,14 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Length, Theme};
 
-use super::sidebar::{CLOSE, icon, mark};
+use super::sidebar::{CLOSE, icon, mark, tipped};
 use super::theme::{self, BG, DANGER, FG, FG2, FG3, GREEN, IDLE};
 use super::voice::Probe;
-use super::{Control, ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, ServerForm, Tab, avatar};
-use crate::api::Secret;
+use super::{
+    Control, ID_SENHA, ID_SERVIDOR, ID_USUARIO, LoginForm, Main, Msg, Offline, ServerForm, Tab,
+    avatar,
+};
+use crate::api::{self, Channel, ChannelKind, Participant, Secret};
 use crate::audio::{
     self, GAIN_DEFAULT_DB, GAIN_MAX_DB, GAIN_MIN_DB, MANUAL_DEFAULT_DB, MANUAL_MAX_DB,
     MANUAL_MIN_DB, MicGain, NoiseLevel, Sensitivity,
@@ -21,6 +24,12 @@ use crate::update::Check;
 const PADRAO: &str = "Padrão do sistema";
 
 const COLUNA: f32 = 400.0;
+/// Largura do cartão de canal na home, e quantos rostos cabem nele.
+const CARTAO: f32 = 380.0;
+const FACES: usize = 6;
+
+const EYE: &[u8] = include_bytes!("../../assets/icons/eye.svg");
+const EYE_OFF: &[u8] = include_bytes!("../../assets/icons/eye-off.svg");
 
 fn page<'a>(content: impl Into<Element<'a, Msg>>) -> Element<'a, Msg> {
     container(center(content)).style(theme::fill(BG)).into()
@@ -86,9 +95,16 @@ fn error_line<'a>(error: Option<&'a str>) -> Option<Element<'a, Msg>> {
     error.map(|e| text(e).size(14).color(DANGER).into())
 }
 
-pub fn connecting<'a>() -> Element<'a, Msg> {
+/// `stuck`: passou do tempo de espera, e dá pra desistir.
+pub fn connecting<'a>(stuck: bool) -> Element<'a, Msg> {
     page(
         column![mark(76.0), text("Conectando…").size(15).color(FG2)]
+            .push(stuck.then(|| {
+                column![
+                    space().height(6),
+                    action("Cancelar", Msg::CancelConnect, theme::outline)
+                ]
+            }))
             .spacing(8)
             .align_x(Alignment::Center),
     )
@@ -114,19 +130,32 @@ pub fn server(f: &ServerForm) -> Element<'_, Msg> {
 
 pub fn login(f: &LoginForm) -> Element<'_, Msg> {
     let mut username = input("", &f.username, ID_USUARIO);
-    let mut password = input("", &f.password.0, "campo-senha").secure(true);
+    let mut password = input("", &f.password.0, ID_SENHA).secure(!f.show);
     if !f.busy {
         username = username.on_input(Msg::Username).on_submit(Msg::LoginSubmit);
         password = password
             .on_input(|s| Msg::Password(Secret(s)))
             .on_submit(Msg::LoginSubmit);
     }
+    let eye = button(container(icon(if f.show { EYE_OFF } else { EYE }, 18.0, FG2)).center(42))
+        .padding(0)
+        .style(theme::ghost)
+        .on_press(Msg::ShowPassword);
+    let eye = tipped(
+        eye.into(),
+        if f.show {
+            "Esconder a senha"
+        } else {
+            "Mostrar a senha"
+        },
+    );
+    let password = row![password, eye].spacing(6).align_y(Alignment::Center);
     branded(
         column![labeled("Usuário", username), labeled("Senha", password)]
             .push(error_line(f.error.as_deref()))
             .push(primary(
                 if f.busy { "Entrando…" } else { "Entrar" },
-                (!f.busy).then_some(Msg::LoginSubmit),
+                (!f.busy && f.wait.is_none()).then_some(Msg::LoginSubmit),
             ))
             .push(
                 text(&f.server)
@@ -143,13 +172,16 @@ pub fn login(f: &LoginForm) -> Element<'_, Msg> {
     )
 }
 
-pub fn offline(server: &str) -> Element<'_, Msg> {
+pub fn offline(o: &Offline) -> Element<'_, Msg> {
     branded(
         column![
             text("Sem conexão").size(20).font(theme::SEMIBOLD),
-            text(format!("Não foi possível falar com {server}."))
+            text(format!("Não foi possível falar com {}.", o.server))
                 .size(14)
                 .color(FG2),
+            text(format!("Tentando de novo em {} s…", o.wait.left))
+                .size(13)
+                .color(FG3),
             primary("Tentar de novo", Some(Msg::Retry)),
             link("Trocar servidor", Some(Msg::ChangeServer)),
         ]
@@ -157,18 +189,109 @@ pub fn offline(server: &str) -> Element<'_, Msg> {
     )
 }
 
-pub fn home<'a>(username: &'a str, notice: Option<&'a str>) -> Element<'a, Msg> {
+/// Canais de voz com gente, e quem está em cada um (sem repetir quem tem sessão fantasma).
+pub(super) fn live_voice(m: &Main) -> Vec<(&Channel, Vec<&Participant>)> {
+    m.channels
+        .iter()
+        .filter(|c| c.kind == ChannelKind::Voice)
+        .filter_map(|c| {
+            let who = api::occupants(m.presence.get(&c.slug)?);
+            (!who.is_empty()).then_some((c, who))
+        })
+        .collect()
+}
+
+/// Canal de voz com gente: nome, rostos e o botão de entrar.
+fn voice_card<'a>(m: &'a Main, c: &'a Channel, who: &[&'a Participant]) -> Element<'a, Msg> {
+    let faces = Row::with_children(
+        who.iter()
+            .take(FACES)
+            .map(|p| avatar::view(p.display_name(), m.avatar(p.display_name()), 30.0)),
+    );
+    let more = who.len().saturating_sub(FACES);
+    let faces = faces
+        .push((more > 0).then(|| text(format!("+{more}")).size(13).color(FG2)))
+        .spacing(5)
+        .align_y(Alignment::Center);
+    container(
+        row![
+            column![text(&c.name).size(15).font(theme::SEMIBOLD), faces]
+                .spacing(8)
+                .width(Length::Fill),
+            action("Entrar", Msg::JoinChannel(c.slug.clone()), theme::primary),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center),
+    )
+    .padding(16)
+    .width(CARTAO)
+    .style(theme::card)
+    .into()
+}
+
+pub fn home<'a>(m: &'a Main, config: &'a Config) -> Element<'a, Msg> {
+    let live = live_voice(m);
+    let dismiss = button(container(icon(CLOSE, 14.0, FG2)).center(24))
+        .padding(0)
+        .style(theme::ghost)
+        .on_press(Msg::DismissNotice);
+    let notice = m.notice.as_deref().map(|n| {
+        row![
+            text(n).size(14).color(IDLE),
+            tipped(dismiss.into(), "Dispensar")
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+    });
+    let retry = m.notice_retry.as_ref().map(|slug| {
+        action(
+            "Tentar de novo",
+            Msg::JoinChannel(slug.clone()),
+            theme::outline,
+        )
+    });
+    // Com o canal já num cartão, ou no aviso de tentar de novo, o botão seria repetido.
+    let back = config
+        .last_voice
+        .as_deref()
+        .filter(|slug| m.notice_retry.is_none() && live.iter().all(|(c, _)| c.slug != *slug))
+        .and_then(|slug| {
+            let voice = |c: &&Channel| c.slug == slug && c.kind == ChannelKind::Voice;
+            m.channels.iter().find(voice)
+        })
+        .map(|c| {
+            action(
+                format!("Voltar pra {}", c.name),
+                Msg::JoinChannel(c.slug.clone()),
+                theme::outline,
+            )
+        });
+    let body: Element<'a, Msg> = if live.is_empty() {
+        text("Escolha um canal pra começar.")
+            .size(16)
+            .color(FG2)
+            .into()
+    } else {
+        column![
+            text("Na call agora").size(13).font(theme::BOLD).color(FG3),
+            Column::with_children(live.iter().map(|(c, who)| voice_card(m, c, who))).spacing(10),
+        ]
+        .spacing(10)
+        .into()
+    };
     page(
         column![
             mark(92.0),
             space().height(8),
-            text(format!("Bem-vindo de volta, {username}."))
+            text(format!("Bem-vindo de volta, {}.", m.user.username))
                 .size(32)
                 .font(theme::DISPLAY_HEAVY)
                 .center(),
-            text("Escolha um canal pra começar.").size(16).color(FG2),
         ]
-        .push(notice.map(|n| text(n).size(14).color(IDLE)))
+        .push(notice)
+        .push(retry)
+        .push(body)
+        .push(back)
         .spacing(12)
         .padding(40)
         .align_x(Alignment::Center),
@@ -291,7 +414,7 @@ fn title<'a>(content: &'a str) -> Element<'a, Msg> {
 }
 
 fn action<'a>(
-    label: &'a str,
+    label: impl text::IntoFragment<'a>,
     msg: impl Into<Option<Msg>>,
     style: fn(&Theme, button::Status) -> button::Style,
 ) -> Element<'a, Msg> {

@@ -58,6 +58,8 @@ pub struct Config {
     pub autostart: bool,
     /// Data local (`AAAA-MM-DD`) do último som de abertura: toca na primeira do dia.
     pub greeted_on: Option<String>,
+    /// Slug do último canal de voz em que entrou: o "Voltar pra" da home.
+    pub last_voice: Option<String>,
 }
 
 impl Default for Config {
@@ -86,6 +88,7 @@ impl Default for Config {
             notifications: true,
             autostart: true,
             greeted_on: None,
+            last_voice: None,
         }
     }
 }

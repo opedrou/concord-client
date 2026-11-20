@@ -245,6 +245,18 @@ impl Chat {
         self.everyone = members.iter().map(|p| p.username.clone()).collect();
     }
 
+    /// "Mencionar" da lista de membros: `@nome ` onde está o cursor, e o foco vai pro campo.
+    pub fn mention_member(&mut self, name: &str) -> Task<App> {
+        let Position { line, column } = self.draft.cursor().position;
+        let before = self.draft.line(line).map_or_else(String::new, |l| {
+            l.text.get(..column).unwrap_or_default().to_owned()
+        });
+        self.edit(Action::Edit(Edit::Paste(Arc::new(mention_text(
+            &before, name,
+        )))));
+        operation::focus(COMPOSER)
+    }
+
     /// O `@` antes do cursor. Sem seleção, e não enquanto envia.
     fn mention(&self) -> Option<Mention> {
         let cursor = self.draft.cursor();
@@ -1366,6 +1378,16 @@ fn editor_keys(key: KeyPress, channel: i64, listed: bool) -> Option<Binding<App>
     enter_sends(key, channel)
 }
 
+/// O que entra no campo ao mencionar alguém: o nome com `@` e um espaço pra seguir escrevendo,
+/// separado por outro espaço do texto que já estava antes do cursor.
+fn mention_text(before: &str, name: &str) -> String {
+    let glued = before
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_whitespace());
+    format!("{}@{name} ", if glued { " " } else { "" })
+}
+
 /// `@` com começo de nome logo antes da coluna `column` (em bytes) da linha: devolve onde o
 /// `@` está e o que vem depois dele. O `@` tem de abrir a linha ou vir depois de espaço
 /// (`a@b` é e-mail), e o começo não pode terminar em espaço: quem digitou "@Ana " já seguiu
@@ -1757,6 +1779,24 @@ mod tests {
         digita(c, "e @zé");
         let _ = c.update(Msg::Mention(Suggest::At(0)), &cliente);
         assert_eq!(c.draft.text(), "oi @Ana Maria e @Zé da Silva ");
+    }
+
+    #[test]
+    fn mencionar_da_lista_de_membros_cola_o_nome_no_cursor() {
+        assert_eq!(mention_text("", "Ana"), "@Ana ");
+        assert_eq!(mention_text("oi ", "Ana"), "@Ana ");
+        assert_eq!(mention_text("oi", "Ana"), " @Ana ");
+        let mut a = app();
+        let _ = a.update(App::Chat(1, Msg::Open));
+        let c = chat(&mut a);
+        let _ = c.mention_member("Ana");
+        assert_eq!(c.draft.text(), "@Ana ");
+        digita(c, "oi");
+        let _ = c.mention_member("Zé da Silva");
+        assert_eq!(c.draft.text(), "@Ana oi @Zé da Silva ");
+        // Cursor no fim do que foi colado, pra seguir escrevendo.
+        digita(c, "!");
+        assert_eq!(c.draft.text(), "@Ana oi @Zé da Silva !");
     }
 
     #[test]
