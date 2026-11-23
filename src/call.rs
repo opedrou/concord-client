@@ -13,7 +13,7 @@ use std::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use livekit::{
-    DisconnectReason, Room, RoomEvent, RoomOptions,
+    DataPacket, DisconnectReason, Room, RoomEvent, RoomOptions,
     options::TrackPublishOptions,
     participant::{ConnectionQuality, LocalParticipant, Participant},
     publication::{LocalTrackPublication, RemoteTrackPublication},
@@ -42,6 +42,7 @@ use crate::audio::{Engine, Meter, MicFrames, RATE};
 use crate::config::Config;
 use crate::health::{self, Alive};
 use crate::share::{self, Capturer, Choice, Quality};
+use crate::soundboard::{self, Wire};
 
 pub(crate) mod stats;
 
@@ -113,6 +114,13 @@ pub enum Event {
     ShareAudio(share::View),
     /// Prévia pequena da transmissão de alguém, pela identity: um quadro só.
     Preview(String, Picture),
+    /// Alguém tocou um som da soundboard. `by` é o nome, a chave do volume dela.
+    Sound {
+        by: String,
+        sound: api::Sound,
+    },
+    /// Alguém apertou o "Parar" da soundboard.
+    SoundStop,
     /// Último evento da call.
     Ended(End),
 }
@@ -122,6 +130,8 @@ enum Cmd {
     MutedPeople(Vec<String>),
     /// Identity de quem assistir; `None` para de assistir.
     Watch(Option<String>),
+    /// Mensagem da soundboard já pronta, pra todos. Sem sala, se perde, como no site.
+    Soundboard(Vec<u8>),
     Leave,
     /// Queda simulada pelo SDK, pra bancada.
     #[cfg(test)]
@@ -403,6 +413,16 @@ impl Call {
         let _ = self.cmd.send(Cmd::Mute(muted));
     }
 
+    /// Toca um som pra todos. Quem manda toca o próprio som: a mensagem não volta.
+    pub fn play_sound(&self, sound: &api::Sound) {
+        let _ = self.cmd.send(Cmd::Soundboard(Wire::play(sound)));
+    }
+
+    /// Corta os sons da soundboard na máquina de todo mundo.
+    pub fn stop_sounds(&self) {
+        let _ = self.cmd.send(Cmd::Soundboard(Wire::stop()));
+    }
+
     /// Nomes com voz em zero: vai pro atributo `concord.muted`.
     pub fn set_muted_people(&self, names: Vec<String>) {
         let _ = self.cmd.send(Cmd::MutedPeople(names));
@@ -470,6 +490,17 @@ fn human(d: Duration) -> String {
 fn backoff(attempt: u32) -> Duration {
     let n = attempt.saturating_sub(1).min(10);
     Duration::from_millis((2000u64 << n).min(30_000))
+}
+
+/// Quem tocou um som, como o volume dela é guardado: o nome, ou a identity sem o sufixo da
+/// instalação. Sem nenhum dos dois, "alguém", como no site.
+fn sender(identity: &str, name: &str) -> String {
+    let who = if name.is_empty() {
+        identity.split("__").next().unwrap_or_default()
+    } else {
+        name
+    };
+    if who.is_empty() { "alguém" } else { who }.to_owned()
 }
 
 /// Nomes ordenados e sem repetição, separados por vírgula: igual a `encodeMuted` da web.
@@ -717,6 +748,7 @@ impl Ctl {
                     }
                     Some(Cmd::MutedPeople(p)) => self.people = p,
                     Some(Cmd::Watch(w)) => self.watching = w,
+                    Some(Cmd::Soundboard(_)) => {}
                     #[cfg(test)]
                     Some(Cmd::Simulate(_)) => {}
                 }
@@ -1029,6 +1061,7 @@ impl Task {
                         s.send_watching(ctl.watching.as_deref());
                         self.refresh(s);
                     }
+                    Some(Cmd::Soundboard(payload)) => s.send_sound(payload),
                     #[cfg(test)]
                     Some(Cmd::Simulate(scenario)) => {
                         let _ = s.room.simulate_scenario(scenario).await;
@@ -1205,6 +1238,29 @@ impl Task {
                 if ctl.watching.as_deref() == Some(identity.as_str()) {
                     s.watched.clear();
                     ctl.screen.clear();
+                }
+            }
+            RoomEvent::DataReceived {
+                payload,
+                topic: Some(topic),
+                participant,
+                ..
+            } if topic == soundboard::TOPIC => {
+                let (identity, name) = participant
+                    .as_ref()
+                    .map(|p| (p.identity().to_string(), p.name()))
+                    .unwrap_or_default();
+                match Wire::decode(payload) {
+                    Some(Wire::Play(sound)) => {
+                        log!("soundboard: {identity} tocou um som");
+                        let by = sender(&identity, &name);
+                        self.emit(Event::Sound { by, sound });
+                    }
+                    Some(Wire::Stop) => {
+                        log!("soundboard: {identity} parou os sons");
+                        self.emit(Event::SoundStop);
+                    }
+                    None => log!("soundboard: mensagem que não entendi de {identity}"),
                 }
             }
             RoomEvent::RoomUpdated { .. } => self.set_recording(s),
@@ -1521,6 +1577,23 @@ impl Session {
             let _ = me
                 .set_attributes(HashMap::from([(MUTED_ATTRIBUTE.to_owned(), value)]))
                 .await;
+        });
+    }
+
+    /// Mensagem da soundboard pra todos, numa tarefa: o `publish_data` espera a sala voltar
+    /// quando ela está reconectando.
+    fn send_sound(&self, payload: Vec<u8>) {
+        let me = self.room.local_participant();
+        tokio::spawn(async move {
+            let packet = DataPacket {
+                payload,
+                topic: Some(soundboard::TOPIC.to_owned()),
+                reliable: true,
+                ..Default::default()
+            };
+            if let Err(e) = me.publish_data(packet).await {
+                log!("soundboard: mensagem não saiu: {e}");
+            }
         });
     }
 
@@ -1873,6 +1946,14 @@ mod tests {
         );
         // Sem estouro em contagem absurda.
         assert_eq!(backoff(u32::MAX).as_millis(), 30_000);
+    }
+
+    #[test]
+    fn quem_tocou_o_som_pelo_nome_ou_pela_identity_sem_sufixo() {
+        assert_eq!(sender("ana__abc", "ana"), "ana");
+        assert_eq!(sender("bia__abc", ""), "bia");
+        assert_eq!(sender("zeca", ""), "zeca");
+        assert_eq!(sender("", ""), "alguém");
     }
 
     #[test]

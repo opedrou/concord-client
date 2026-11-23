@@ -1938,6 +1938,7 @@ impl App {
             call::Event::ShareAudio(view) => active.set_share_audio(view),
             call::Event::Viewers(viewers) => active.viewers = viewers,
             call::Event::Preview(identity, picture) => active.set_preview(identity, picture),
+            call::Event::Sound { .. } | call::Event::SoundStop => {}
             call::Event::Ended(end) => return self.call_ended(end),
         }
         Task::none()
