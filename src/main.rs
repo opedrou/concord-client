@@ -22,6 +22,7 @@ mod log;
 mod notify;
 mod session;
 mod share;
+mod soundboard;
 mod sse;
 mod tray;
 mod ui;

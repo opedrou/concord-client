@@ -312,6 +312,7 @@ pub fn settings<'a>(m: &'a Main, config: &'a Config, tab: Tab) -> Element<'a, Ms
             item("Conta", Tab::Account),
             item("Voz", Tab::Voice),
             item("Notificações", Tab::Notifications),
+            item("Soundboard", Tab::Soundboard),
             item("Sobre", Tab::About)
         ]
         .spacing(4),
@@ -325,6 +326,7 @@ pub fn settings<'a>(m: &'a Main, config: &'a Config, tab: Tab) -> Element<'a, Ms
         Tab::Account => account_panel(m),
         Tab::Voice => voice_panel(m, config),
         Tab::Notifications => notifications_panel(config),
+        Tab::Soundboard => super::board::library_panel(m),
         Tab::About => about_panel(m),
     };
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(32))

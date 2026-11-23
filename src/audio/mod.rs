@@ -21,6 +21,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) use device::ToMono;
 use mixer::{Mixer, VoiceQueue};
 use worker::Command;
 
@@ -339,6 +340,17 @@ impl Engine {
             Effect::On | Effect::Off => Command::Cue(effect.pcm()),
             _ => Command::Effect(effect.pcm()),
         });
+    }
+
+    /// Som da soundboard: PCM mono em 48 kHz, com o ganho final (o de quem tocou vezes o
+    /// geral). Surdo não ouve, e os sons se sobrepõem até o [`Engine::stop_sounds`].
+    pub fn sound(&self, pcm: Arc<[i16]>, gain: f32) {
+        self.send(Command::Sound(pcm, gain));
+    }
+
+    /// Corta os sons da soundboard; os de interface seguem.
+    pub fn stop_sounds(&self) {
+        self.send(Command::StopSounds);
     }
 
     /// Retorno do mic na saída, já tratado, pra pessoa se ouvir. Só no motor de teste da

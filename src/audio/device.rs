@@ -182,7 +182,7 @@ fn config(channels: u16, rate: u32) -> StreamConfig {
 ///
 /// ponytail: interpolação linear sem filtro. Sobe 44,1 kHz bem; descer de 96 kHz dobra
 /// ruído acima de 24 kHz pra dentro da banda. Rubato aqui se alguém ouvir isso.
-struct ToMono {
+pub(crate) struct ToMono {
     channels: usize,
     /// Amostras de entrada por amostra de saída.
     step: f64,
@@ -192,7 +192,7 @@ struct ToMono {
 }
 
 impl ToMono {
-    fn new(channels: u16, rate: u32) -> Self {
+    pub(crate) fn new(channels: u16, rate: u32) -> Self {
         ToMono {
             channels: channels.max(1) as usize,
             step: rate as f64 / RATE as f64,
@@ -201,7 +201,7 @@ impl ToMono {
         }
     }
 
-    fn push(&mut self, data: &[f32], mut out: impl FnMut(f32)) {
+    pub(crate) fn push(&mut self, data: &[f32], mut out: impl FnMut(f32)) {
         for frame in data.chunks(self.channels) {
             let cur = frame.iter().sum::<f32>() / frame.len() as f32;
             while self.pos < 1.0 {
