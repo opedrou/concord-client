@@ -3901,7 +3901,7 @@ mod tests {
 
     #[test]
     fn soundboard_clique_avisa_baixa_e_espera_o_cooldown() {
-        let mut a = in_call(&["Opedro", "Ana"]);
+        let mut a = in_call(&["Ana"]);
         let _ = a.update(Msg::Soundboard(board::Msg::Open));
         assert!(call_of(&mut a).board.open && call_of(&mut a).menu_open());
         let _ = a.update(Msg::CloseVolume);
@@ -3942,7 +3942,7 @@ mod tests {
 
     #[test]
     fn soundboard_som_da_sala_respeita_cooldown_volume_e_cache() {
-        let mut a = in_call(&["Opedro", "Ana", "Bia", "Caio"]);
+        let mut a = in_call(&["Ana", "Bia", "Caio"]);
         let id = call_id(&mut a);
         assert_eq!(tocou(&mut a, "Ana", som(1, "buzina")), 2, "baixa e avisa");
         assert_eq!(
@@ -3975,7 +3975,7 @@ mod tests {
         let _ = a.update(Msg::Soundboard(board::Msg::Expire(id, 3)));
         assert!(call_of(&mut a).board.notice.is_none());
 
-        let _ = tocou(&mut a, "Opedro", som(4, "x"));
+        let _ = tocou(&mut a, "Duda", som(4, "x"));
         let _ = a.update(Msg::CallEvent(id, call::Event::SoundStop));
         assert!(
             call_of(&mut a).board.notice.is_none(),
@@ -4780,7 +4780,7 @@ mod tests {
         // Soundboard sem admin: o "Apagar" só no som que a pessoa subiu.
         let _ = a.update(Msg::OpenSettings(Tab::Soundboard));
         main_of(&mut a).user.is_admin = false;
-        let mut meu = som(1, "buzina do Opedro");
+        let mut meu = som(1, "minha buzina");
         meu.uploaded_by = Some(1);
         let mut outro = som(2, "risada da Ana");
         outro.uploaded_by = Some(7);
