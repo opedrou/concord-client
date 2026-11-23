@@ -34,6 +34,8 @@ pub enum Error {
     BadCredentials,
     /// Login bloqueado por tentativas; segundos até liberar.
     TooManyAttempts(u64),
+    /// O servidor recusou o formato do arquivo (`unsupported_format`).
+    Unsupported,
     Server(u16),
 }
 
@@ -158,6 +160,9 @@ pub struct Sound {
     #[serde(default)]
     pub trim_start: f64,
     pub trim_end: Option<f64>,
+    /// Id de quem subiu. `None` em som de conta apagada, e no que chega pela sala.
+    #[serde(default)]
+    pub uploaded_by: Option<i64>,
 }
 
 /// Recibo do upload. Volta inteiro no POST da mensagem.
@@ -504,6 +509,30 @@ impl Client {
         read_limited(check(resp)?, MAX_SOUND).await
     }
 
+    /// Sobe um som com o corpo cru, como o site. `name` é o nome do botão: o servidor limpa
+    /// e corta em 40 caracteres.
+    pub async fn upload_sound(&self, name: &str, bytes: Vec<u8>) -> Result<Sound, Error> {
+        let resp = self.sound_upload(name, bytes).send().await;
+        let resp = resp.map_err(|_| Error::Offline)?;
+        let status = resp.status();
+        classify_sound(status, &read_limited(resp, MAX_JSON).await?)
+    }
+
+    fn sound_upload(&self, name: &str, bytes: Vec<u8>) -> RequestBuilder {
+        let url = format!("{}/api/sounds", self.base);
+        self.authed(self.http.post(url))
+            .query(&[("name", name)])
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(bytes)
+    }
+
+    /// 403 quando não foi quem subiu nem admin.
+    pub async fn delete_sound(&self, id: i64) -> Result<(), Error> {
+        let url = format!("{}/api/sounds/{id}", self.base);
+        let resp = self.authed(self.http.delete(url)).send().await;
+        check(resp.map_err(|_| Error::Offline)?).map(drop)
+    }
+
     /// SSE do canal, já com a resposta 200: a partir daqui o servidor entrega os eventos.
     pub async fn message_stream(&self, channel: i64) -> Result<Response, Error> {
         self.event_stream(&format!("/api/channels/{channel}/messages/stream"))
@@ -599,6 +628,24 @@ fn classify_call(status: StatusCode, wait: u64, body: &[u8]) -> Result<(u32, u32
             .map(|b| (b.called, b.delivered))
             .map_err(|_| Error::NotConcord),
         StatusCode::TOO_MANY_REQUESTS => Err(Error::TooManyAttempts(wait)),
+        StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
+        s => Err(Error::Server(s.as_u16())),
+    }
+}
+
+/// Upload de som: 201 traz o som; 413 é arquivo grande demais, e 400 separa formato recusado
+/// (`unsupported_format`) de corpo vazio (`invalid_body`).
+fn classify_sound(status: StatusCode, body: &[u8]) -> Result<Sound, Error> {
+    #[derive(Deserialize)]
+    struct Body {
+        error: String,
+    }
+    match status {
+        s if s.is_success() => serde_json::from_slice(body).map_err(|_| Error::NotConcord),
+        StatusCode::BAD_REQUEST => match serde_json::from_slice::<Body>(body) {
+            Ok(b) if b.error == "unsupported_format" => Err(Error::Unsupported),
+            _ => Err(Error::Server(400)),
+        },
         StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
         s => Err(Error::Server(s.as_u16())),
     }
@@ -775,12 +822,61 @@ mod tests {
         .unwrap();
         assert_eq!((lista[0].trim_start, lista[0].trim_end), (0.5, None));
         assert_eq!(lista[1].trim_end, Some(1.25));
+        assert_eq!(
+            (lista[0].uploaded_by, lista[1].uploaded_by),
+            (None, Some(2))
+        );
         let pasta = "/api/sounds/";
         assert!(is_server_path("/api/sounds/3?v=ab.mp3", pasta));
         assert!(!is_server_path("https://evil.com/api/sounds/3", pasta));
         assert!(!is_server_path("//evil.com/api/sounds/3", pasta));
         assert!(!is_server_path("/api/avatars/3?v=a.png", pasta));
         assert!(!is_server_path("/api/sounds/../auth/me", pasta));
+    }
+
+    #[test]
+    fn subir_som_le_as_respostas_do_site() {
+        let ok = br#"{"id":9,"name":"buzina","url":"/api/sounds/9?v=a.mp3","size":10,
+            "uploadedBy":5,"createdAt":1,"trimStart":0,"trimEnd":null}"#;
+        let som = classify_sound(StatusCode::CREATED, ok).unwrap();
+        assert_eq!((som.id, som.uploaded_by), (9, Some(5)));
+        let erro = |status, body: &[u8]| classify_sound(status, body).unwrap_err();
+        assert_eq!(
+            erro(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                br#"{"error":"file_too_large"}"#
+            ),
+            Error::Server(413)
+        );
+        assert_eq!(
+            erro(
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"unsupported_format"}"#
+            ),
+            Error::Unsupported
+        );
+        assert_eq!(
+            erro(StatusCode::BAD_REQUEST, br#"{"error":"invalid_body"}"#),
+            Error::Server(400)
+        );
+        assert_eq!(erro(StatusCode::UNAUTHORIZED, b""), Error::Unauthorized);
+        assert_eq!(erro(StatusCode::CREATED, b"<html>"), Error::NotConcord);
+    }
+
+    #[test]
+    fn subir_som_manda_o_nome_na_query_e_o_corpo_cru() {
+        let c = Client::new("http://localhost:3000", None);
+        let req = c
+            .sound_upload("Buzina alta & cia", vec![1, 2, 3])
+            .build()
+            .unwrap();
+        assert_eq!(req.url().path(), "/api/sounds");
+        let nome: Vec<_> = req.url().query_pairs().collect();
+        assert_eq!(nome, [("name".into(), "Buzina alta & cia".into())]);
+        assert_eq!(
+            req.body().and_then(|b| b.as_bytes()),
+            Some(&[1u8, 2, 3][..])
+        );
     }
 
     #[test]

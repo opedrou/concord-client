@@ -444,14 +444,21 @@ pub fn read_attachment(path: &Path) -> Result<(String, Vec<u8>), String> {
     Ok((name, bytes))
 }
 
-/// Seletor de arquivo do sistema. `None`: cancelou, ou não tem seletor.
-pub async fn pick_file() -> Option<PathBuf> {
-    tokio::task::spawn_blocking(pick).await.ok().flatten()
+/// Filtro do seletor: o nome e os padrões, como `*.mp3`.
+pub type Filter = (&'static str, &'static [&'static str]);
+
+/// Seletor de arquivo do sistema, com o título e, se tiver, um filtro. `None`: cancelou, ou
+/// não tem seletor.
+pub async fn pick_file(title: &'static str, filter: Option<Filter>) -> Option<PathBuf> {
+    tokio::task::spawn_blocking(move || pick(title, filter))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Pelo portal, que abre o seletor do GNOME ou do KDE sem puxar GTK pra dentro do processo.
 #[cfg(target_os = "linux")]
-fn pick() -> Option<PathBuf> {
+fn pick(title: &str, filter: Option<Filter>) -> Option<PathBuf> {
     use std::collections::HashMap;
     use zbus::zvariant::{OwnedValue, Value};
     const PORTAL: &str = "org.freedesktop.portal.Desktop";
@@ -473,16 +480,21 @@ fn pick() -> Option<PathBuf> {
     )
     .ok()?;
     let mut answers = request.receive_signal("Response").ok()?;
-    let options = HashMap::from([
+    let mut options = HashMap::from([
         ("handle_token", Value::from(token.as_str())),
         ("modal", Value::from(true)),
     ]);
+    // `a(sa(us))`: cada filtro com padrões do tipo 0, de nome de arquivo.
+    if let Some((name, patterns)) = filter {
+        let patterns: Vec<(u32, &str)> = patterns.iter().map(|p| (0, *p)).collect();
+        options.insert("filters", Value::new(vec![(name, patterns)]));
+    }
     conn.call_method(
         Some(PORTAL),
         OBJETO,
         Some("org.freedesktop.portal.FileChooser"),
         "OpenFile",
-        &("", "Anexar arquivo", options),
+        &("", title, options),
     )
     .ok()?;
     let answer = answers.next()?;
@@ -514,13 +526,13 @@ fn file_path(uri: &str) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn pick() -> Option<PathBuf> {
+fn pick(title: &str, filter: Option<Filter>) -> Option<PathBuf> {
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
     // SAFETY: COM aberto e fechado nesta thread, que é só do seletor; as interfaces de
     // `ask_file` são soltas antes do `CoUninitialize`.
     unsafe {
         let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let path = ask_file();
+        let path = ask_file(title, filter);
         if init.is_ok() {
             CoUninitialize();
         }
@@ -529,14 +541,26 @@ fn pick() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-unsafe fn ask_file() -> windows::core::Result<PathBuf> {
+unsafe fn ask_file(title: &str, filter: Option<Filter>) -> windows::core::Result<PathBuf> {
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
     use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
+    use windows::core::{HSTRING, PCWSTR};
     // SAFETY: chamadas COM numa thread com COM aberto; o texto do caminho é do COM e volta
     // pra ele depois de copiado.
     unsafe {
         let dialog: IFileOpenDialog =
             CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+        dialog.SetTitle(&HSTRING::from(title))?;
+        // Os textos do filtro ficam vivos até depois do `Show`.
+        let filter =
+            filter.map(|(name, patterns)| (HSTRING::from(name), HSTRING::from(patterns.join(";"))));
+        if let Some((name, spec)) = &filter {
+            dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: PCWSTR(name.as_ptr()),
+                pszSpec: PCWSTR(spec.as_ptr()),
+            }])?;
+        }
         dialog.Show(None)?;
         let name = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
         let path: std::ffi::OsString =
@@ -547,7 +571,7 @@ unsafe fn ask_file() -> windows::core::Result<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn pick() -> Option<PathBuf> {
+fn pick(_: &str, _: Option<Filter>) -> Option<PathBuf> {
     None
 }
 

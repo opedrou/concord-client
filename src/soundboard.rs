@@ -81,6 +81,7 @@ impl Wire {
             url: m.url?,
             trim_start: m.trim_start.unwrap_or_default(),
             trim_end: m.trim_end,
+            uploaded_by: None,
         }))
     }
 }
@@ -174,6 +175,7 @@ mod tests {
             url: "/api/sounds/3?v=ab.mp3".into(),
             trim_start: 0.5,
             trim_end,
+            uploaded_by: None,
         }
     }
 

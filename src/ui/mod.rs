@@ -241,6 +241,8 @@ struct Main {
     online: HashSet<String>,
     /// Canal de texto -> menções ainda não vistas, na pílula da sidebar. Só na memória.
     mentions: HashMap<i64, u32>,
+    /// Aba Soundboard das configurações.
+    library: board::Library,
 }
 
 /// Slider da aba Voz com botão "Padrão".
@@ -257,6 +259,7 @@ pub enum Tab {
     Account,
     Voice,
     Notifications,
+    Soundboard,
     About,
 }
 
@@ -431,6 +434,8 @@ pub enum Msg {
     Member(members::Msg),
     /// Painel e sons da soundboard.
     Soundboard(board::Msg),
+    /// Aba Soundboard das configurações: subir e apagar.
+    SoundLibrary(board::Lib),
 }
 
 /// O que a pessoa fez, pro log: cliques e escolhas, nunca texto digitado nem título de
@@ -507,6 +512,7 @@ fn action(msg: &Msg) -> Option<String> {
         Msg::People(msg) => return people::action(msg),
         Msg::Member(msg) => return members::action(msg),
         Msg::Soundboard(msg) => return board::action(msg),
+        Msg::SoundLibrary(msg) => return board::library_action(msg),
         _ => return None,
     })
 }
@@ -988,6 +994,10 @@ impl App {
             Msg::EngineStarted(id, result) => self.engine_started(id, result),
             Msg::CallEvent(id, event) => self.call_event(id, event),
             Msg::Soundboard(msg) => self.soundboard(msg),
+            Msg::SoundLibrary(msg) => match &mut self.screen {
+                Screen::Main(m) => board::library(m, msg),
+                _ => Task::none(),
+            },
             Msg::Frame(now) => {
                 if let Some(call) = self.call_mut() {
                     call.tick(now);
@@ -1304,6 +1314,13 @@ impl App {
                 if let Screen::Main(m) = &mut self.screen {
                     m.settings = Some(tab);
                     m.confirm = false;
+                }
+                if tab == Tab::Soundboard {
+                    self.stop_probe();
+                    return match &mut self.screen {
+                        Screen::Main(m) => board::library(m, board::Lib::Load),
+                        _ => Task::none(),
+                    };
                 }
                 if tab != Tab::Voice {
                     self.stop_probe();
@@ -2287,6 +2304,7 @@ impl App {
             member_menu: None,
             online: HashSet::new(),
             mentions: HashMap::new(),
+            library: board::Library::default(),
         };
         let avatars = main.fetch_avatars();
         let fresh = main.refresh();
@@ -3865,6 +3883,7 @@ mod tests {
             url: format!("/api/sounds/{id}?v=s{id}.mp3"),
             trim_start: 0.0,
             trim_end: None,
+            uploaded_by: None,
         }
     }
 
@@ -3898,6 +3917,27 @@ mod tests {
 
         let _ = a.update(Msg::Soundboard(board::Msg::Stop));
         assert_eq!(aviso(&mut a), None, "parar tira o aviso");
+    }
+
+    #[test]
+    fn soundboard_nas_configuracoes_busca_ao_abrir_e_apagar_pergunta() {
+        let mut a = main_app();
+        let t = a.update(Msg::OpenSettings(Tab::Soundboard));
+        assert_eq!(t.units(), 1, "busca a lista");
+        let t = a.update(Msg::SoundLibrary(board::Lib::Delete(4)));
+        assert_eq!(t.units(), 0, "o primeiro clique só pergunta");
+        let t = a.update(Msg::SoundLibrary(board::Lib::Confirm(4)));
+        assert_eq!(t.units(), 1, "o segundo apaga");
+        let apagado = Ok(());
+        let t = a.update(Msg::SoundLibrary(board::Lib::Deleted(apagado)));
+        assert_eq!(t.units(), 1, "e busca a lista de novo");
+        let t = a.update(Msg::SoundLibrary(board::Lib::Upload));
+        assert_eq!(t.units(), 1, "abre o seletor");
+        let t = a.update(Msg::SoundLibrary(board::Lib::Upload));
+        assert_eq!(t.units(), 0, "um envio por vez");
+        let _ = a.update(Msg::SoundLibrary(board::Lib::Picked(None)));
+        let t = a.update(Msg::SoundLibrary(board::Lib::Upload));
+        assert_eq!(t.units(), 1, "cancelar o seletor libera");
     }
 
     #[test]
@@ -4737,6 +4777,21 @@ mod tests {
             }
             print(&a, nome);
         }
+        // Soundboard sem admin: o "Apagar" só no som que a pessoa subiu.
+        let _ = a.update(Msg::OpenSettings(Tab::Soundboard));
+        main_of(&mut a).user.is_admin = false;
+        let mut meu = som(1, "buzina do Opedro");
+        meu.uploaded_by = Some(1);
+        let mut outro = som(2, "risada da Ana");
+        outro.uploaded_by = Some(7);
+        let lista = Ok(vec![meu, outro, som(3, "sino de conta apagada")]);
+        let _ = a.update(Msg::SoundLibrary(board::Lib::Loaded(lista)));
+        print(&a, "config-soundboard");
+        let _ = a.update(Msg::SoundLibrary(board::Lib::Delete(1)));
+        let erro = Err(Error::Unsupported);
+        let _ = a.update(Msg::SoundLibrary(board::Lib::Uploaded(erro)));
+        print(&a, "config-soundboard-apagar");
+        main_of(&mut a).user.is_admin = true;
 
         // Linha do "Procurar atualização": baixando (botão parado), pronta e erro.
         main_of(&mut a).settings = Some(Tab::About);

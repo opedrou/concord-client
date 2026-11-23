@@ -377,7 +377,10 @@ impl Chat {
                 }
                 self.upload = Upload::Picking;
                 return Task::future(async move {
-                    App::Chat(channel, Msg::Picked(logic::pick_file().await))
+                    App::Chat(
+                        channel,
+                        Msg::Picked(logic::pick_file("Anexar arquivo", None).await),
+                    )
                 });
             }
             Msg::Picked(picked) => {
