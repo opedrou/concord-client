@@ -21,6 +21,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) use device::ToMono;
 use mixer::{Mixer, VoiceQueue};
 use worker::Command;
 

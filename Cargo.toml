@@ -34,6 +34,18 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 log = "0.4"
 # Notificação nativa (`notify`). Fixo na 4.18: a 4.19 puxa o zbus 6, e a árvore está no 5.
 notify-rust = "=4.18.2"
+# Sons da soundboard (`soundboard`): os formatos que o site aceita. Rust puro, compila no
+# Windows. Sem o `id3v2`, a sonda pula a etiqueta do começo do mp3 sozinha.
+symphonia = { version = "0.6", default-features = false, features = [
+    "mp3",
+    "ogg",
+    "vorbis",
+    "wav",
+    "pcm",
+    "flac",
+    "isomp4",
+    "aac",
+] }
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.18"
