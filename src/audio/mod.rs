@@ -342,6 +342,17 @@ impl Engine {
         });
     }
 
+    /// Som da soundboard: PCM mono em 48 kHz, com o ganho final (o de quem tocou vezes o
+    /// geral). Surdo não ouve, e os sons se sobrepõem até o [`Engine::stop_sounds`].
+    pub fn sound(&self, pcm: Arc<[i16]>, gain: f32) {
+        self.send(Command::Sound(pcm, gain));
+    }
+
+    /// Corta os sons da soundboard; os de interface seguem.
+    pub fn stop_sounds(&self) {
+        self.send(Command::StopSounds);
+    }
+
     /// Retorno do mic na saída, já tratado, pra pessoa se ouvir. Só no motor de teste da
     /// aba Voz, que não tem sala: abre o mic junto.
     pub fn set_monitor(&self, on: bool) {

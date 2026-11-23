@@ -39,6 +39,9 @@ pub enum Command {
     Effect(&'static [u8]),
     /// Toca surdo também: ver [`Mixer::cue`].
     Cue(&'static [u8]),
+    /// Som da soundboard e o ganho: ver [`Mixer::sound`].
+    Sound(Arc<[i16]>, f32),
+    StopSounds,
     /// Retorno do mic na saída, no motor de teste.
     Monitor(bool),
     Voice {
@@ -310,6 +313,8 @@ pub fn run(
                 }
                 Command::Effect(pcm) => mixer.play(pcm),
                 Command::Cue(pcm) => mixer.cue(pcm),
+                Command::Sound(pcm, gain) => mixer.sound(pcm, gain),
+                Command::StopSounds => mixer.stop_sounds(),
                 Command::Monitor(on) => {
                     if echo.is_some() != on {
                         log!(

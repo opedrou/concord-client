@@ -69,6 +69,9 @@ pub struct Mixer {
     effects: Vec<(&'static [u8], usize)>,
     /// Confirmação do mic e do fone, no mesmo formato. Ver [`Mixer::cue`].
     cue: Option<(&'static [u8], usize)>,
+    /// Sons da soundboard tocando: PCM, posição e ganho. Fora dos `effects`, pro "Parar"
+    /// da soundboard não cortar os sons de interface.
+    sounds: Vec<(Arc<[i16]>, usize, f32)>,
 }
 
 /// Soma um som de interface a partir de `pos`, até o fim do bloco ou do som.
@@ -91,6 +94,7 @@ impl Mixer {
             deafened: false,
             effects: Vec::new(),
             cue: None,
+            sounds: Vec::new(),
         }
     }
 
@@ -99,6 +103,19 @@ impl Mixer {
         if !self.deafened {
             self.effects.push((pcm, 0));
         }
+    }
+
+    /// Som da soundboard, com o ganho de quem tocou e o geral já multiplicados. Surdo não
+    /// começa, como no site, e os sons se sobrepõem.
+    pub fn sound(&mut self, pcm: Arc<[i16]>, gain: f32) {
+        if !self.deafened {
+            self.sounds.push((pcm, 0, gain.min(MAX_GAIN)));
+        }
+    }
+
+    /// "Parar" da soundboard: só os sons dela.
+    pub fn stop_sounds(&mut self) {
+        self.sounds.clear();
     }
 
     /// Toca surdo também, que é quando ela diz que o fone desligou. Uma por vez: alternar
@@ -181,6 +198,14 @@ impl Mixer {
             add_effect(out, pcm, pos);
         }
         self.effects.retain(|(pcm, pos)| *pos * 2 < pcm.len());
+        for (pcm, pos, gain) in &mut self.sounds {
+            let end = (*pos + FRAME).min(pcm.len());
+            for (o, s) in out.iter_mut().zip(&pcm[*pos..end]) {
+                *o += *s as f32 / 32768.0 * *gain;
+            }
+            *pos = end;
+        }
+        self.sounds.retain(|(pcm, pos, _)| *pos < pcm.len());
         if self.deafened {
             out.fill(0.0);
         }
@@ -358,6 +383,37 @@ mod tests {
         assert!(close(out[0], 0.25 * EFFECT_GAIN), "só a nova, sem a voz");
         assert!(close(out[1], 0.25 * EFFECT_GAIN) && out[2] == 0.0);
         assert!(!m.playing());
+    }
+
+    #[test]
+    fn som_da_soundboard_tem_o_ganho_pronto_e_se_sobrepoe() {
+        let mut m = mixer(0);
+        let som: Arc<[i16]> = vec![16384; FRAME + 10].into();
+        m.sound(som.clone(), 1.5);
+        m.sound(som, 0.5);
+        let out = mix(&mut m);
+        assert!(close(out[0], 0.5 * 2.0), "1,5 + 0,5, sem o volume geral");
+        let out = mix(&mut m);
+        assert!(close(out[9], 1.0) && out[10] == 0.0, "acaba no fim do som");
+        assert!(m.sounds.is_empty());
+        m.sound(vec![16384; 4].into(), 9.0);
+        assert!(close(mix(&mut m)[0], 0.5 * MAX_GAIN), "teto de ganho em 2");
+    }
+
+    #[test]
+    fn surdo_nao_comeca_som_e_parar_so_corta_a_soundboard() {
+        static BIPE: [u8; 4] = [0x00, 0x40, 0x00, 0x40];
+        let mut m = mixer(71);
+        m.deafened = true;
+        m.sound(vec![10000; FRAME].into(), 1.0);
+        assert!(m.sounds.is_empty());
+        m.deafened = false;
+        m.sound(vec![16384; FRAME * 3].into(), 1.0);
+        m.play(&BIPE);
+        m.stop_sounds();
+        let out = mix(&mut m);
+        assert!(close(out[0], 0.5 * EFFECT_GAIN), "o som de interface segue");
+        assert_eq!(out[2], 0.0, "a soundboard parou");
     }
 
     #[test]
