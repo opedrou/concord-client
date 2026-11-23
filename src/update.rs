@@ -38,15 +38,15 @@ const ASSET: &str = "concord-client-linux-x86_64";
 /// Novidades mostradas uma vez, na primeira abertura depois de atualizar. Só aparecem se a
 /// versão daqui for a do `Cargo.toml`: texto esquecido de uma versão velha não volta como novo.
 pub const NEWS: (&str, &[&str]) = (
-    "0.1.19",
+    "0.1.20",
     &[
-        "Transmitir de novo a última tela ou janela direto pelo painel de transmitir, sem \
-         passar pelo seletor.",
-        "Atalhos Ctrl+Shift+M (microfone), Ctrl+Shift+D (fone) e F (tela cheia da \
-         transmissão), e bloco \"Em call\" na barra lateral pra sair da call com o chat aberto.",
-        "Menu da bandeja com microfone, sair da call e não incomodar por 1 h. O aviso de \
-         chamado tem os botões Entrar e Agora não.",
-        "Tela inicial com os canais de voz ocupados, e links do chat que abrem no navegador.",
+        "Soundboard na call: o botão de música na barra abre os sons, que tocam pra todo mundo, \
+         no aplicativo e no site. Parar corta o som pra todos.",
+        "Configurações › Soundboard sobe um som (mp3, ogg, wav, flac ou m4a, até 1 MB) e apaga \
+         os que você subiu.",
+        "Volume da soundboard separado por pessoa, no mesmo painel do volume da voz.",
+        "Corrigido: o botão de silenciar cobria o selo LIVE na barra lateral, e o Parar da \
+         transmissão não tinha fundo.",
     ],
 );
 

@@ -4,7 +4,7 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.19.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.20.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
@@ -18,6 +18,8 @@ escolhido na primeira abertura.
   saindo. A última tela fica lembrada e pode ser transmitida de novo sem o seletor.
 - **Assistir** a transmissão dos outros, com o som, também de quem transmite pelo site, vendo
   quem mais está assistindo. Duplo clique ou `F` alterna a tela cheia.
+- **Soundboard:** toca os sons do grupo pra todo mundo na call, junto com o site, com volume
+  separado por pessoa. Dá pra subir e apagar sons pelo aplicativo.
 - **Câmera dos outros** no tile de voz, no lugar da foto.
 - **Chat de texto** nos canais de texto, em tempo real, com anexos pelo clipe, arrastando o
   arquivo ou colando imagem com Ctrl+V. Links abrem no navegador. O `@` tem autocompletar
@@ -36,7 +38,7 @@ escolhido na primeira abertura.
   arquivo baixado é conferido pelo SHA-256 da release, e se a versão nova não abrir o app volta
   pra anterior. Em Configurações › Sobre dá pra procurar atualização na hora.
 
-Ainda só no site: soundboard e enviar a própria câmera.
+Ainda só no site: enviar a própria câmera e renomear ou cortar os sons da soundboard.
 
 ## Instalar
 
@@ -82,49 +84,30 @@ o seletor de tela do sistema (xdg-desktop-portal).
 - No Linux, a bandeja precisa da extensão AppIndicator, que já vem no Ubuntu. Sem ela, o X
   fecha o app.
 - No Linux com Wayland, arrastar arquivo pra janela não anexa. O clipe funciona.
+- Cada som da soundboard toca por até 2 min, e o modo foco do site não a cala no aplicativo.
 
-## Novidades da v0.1.19
+## Novidades da v0.1.20
 
 ### Novo
-- **Transmitir de novo a mesma tela:** o painel de transmitir lembra a última tela ou janela e
-  oferece "Transmitir de novo", sem passar pelo seletor. "Escolher outra" abre o seletor. No
-  Linux, se a permissão do sistema venceu, ele pergunta de novo.
-- **Tela inicial com quem está em voz:** os canais de voz com gente aparecem com os rostos e
-  um Entrar, e há um atalho pra voltar ao último canal.
-- **Atalhos:** Ctrl+Shift+M liga e desliga o mic, Ctrl+Shift+D o fone, e `F` alterna a tela
-  cheia da transmissão assistida. Os atalhos não disparam enquanto você digita.
-- **Na call:** a barra de controles fica sempre visível na grade. Clicar na pessoa abre o
-  volume, agora com a porcentagem. Duplo clique na transmissão liga e desliga a tela cheia, e
-  o quadro dela ganhou os botões de tela cheia e de mudo.
-- **Barra lateral:** bloco "Em call" com o tempo de call e o botão de sair, pra sair com o chat
-  aberto. Mudo por pessoa na lista da call e contador roxo de menções em cada canal de texto.
-- **Membros:** clicar na pessoa abre um menu com "Chamar pra call", "Mencionar" e entrar no
-  canal de voz em que ela está.
-- **Chat:** links viram botões que abrem no navegador. Arrastar arquivo pra janela e colar
-  imagem com Ctrl+V anexam. Botão "Novas mensagens" com a lista rolada pra cima, datas com
-  Hoje e Ontem e ícones no anexar e no apagar.
-- **Bandeja e avisos:** o menu da bandeja liga e desliga o mic, sai da call e tem "Não
-  incomodar por 1 h". Menção com a janela fora de foco põe um ponto vermelho no ícone. O aviso
-  de chamado tem os botões Entrar e Agora não.
-- **Voz:** som curto ao ligar e desligar o mic e o fone, que toca mesmo com o fone desligado.
-  Em Configurações › Voz: botão Testar na saída, "Ouvir minha voz" com a redução de ruído e o
-  ganho aplicados, volume geral em porcentagem e botão Padrão nos controles.
-- **Login e conexão:** botão pra mostrar a senha, contagem regressiva no bloqueio por
-  tentativas demais e na tela Offline, e Cancelar quando a conexão demora.
+- **Soundboard:** o botão de música na barra da call abre os sons do grupo. Clicar toca pra todo
+  mundo, no aplicativo e no site, e "Parar" corta o som pra todos. Um aviso mostra quem tocou o
+  quê.
+- **Subir e apagar sons:** em Configurações › Soundboard. Aceita mp3, ogg, wav, flac ou m4a, até
+  1 MB. Apagar aparece nos sons que você subiu, e em todos para administradores.
+- **Volume da soundboard por pessoa:** no painel que abre ao clicar na pessoa, separado do volume
+  da voz. Em zero, os sons dela não tocam pra você.
 
 ### Corrigido
-- **Sair e Trocar servidor perguntam antes** e avisam quando a call vai cair junto. Um clique
-  perdido apagava o login.
-- **Tentar de novo** onde antes era preciso sair e entrar: chat que não carregou, transmissão
-  que não abriu e call que não reconectou.
+- **Selo LIVE na barra lateral:** o botão de silenciar ficava por cima dele.
+- **"Parar" da transmissão assistida:** não tinha fundo e sumia em cima do vídeo.
 
 ### Interno
-- Dependência nova `arboard`, só pra ler imagem da área de transferência.
-- A cópia do `webrtc-sys` pede ao portal do Linux uma permissão que vale entre execuções, pra
-  transmitir de novo sem o seletor.
+- Dependência nova `symphonia`, que decodifica os sons.
 
 ### Limites conhecidos
-- No Linux com Wayland, arrastar arquivo pra janela não anexa. O clipe funciona.
+- Renomear e cortar os sons da soundboard continuam só no site.
+- Cada som toca por até 2 min, contados depois do corte.
+- O modo foco do site não cala a soundboard no aplicativo.
 
 ## Compilar
 
