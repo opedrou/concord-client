@@ -106,6 +106,7 @@ pub fn update(m: &mut Main, msg: Msg) -> Task<App> {
             }
             // Um painel por vez.
             (call.volume_panel, call.share_panel, call.share_menu) = (None, false, false);
+            call.board.open = false;
             call.people = Some(Panel::default());
             // Quem não está na call ainda não tem a foto baixada.
             m.fetch_avatars()

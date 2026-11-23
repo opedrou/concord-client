@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use iced::widget::image;
 use iced::{Point, Size};
 
+use super::board::Board;
 use super::drawn;
 use super::sounds::Cues;
 use crate::api::{self, Participant};
@@ -136,6 +137,8 @@ pub struct ActiveCall {
     pub volume_at: Point,
     /// Painel "Chamar pessoas" aberto.
     pub people: Option<super::people::Panel>,
+    /// Painel, sons baixados e aviso da soundboard.
+    pub board: Board,
 }
 
 /// Como a transmissão assistida aparece, como no site.
@@ -193,6 +196,7 @@ impl ActiveCall {
             cursor: Point::ORIGIN,
             volume_at: Point::ORIGIN,
             people: None,
+            board: Board::default(),
         }
     }
 
@@ -244,12 +248,17 @@ impl ActiveCall {
             || self.share_panel
             || self.share_menu
             || self.people.is_some()
+            || self.board.open
             || matches!(self.share, share::State::Choosing | share::State::Failed)
     }
 
     /// Algum painel solto sobre o palco aberto: o fundo pega o clique de fora.
     pub fn menu_open(&self) -> bool {
-        self.volume_panel.is_some() || self.share_panel || self.share_menu || self.people.is_some()
+        self.volume_panel.is_some()
+            || self.share_panel
+            || self.share_menu
+            || self.people.is_some()
+            || self.board.open
     }
 
     pub fn attach(&mut self, call: Call, engine: Engine) {

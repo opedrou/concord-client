@@ -6,14 +6,13 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, ContentFit, Element, Length, Padding, Size, Theme, border};
 
-use super::people;
 use super::sidebar::{
-    CHEVRON_UP, CLOSE, HEADPHONES, HEADPHONES_OFF, MIC, MIC_OFF, SCREEN, USER_PLUS, VOLUME,
-    VOLUME_X, icon, live_badge, tipped,
+    CHEVRON_UP, CLOSE, HEADPHONES, HEADPHONES_OFF, MIC, MIC_OFF, PHONE_OFF, SCREEN, USER_PLUS,
+    VOLUME, VOLUME_X, icon, live_badge, tipped,
 };
 use super::theme::{self, ACCENT, ACCENT2, BG, BG2, BORDER, BORDER2, DANGER, FG, FG2, GREEN, IDLE};
 use super::voice::{self, ActiveCall, GAP, Status};
-use super::{Main, Msg, avatar};
+use super::{Main, Msg, avatar, board, people};
 use crate::call::{Live, MAX_ATTEMPTS};
 use crate::config::{Config, SCREEN as SCREEN_KEY, VOLUME_PADRAO};
 use crate::share::{Quality, Source, State};
@@ -21,9 +20,12 @@ use crate::share::{Quality, Source, State};
 const ALERT: &[u8] = include_bytes!("../../assets/icons/alert-triangle.svg").as_slice();
 const VIDEO: &[u8] = include_bytes!("../../assets/icons/video.svg").as_slice();
 const MAXIMIZE: &[u8] = include_bytes!("../../assets/icons/maximize.svg").as_slice();
+const MUSIC: &[u8] = include_bytes!("../../assets/icons/music.svg").as_slice();
 
 /// Largura fixa e altura aproximada do painel de volume, pra centrar no tile.
-const PANEL: Size = Size::new(280.0, 104.0);
+const PANEL: Size = Size::new(320.0, 104.0);
+/// Coluna do rótulo de cada slider do painel de volume.
+const LABEL: f32 = 80.0;
 /// Largura do painel de qualidade.
 const SHARE_PANEL: f32 = 340.0;
 const SHARE_MENU: f32 = 230.0;
@@ -42,6 +44,9 @@ const ABOVE_BAR: f32 = 94.0;
 const BAR_ZONE: f32 = 140.0;
 /// Altura que a barra fixa da grade toma do palco: os tiles não ficam por baixo dela.
 const BAR_DOCK: f32 = 74.0;
+/// Palco mais estreito que isso (janela mínima com a lista de membros aberta): a barra aperta
+/// os espaços e o "Sair" vira ícone. A barra inteira com o "Sair" escrito pede uns 410.
+const BAR_FULL: f32 = 420.0;
 /// Espectadores desenhados no tile da transmissão: o resto vira "+N". Como no site.
 const MAX_VIEWERS: usize = 3;
 const VIEWER_FACE: f32 = 18.0;
@@ -99,8 +104,18 @@ fn overlays<'a>(
         );
     }
     layers.extend(share_overlay(call, config));
-    layers.extend(people::card(m, call).map(|card| {
+    let above_bar = |card| {
         container(opaque(card))
+            .center_x(Length::Fill)
+            .align_bottom(Length::Fill)
+            .padding(Padding::ZERO.bottom(ABOVE_BAR))
+            .into()
+    };
+    layers.extend(people::card(m, call).map(above_bar));
+    layers.extend(board::card(call).map(above_bar));
+    // O aviso não pega clique: o que está embaixo dele segue clicável.
+    layers.extend(board::notice(call).map(|line| {
+        container(line)
             .center_x(Length::Fill)
             .align_bottom(Length::Fill)
             .padding(Padding::ZERO.bottom(ABOVE_BAR))
@@ -124,11 +139,12 @@ fn with_bar<'a>(
                 .padding(Padding::ZERO.bottom(dock))
         ];
         if call.bar_visible() {
+            let compact = area.width < BAR_FULL;
             layers = layers.push(
-                container(bar(call, config))
+                container(bar(call, config, compact))
                     .center_x(Length::Fill)
                     .align_bottom(Length::Fill)
-                    .padding([12, 20]),
+                    .padding([12, if compact { 8 } else { 20 }]),
             );
         }
         // A posição serve também pro painel do botão direito abrir onde foi o clique.
@@ -178,12 +194,13 @@ fn focus<'a>(
     container(row![big, side].spacing(GAP)).padding(GAP).into()
 }
 
-/// Tamanho do painel de volume: o da transmissão tem a linha de botões a mais.
+/// Tamanho do painel de volume: o da transmissão tem a linha de botões a mais, e o da pessoa,
+/// a da soundboard.
 fn panel_size(name: &str) -> Size {
     if name.ends_with(SCREEN_KEY) {
         Size::new(PANEL.width, PANEL.height + 46.0)
     } else {
-        PANEL
+        Size::new(PANEL.width, PANEL.height + 38.0)
     }
 }
 
@@ -541,7 +558,7 @@ pub fn full<'a>(m: &'a Main, call: &'a ActiveCall, config: &'a Config) -> Elemen
     stack(layers).into()
 }
 
-fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
+fn bar<'a>(call: &'a ActiveCall, config: &'a Config, compact: bool) -> Element<'a, Msg> {
     let square = |glyph, off, msg, tip| {
         let color = if off { DANGER } else { FG2 };
         let b = button(container(icon(glyph, 20.0, color)).center(46))
@@ -611,6 +628,12 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
             .style(theme::bar_toggle(inviting))
             .on_press(Msg::People(people::Msg::Open));
     let invite = tipped(invite.into(), "Chamar pessoas");
+    let open = call.board.open;
+    let sounds = button(container(icon(MUSIC, 20.0, if open { ACCENT2 } else { FG2 })).center(46))
+        .padding(0)
+        .style(theme::bar_toggle(open))
+        .on_press(Msg::Soundboard(board::Msg::Open));
+    let sounds = tipped(sounds.into(), "Soundboard");
     let separator = container(space())
         .width(1)
         .height(28)
@@ -622,24 +645,36 @@ fn bar<'a>(call: &'a ActiveCall, config: &'a Config) -> Element<'a, Msg> {
     } else {
         ("Sair", Msg::Leave)
     };
-    let leave = button(
-        text(label)
-            .size(15)
-            .font(theme::BOLD)
-            .center()
-            .height(Length::Fill),
-    )
-    .padding([0, 20])
-    .height(46)
-    .style(theme::leave)
-    .on_press(msg);
+    let leave: Element<'_, Msg> = if compact {
+        let glyph = if closing { CLOSE } else { PHONE_OFF };
+        let b = button(container(icon(glyph, 20.0, FG)).center(46))
+            .padding(0)
+            .style(theme::leave)
+            .on_press(msg);
+        tipped(b.into(), label)
+    } else {
+        button(
+            text(label)
+                .size(15)
+                .font(theme::BOLD)
+                .center()
+                .height(Length::Fill),
+        )
+        .padding([0, 20])
+        .height(46)
+        .style(theme::leave)
+        .on_press(msg)
+        .into()
+    };
 
     container(
-        row![mic, ears, screen, invite, separator, leave]
-            .spacing(8)
+        row![mic, ears, screen, sounds, invite]
+            .push((!compact).then_some(separator))
+            .push(leave)
+            .spacing(if compact { 4 } else { 8 })
             .align_y(Alignment::Center),
     )
-    .padding([8, 10])
+    .padding([8, if compact { 6 } else { 10 }])
     .style(theme::bar)
     .into()
 }
@@ -1074,9 +1109,30 @@ fn percent(slider: u8) -> String {
     format!("{}%", (gain * 100.0).round())
 }
 
+/// Mudo, rótulo, slider e percentual de uma chave de volume.
+fn volume_line<'a>(config: &Config, key: String, label: &'a str) -> Row<'a, Msg> {
+    let volume = config.volume_of(&key);
+    let mute = mute_button(&key, volume == 0);
+    let level = slider(0..=100u8, volume, move |v| Msg::Volume(key.clone(), v))
+        .on_release(Msg::VolumeDone)
+        .width(Length::Fill);
+    row![
+        mute,
+        // Largura fixa: os dois sliders da pessoa começam no mesmo ponto.
+        text(label).size(13).color(FG2).width(LABEL),
+        level,
+        text(percent(volume))
+            .size(13)
+            .color(FG2)
+            .width(42)
+            .align_x(Alignment::End),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+}
+
 /// Volume de uma pessoa. Fecha no X, no Escape ou com um clique fora (`overlays`).
 fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> Element<'a, Msg> {
-    let volume = config.volume_of(name);
     let screen = name.ends_with(SCREEN_KEY);
     let close = button(container(icon(CLOSE, 16.0, FG2)).center(28))
         .padding(0)
@@ -1095,24 +1151,13 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
     ]
     .align_y(Alignment::Center);
 
-    let owned = name.to_owned();
-    let level = slider(0..=100u8, volume, move |v| Msg::Volume(owned.clone(), v))
-        .on_release(Msg::VolumeDone)
-        .width(Length::Fill);
-    let line = row![
-        mute_button(name, volume == 0),
-        text(if screen { "Transmissão" } else { "Voz" })
-            .size(13)
-            .color(FG2),
-        level,
-        text(percent(volume))
-            .size(13)
-            .color(FG2)
-            .width(42)
-            .align_x(Alignment::End),
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center);
+    let line = volume_line(
+        config,
+        name.to_owned(),
+        if screen { "Transmissão" } else { "Voz" },
+    );
+    // Da pessoa: os sons que ela toca na soundboard, num volume à parte, como no site.
+    let sounds = (!screen).then(|| volume_line(config, Config::soundboard_key(name), "Soundboard"));
 
     // Da transmissão assistida: tela cheia completa e parar, só por aqui.
     let watched = call
@@ -1137,7 +1182,7 @@ fn volume_card<'a>(call: &'a ActiveCall, config: &'a Config, name: &'a str) -> E
     });
 
     let ring = if call.speaking(name) { ACCENT } else { BORDER };
-    container(column![head, line].push(actions).spacing(10))
+    container(column![head, line].push(sounds).push(actions).spacing(10))
         .width(PANEL.width)
         .padding(12)
         .style(floating(ring))
@@ -1154,6 +1199,13 @@ mod tests {
         assert_eq!(percent(71), "100%");
         assert_eq!(percent(100), "200%");
         assert_eq!(percent(50), "50%");
+    }
+
+    #[test]
+    fn rotulos_de_volume_cabem_na_coluna() {
+        for label in ["Voz", "Transmissão", "Soundboard"] {
+            assert!(text_width(label, 13.0) <= LABEL, "{label}");
+        }
     }
 
     #[test]

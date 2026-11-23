@@ -1,5 +1,6 @@
 //! Telas e estado do app. A rede roda em `Task`; o resto é síncrono.
 mod avatar;
+mod board;
 mod chat;
 mod drawn;
 mod members;
@@ -428,6 +429,8 @@ pub enum Msg {
     People(people::Msg),
     /// Menu de uma pessoa na lista de membros.
     Member(members::Msg),
+    /// Painel e sons da soundboard.
+    Soundboard(board::Msg),
 }
 
 /// O que a pessoa fez, pro log: cliques e escolhas, nunca texto digitado nem título de
@@ -503,6 +506,7 @@ fn action(msg: &Msg) -> Option<String> {
         ),
         Msg::People(msg) => return people::action(msg),
         Msg::Member(msg) => return members::action(msg),
+        Msg::Soundboard(msg) => return board::action(msg),
         _ => return None,
     })
 }
@@ -983,6 +987,7 @@ impl App {
             Msg::JoinChannel(slug) => self.join_channel(slug),
             Msg::EngineStarted(id, result) => self.engine_started(id, result),
             Msg::CallEvent(id, event) => self.call_event(id, event),
+            Msg::Soundboard(msg) => self.soundboard(msg),
             Msg::Frame(now) => {
                 if let Some(call) = self.call_mut() {
                     call.tick(now);
@@ -1000,6 +1005,7 @@ impl App {
                     call.volume_at = call.cursor;
                     call.share_panel = false;
                     call.share_menu = false;
+                    call.board.open = false;
                 }
                 Task::none()
             }
@@ -1053,6 +1059,7 @@ impl App {
                 call.share_panel = true;
                 call.share_menu = false;
                 call.volume_panel = None;
+                call.board.open = false;
                 read_sources(call)
             }
             Msg::ShareSources(sources) => {
@@ -1695,6 +1702,13 @@ impl App {
         self.persist();
     }
 
+    fn soundboard(&mut self, msg: board::Msg) -> Task<Msg> {
+        match &mut self.screen {
+            Screen::Main(m) => board::update(m, &self.config, msg),
+            _ => Task::none(),
+        }
+    }
+
     /// Som fora da call: pelo motor aberto (call ou teste da aba Voz), senão abre só a saída.
     fn chime(&self, effect: Effect) {
         if cfg!(test) {
@@ -1826,6 +1840,7 @@ impl App {
             call.share_panel = false;
             call.share_menu = false;
             call.people = None;
+            call.board.open = false;
         }
     }
 
@@ -1938,7 +1953,10 @@ impl App {
             call::Event::ShareAudio(view) => active.set_share_audio(view),
             call::Event::Viewers(viewers) => active.viewers = viewers,
             call::Event::Preview(identity, picture) => active.set_preview(identity, picture),
-            call::Event::Sound { .. } | call::Event::SoundStop => {}
+            call::Event::Sound { by, sound } => {
+                return self.soundboard(board::Msg::Heard(id, by, sound));
+            }
+            call::Event::SoundStop => return self.soundboard(board::Msg::Stopped(id)),
             call::Event::Ended(end) => return self.call_ended(end),
         }
         Task::none()
@@ -3840,6 +3858,91 @@ mod tests {
         assert!(!call_of(&mut a).share_menu);
     }
 
+    fn som(id: i64, name: &str) -> api::Sound {
+        api::Sound {
+            id,
+            name: name.into(),
+            url: format!("/api/sounds/{id}?v=s{id}.mp3"),
+            trim_start: 0.0,
+            trim_end: None,
+        }
+    }
+
+    fn tocou(a: &mut App, by: &str, sound: api::Sound) -> usize {
+        let id = call_id(a);
+        a.update(Msg::CallEvent(
+            id,
+            call::Event::Sound {
+                by: by.into(),
+                sound,
+            },
+        ))
+        .units()
+    }
+
+    #[test]
+    fn soundboard_clique_avisa_baixa_e_espera_o_cooldown() {
+        let mut a = in_call(&["Opedro", "Ana"]);
+        let _ = a.update(Msg::Soundboard(board::Msg::Open));
+        assert!(call_of(&mut a).board.open && call_of(&mut a).menu_open());
+        let _ = a.update(Msg::CloseVolume);
+        assert!(!call_of(&mut a).board.open, "clicar fora fecha");
+
+        let t = a.update(Msg::Soundboard(board::Msg::Play(som(1, "buzina"))));
+        assert_eq!(t.units(), 2, "baixa o som e agenda o fim do aviso");
+        let aviso = |a: &mut App| call_of(a).board.notice.clone();
+        assert_eq!(aviso(&mut a).as_deref(), Some("Você tocou buzina"));
+        let t = a.update(Msg::Soundboard(board::Msg::Play(som(2, "sino"))));
+        assert_eq!(t.units(), 0, "segundo clique em 800 ms não vai");
+        assert_eq!(aviso(&mut a).as_deref(), Some("Você tocou buzina"));
+
+        let _ = a.update(Msg::Soundboard(board::Msg::Stop));
+        assert_eq!(aviso(&mut a), None, "parar tira o aviso");
+    }
+
+    #[test]
+    fn soundboard_som_da_sala_respeita_cooldown_volume_e_cache() {
+        let mut a = in_call(&["Opedro", "Ana", "Bia", "Caio"]);
+        let id = call_id(&mut a);
+        assert_eq!(tocou(&mut a, "Ana", som(1, "buzina")), 2, "baixa e avisa");
+        assert_eq!(
+            call_of(&mut a).board.notice.as_deref(),
+            Some("Ana tocou buzina")
+        );
+        assert_eq!(tocou(&mut a, "Ana", som(2, "sino")), 0, "cooldown da Ana");
+
+        // Baixado uma vez, o mesmo som não desce de novo.
+        let pcm: std::sync::Arc<[i16]> = vec![100; 480].into();
+        let key = board::key(&som(1, "buzina"));
+        let _ = a.update(Msg::Soundboard(board::Msg::Ready(id, key, Ok(pcm), 1.0)));
+        assert_eq!(
+            tocou(&mut a, "Bia", som(1, "buzina")),
+            1,
+            "do cache, só o aviso"
+        );
+
+        // Soundboard da pessoa em zero: avisa, como o site, mas nem baixa.
+        a.config.volumes.insert(Config::soundboard_key("Caio"), 0);
+        assert_eq!(tocou(&mut a, "Caio", som(3, "apito")), 1);
+        assert_eq!(
+            call_of(&mut a).board.notice.as_deref(),
+            Some("Caio tocou apito")
+        );
+
+        // O aviso velho não apaga o novo; o último apaga.
+        let _ = a.update(Msg::Soundboard(board::Msg::Expire(id, 1)));
+        assert!(call_of(&mut a).board.notice.is_some());
+        let _ = a.update(Msg::Soundboard(board::Msg::Expire(id, 3)));
+        assert!(call_of(&mut a).board.notice.is_none());
+
+        let _ = tocou(&mut a, "Opedro", som(4, "x"));
+        let _ = a.update(Msg::CallEvent(id, call::Event::SoundStop));
+        assert!(
+            call_of(&mut a).board.notice.is_none(),
+            "parar de outro tira o aviso"
+        );
+    }
+
     #[test]
     fn clicar_fora_fecha_qualquer_painel() {
         let mut a = in_call(&["Ana"]);
@@ -4817,6 +4920,44 @@ mod tests {
         print(&a, "palco-surdo-volume");
         a.config.volumes.insert("Ana".into(), 100);
         print(&a, "palco-volume-200");
+
+        // Soundboard: painel com os sons e o aviso de quem tocou, vazio, com erro, o aviso com
+        // o painel fechado e o volume da soundboard no cartão da pessoa.
+        let (mut a, id) = palco(4);
+        let _ = a.update(Msg::Soundboard(board::Msg::Open));
+        let sons = [
+            "aplausos",
+            "buzina",
+            "grilo",
+            "nome comprido demais pra caber num botão",
+            "risada",
+            "sino",
+            "tambor",
+            "uau",
+        ]
+        .iter()
+        .zip(1..)
+        .map(|(nome, i)| som(i, nome))
+        .collect();
+        let _ = a.update(Msg::Soundboard(board::Msg::Listed(id, Ok(sons))));
+        let _ = tocou(&mut a, "Ana", som(2, "buzina"));
+        print(&a, "palco-soundboard");
+        print_at(
+            &a,
+            "palco-soundboard-janela-minima",
+            Size::new(860.0, 560.0),
+        );
+        let _ = a.update(Msg::Soundboard(board::Msg::Listed(id, Ok(Vec::new()))));
+        print(&a, "palco-soundboard-vazio");
+        let erro = Err("Offline".to_owned());
+        let _ = a.update(Msg::Soundboard(board::Msg::Listed(id, erro)));
+        print(&a, "palco-soundboard-erro");
+        let _ = a.update(Msg::CloseVolume);
+        print(&a, "palco-soundboard-aviso");
+        let _ = a.update(Msg::OpenVolume("Ana".into()));
+        a.config.volumes.insert("Ana".into(), 40);
+        a.config.volumes.insert(Config::soundboard_key("Ana"), 0);
+        print(&a, "palco-volume-soundboard");
 
         // Avisos da web: selo de quem não me ouve, gravação e conexão instável (no meu tile).
         let (mut a, id) = palco(4);
