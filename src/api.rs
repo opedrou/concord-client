@@ -9,6 +9,8 @@ use serde_json::json;
 const MAX_JSON: usize = 2 * 1024 * 1024;
 /// Mesmo teto do upload no servidor (`MAX_AVATAR_BYTES`).
 const MAX_AVATAR: usize = 5 * 1024 * 1024;
+/// Mesmo teto do upload de som no servidor (`MAX_SOUND_BYTES`).
+const MAX_SOUND: usize = 1024 * 1024;
 
 /// Senha ou cookie. O `Debug` não mostra o valor, pra nunca cair em log.
 #[derive(Clone, PartialEq)]
@@ -143,6 +145,19 @@ pub struct Page {
     /// Em ordem cronológica.
     pub messages: Vec<Message>,
     pub has_more: bool,
+}
+
+/// Som da soundboard, na lista do servidor. O corte é em segundos, e `trim_end` `None` vai
+/// até o fim do arquivo.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Sound {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub trim_start: f64,
+    pub trim_end: Option<f64>,
 }
 
 /// Recibo do upload. Volta inteiro no POST da mensagem.
@@ -474,6 +489,21 @@ impl Client {
         read_limited(check(resp.map_err(|_| Error::Offline)?)?, max).await
     }
 
+    /// Sons da soundboard, em ordem de nome.
+    pub async fn sounds(&self) -> Result<Vec<Sound>, Error> {
+        self.json("/api/sounds").await
+    }
+
+    /// Bytes de um som. `url` vem de outro participante, pela sala: só caminho de som passa,
+    /// senão o cookie iria pra onde ele quisesse.
+    pub async fn sound(&self, url: &str) -> Result<Vec<u8>, Error> {
+        if !is_server_path(url, "/api/sounds/") {
+            return Err(Error::NotConcord);
+        }
+        let resp = self.get(url).send().await.map_err(|_| Error::Offline)?;
+        read_limited(check(resp)?, MAX_SOUND).await
+    }
+
     /// SSE do canal, já com a resposta 200: a partir daqui o servidor entrega os eventos.
     pub async fn message_stream(&self, channel: i64) -> Result<Response, Error> {
         self.event_stream(&format!("/api/channels/{channel}/messages/stream"))
@@ -732,6 +762,25 @@ mod tests {
             "/api/attachments/../auth/me",
             "/api/attachments/"
         ));
+    }
+
+    #[test]
+    fn som_le_a_lista_do_site_e_nunca_sai_do_servidor() {
+        let lista: Vec<Sound> = serde_json::from_str(
+            r#"[{"id":3,"name":"buzina","url":"/api/sounds/3?v=ab.mp3","size":9000,
+                "uploadedBy":null,"createdAt":"2026-11-20","trimStart":0.5,"trimEnd":null},
+               {"id":4,"name":"x","url":"/api/sounds/4?v=c.ogg","size":1,"uploadedBy":2,
+                "createdAt":"2026-11-21","trimStart":0,"trimEnd":1.25}]"#,
+        )
+        .unwrap();
+        assert_eq!((lista[0].trim_start, lista[0].trim_end), (0.5, None));
+        assert_eq!(lista[1].trim_end, Some(1.25));
+        let pasta = "/api/sounds/";
+        assert!(is_server_path("/api/sounds/3?v=ab.mp3", pasta));
+        assert!(!is_server_path("https://evil.com/api/sounds/3", pasta));
+        assert!(!is_server_path("//evil.com/api/sounds/3", pasta));
+        assert!(!is_server_path("/api/avatars/3?v=a.png", pasta));
+        assert!(!is_server_path("/api/sounds/../auth/me", pasta));
     }
 
     #[test]
