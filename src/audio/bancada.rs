@@ -1436,3 +1436,231 @@ fn bancada_retorno() {
     assert!(pico_entrada < 0.001, "surdo não ouve a entrada");
     assert!(razao.abs() < 1.0, "{razao:.2} dB");
 }
+
+/// Próxima linha do Chrome que começa com `prefixo`; as outras só vão pro relatório.
+async fn web_diz(
+    linhas: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    prefixo: &str,
+) -> String {
+    loop {
+        let linha = tokio::time::timeout(Duration::from_secs(90), linhas.recv())
+            .await
+            .unwrap_or_else(|_| panic!("o Chrome não disse {prefixo}"))
+            .unwrap_or_else(|| panic!("o Chrome saiu antes de dizer {prefixo}"));
+        if linha.starts_with(prefixo) {
+            return linha;
+        }
+    }
+}
+
+/// Próximo evento da call que passa em `f`.
+async fn evento(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<crate::call::Event>,
+    f: impl Fn(&crate::call::Event) -> bool,
+) -> crate::call::Event {
+    loop {
+        let e = tokio::time::timeout(Duration::from_secs(30), events.recv())
+            .await
+            .expect("evento da call")
+            .expect("a call acabou");
+        if f(&e) {
+            return e;
+        }
+    }
+}
+
+/// Só o nó de saída do cpal toca no fone falso: nada do Chrome, que fica mudo.
+fn so_o_cpal_no_fone(links: &str) -> bool {
+    let mut dono = "";
+    let mut cpal = false;
+    for linha in links.lines() {
+        if !linha.starts_with(' ') {
+            dono = linha;
+        } else if linha.contains("bancada_fone:playback") {
+            if !dono.starts_with("cpal-pulseaudio-") {
+                return false;
+            }
+            cpal = true;
+        }
+    }
+    cpal
+}
+
+/// Soundboard nos dois sentidos, com o site local e o Chrome na sala de teste: o app sobe um
+/// som pela API, o Chrome corta e toca, o som sai no fone falso e o "Parar" do Chrome corta;
+/// depois o Chrome vê o aviso do som que o app toca e ele sumir no "Parar" do app; no fim o
+/// app apaga o som. Uso, com o `npm run dev` do site:
+/// `CONCORD_URL=... CONCORD_USER=... CONCORD_PASS=... CONCORD_ROOM=... CONCORD_BANCADA=...
+/// src/audio/bancada.sh bancada_soundboard`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "precisa do PipeWire próprio e do site local: src/audio/bancada.sh"]
+async fn bancada_soundboard() {
+    use crate::api::{Client, Secret};
+    use crate::call::{Call, Event};
+    use std::io::{BufRead, BufReader, Write};
+
+    let raiz = std::env::var("BANCADA_RAIZ").expect("rode por src/audio/bancada.sh");
+    let var = |n: &str| std::env::var(n).unwrap_or_else(|_| panic!("faltou {n}"));
+    let out = std::env::var("OUT").unwrap_or_else(|_| raiz.clone());
+    let base = var("CONCORD_URL");
+    let cookie = Client::new(&base, None)
+        .login(&var("CONCORD_USER"), &Secret(var("CONCORD_PASS")))
+        .await
+        .expect("login");
+    let client = Client::new(&base, Some(cookie));
+
+    // Sobra de uma volta que caiu no meio.
+    for velho in client.sounds().await.unwrap() {
+        if velho.name == "bancada-tom" {
+            client.delete_sound(velho.id).await.unwrap();
+        }
+    }
+    // 6 s de lá (880 Hz) a -12 dBFS, subidos pelo app como pela aba Soundboard.
+    let arquivo = format!("{raiz}/bancada-tom.ogg");
+    let tom = "aevalsrc=0.25*sin(2*PI*880*t)|0.25*sin(2*PI*880*t):s=44100:d=6";
+    let gerou = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            tom,
+        ])
+        .args(["-c:a", "libvorbis", "-q:a", "0", &arquivo])
+        .status()
+        .expect("ffmpeg");
+    assert!(gerou.success());
+    let subido = client
+        .upload_sound("bancada-tom", fs::read(&arquivo).unwrap())
+        .await
+        .expect("subir");
+    let lista = client.sounds().await.unwrap();
+    assert!(
+        lista
+            .iter()
+            .any(|s| s.id == subido.id && s.name == "bancada-tom")
+    );
+    println!(
+        "SOUNDBOARD subiu pelo app: som {} no GET /api/sounds",
+        subido.id
+    );
+
+    let mut rig = Rig::new();
+    // Saída própria pro Chrome (`PULSE_SINK`): no fone falso, só o que o app toca.
+    rig.load(
+        "module-null-sink sink_name=bancada_web channels=2 rate=48000 \
+         sink_properties=device.description=BancadaWeb",
+    );
+    let (engine, mic) = Engine::start(prefs(NoiseLevel::Off)).expect("start");
+    // O mic falso do Chrome bipa, e a voz dele sairia no fone: fica em zero, a soundboard não.
+    engine.set_person_volume(&var("CONCORD_USER"), 0);
+    let (call, mut events) = Call::join(
+        client.clone(),
+        var("CONCORD_ROOM"),
+        "bancada-som".into(),
+        engine.clone(),
+        mic,
+        true,
+    );
+    evento(&mut events, |e| matches!(e, Event::Connected)).await;
+
+    let mut web = Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/audio/soundboard.mjs"
+        ))
+        .env("OUT", &out)
+        .env("SOM_ID", subido.id.to_string())
+        .env("PULSE_SINK", "bancada_web")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("node");
+    let mut ordem = web.stdin.take().unwrap();
+    let saida = web.stdout.take().unwrap();
+    let (tx, mut linhas) = tokio::sync::mpsc::unbounded_channel();
+    thread::spawn(move || {
+        for linha in BufReader::new(saida).lines().map_while(Result::ok) {
+            println!("{linha}");
+            let _ = tx.send(linha);
+        }
+    });
+    let corte = web_diz(&mut linhas, "WEB CORTOU").await;
+    assert!(corte.ends_with("200"), "{corte}");
+    web_diz(&mut linhas, "WEB NA SALA").await;
+
+    // Site -> app: o evento chega com o corte, o app baixa, decodifica e toca no fone.
+    writeln!(ordem, "tocar").unwrap();
+    let Event::Sound { by, sound } =
+        evento(&mut events, |e| matches!(e, Event::Sound { .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (sound.id, sound.trim_start, sound.trim_end),
+        (subido.id, 0.5, Some(5.5))
+    );
+    let bytes = client.sound(&sound.url).await.expect("baixar");
+    let pcm =
+        crate::soundboard::decode(bytes, sound.trim_start, sound.trim_end).expect("decodificar");
+    let segundos = pcm.len() as f64 / RATE as f64;
+    let capture = Capture::start("bancada_fone.monitor");
+    thread::sleep(Duration::from_millis(300));
+    capture.reset();
+    engine.sound(pcm.clone(), 1.0);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let tocando = capture.rms();
+    let links = Command::new("pw-link").arg("-l").output().expect("pw-link");
+    let links = String::from_utf8_lossy(&links.stdout).into_owned();
+    // O nome de quem tocou é o usuário da bancada: confere sem imprimir.
+    let quem = by == var("CONCORD_USER");
+    println!(
+        "SOUNDBOARD site -> app: tocou {} (quem tocou confere: {quem}; {segundos:.2} s depois \
+         do corte); fone rms {tocando:.4}\n{links}",
+        sound.name
+    );
+    assert!(quem);
+    assert!((4.95..5.05).contains(&segundos), "{segundos} s");
+    assert!(tocando > 0.1, "fone rms {tocando}");
+    assert!(so_o_cpal_no_fone(&links), "quem toca no fone:\n{links}");
+
+    // "Parar" do Chrome: o som para no meio, antes dos 5 s dele.
+    writeln!(ordem, "parar").unwrap();
+    evento(&mut events, |e| matches!(e, Event::SoundStop)).await;
+    engine.stop_sounds();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    capture.reset();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let parado = capture.rms();
+    println!("SOUNDBOARD parar do site: fone rms {parado:.5}");
+    assert!(parado < 0.005, "fone rms {parado}");
+
+    // App -> site: o Chrome vê o aviso e ele some no "Parar" do app.
+    writeln!(ordem, "ouvir").unwrap();
+    call.play_sound(&sound);
+    engine.sound(pcm, 1.0);
+    web_diz(&mut linhas, "WEB VIU").await;
+    call.stop_sounds();
+    engine.stop_sounds();
+    let sumiu = web_diz(&mut linhas, "WEB AVISO SUMIU EM").await;
+    let ms: u64 = sumiu.split_whitespace().nth(4).unwrap().parse().unwrap();
+    println!("SOUNDBOARD app -> site: aviso no Chrome, e sumiu {ms} ms depois do parar do app");
+    assert!(ms < 2000, "o aviso só sumiu pelo tempo dele: {ms} ms");
+    web_diz(&mut linhas, "WEB OK").await;
+    // Sem a entrada fechada, o node segue esperando ordem.
+    drop(ordem);
+    assert!(web.wait().unwrap().success());
+
+    client.delete_sound(subido.id).await.expect("apagar");
+    let lista = client.sounds().await.unwrap();
+    assert!(!lista.iter().any(|s| s.id == subido.id));
+    println!(
+        "SOUNDBOARD apagou pelo app: som {} saiu do GET /api/sounds",
+        subido.id
+    );
+    call.leave();
+    evento(&mut events, |e| matches!(e, Event::Ended(_))).await;
+}
