@@ -309,19 +309,28 @@ fn occupant<'a>(
     .spacing(8)
     .align_y(Alignment::Center);
     let line = container(line).padding([0, 6]).width(Length::Fill);
+    // Largura dos selos com o espaço antes deles. Estimada: o iced não diz quanto ocupou.
+    let selos = [screen_share, camera, muted].map(|b| if b { 1.0 } else { 0.0 });
+    let selos_w = selos[0] * 38.0 + (selos[1] + selos[2]) * 18.0;
     let line: Element<'_, Msg> = if mutable {
         // Mesmo botão do tile: aparece no hover e fica fixo enquanto a pessoa está mutada.
+        // Encosta à esquerda dos selos, senão cobre o LIVE de quem transmite.
         let silenced = config.volume_of(name) == 0;
-        let corner =
-            container(
-                container(stage::mute_button(name, silenced)).style(|_| container::Style {
+        let corner = container(
+            container(stage::mute_button(name, silenced))
+                .id(format!("mudo-{name}"))
+                .style(|_| container::Style {
                     background: Some(BG3.into()),
                     border: border::rounded(9),
                     ..Default::default()
                 }),
-            )
-            .align_right(Length::Fill)
-            .center_y(Length::Fill);
+        )
+        .align_right(Length::Fill)
+        .center_y(Length::Fill)
+        .padding(Padding {
+            right: 6.0 + selos_w,
+            ..Padding::ZERO
+        });
         if silenced {
             stack![line, corner].into()
         } else {
@@ -332,8 +341,7 @@ fn occupant<'a>(
     };
     // Largura do nome: sidebar menos seção e coluna (16 + 32), padding (12), avatar (24),
     // os dois espaços (16) e os selos.
-    let selos = [screen_share, camera, muted].map(|b| if b { 1.0 } else { 0.0 });
-    let room = config.sidebar_width - 100.0 - selos[0] * 38.0 - (selos[1] + selos[2]) * 18.0;
+    let room = config.sidebar_width - 100.0 - selos_w;
     if cut(name, 13.6, room) {
         tipped(line, name)
     } else {

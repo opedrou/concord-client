@@ -3118,6 +3118,77 @@ mod tests {
         assert_eq!(ui.typewrite("f"), event::Status::Captured, "campo com foco");
     }
 
+    fn simulador(a: &App) -> iced_test::simulator::Simulator<'_, Msg> {
+        let settings = iced::Settings {
+            fonts: theme::FONTS.map(Into::into).to_vec(),
+            default_font: theme::BODY,
+            ..iced::Settings::default()
+        };
+        iced_test::simulator::Simulator::with_size(
+            settings,
+            iced::Size::new(1200.0, 760.0),
+            a.view(),
+        )
+    }
+
+    /// Na sidebar, o mudo da pessoa encosta à esquerda dos selos. Antes ficava por cima e
+    /// cobria o LIVE de quem transmite. Mutada, o botão fica fixo, sem precisar de hover.
+    #[test]
+    fn mudo_da_sidebar_nao_cobre_o_live() {
+        use iced_test::selector::Candidate;
+
+        let mut a = in_call(&["Ana"]);
+        let id = call_id(&mut a);
+        let mut ana = voice::test_live("Ana", false);
+        ana.screen_share = true;
+        ana.camera = true;
+        ana.muted = true;
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(vec![ana])));
+        let _ = a.update(Msg::MutePerson("Ana".into()));
+        let largura = a.config.sidebar_width;
+        let mut ui = simulador(&a);
+        let live = ui
+            .find(move |c: Candidate<'_>| match c {
+                Candidate::Text {
+                    content: "LIVE",
+                    bounds,
+                    ..
+                } if bounds.x < largura => Some(bounds),
+                _ => None,
+            })
+            .expect("LIVE na sidebar");
+        let mudo = ui
+            .find(iced::widget::Id::from("mudo-Ana".to_owned()))
+            .expect("mudo da Ana")
+            .bounds();
+        assert!(
+            mudo.x + mudo.width <= live.x,
+            "o mudo {mudo:?} cobre o LIVE {live:?}"
+        );
+    }
+
+    /// Assistindo, o Parar fica na pílula da tela cheia e do mudo. Solto, sem fundo, sumia
+    /// em cima do vídeo.
+    #[test]
+    fn parar_assistindo_fica_na_pilula() {
+        let mut a = in_call(&["Carla"]);
+        let id = call_id(&mut a);
+        let mut carla = voice::test_live("Carla", false);
+        carla.screen_share = true;
+        let _ = a.update(Msg::CallEvent(id, call::Event::Participants(vec![carla])));
+        let _ = a.update(Msg::Watch(Some("Carla__1".into())));
+        let mut ui = simulador(&a);
+        let pilula = ui
+            .find(iced::widget::Id::new("ferramentas-assistindo"))
+            .expect("pílula do canto")
+            .bounds();
+        let parar = ui.find("Parar").expect("Parar").bounds();
+        assert!(
+            parar.is_within(&pilula),
+            "o Parar {parar:?} fica fora da pílula {pilula:?}"
+        );
+    }
+
     fn chamado(channel: &str) -> Msg {
         Msg::Notified(Live::Event(NotifyEvent::Call {
             caller: "Ana".into(),
@@ -5019,6 +5090,9 @@ mod tests {
         print(&a, "tela-assistindo");
         a.config.volumes.insert(Config::screen_key("Carla"), 0);
         print(&a, "tela-assistindo-mudo");
+        // Carla mutada pra mim: o botão fixo na sidebar fica à esquerda do LIVE.
+        let _ = a.update(Msg::MutePerson("Carla".into()));
+        print(&a, "sidebar-mudo-live");
 
         let mut a = voice_app();
         let _ = a.update(Msg::JoinChannel("call".into()));

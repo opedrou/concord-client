@@ -432,16 +432,24 @@ fn screen_tile<'a>(
             .padding(0)
             .style(theme::ghost)
             .on_press(Msg::Fullscreen);
+        // O Parar vai na mesma pílula: solto, sem fundo, sumia em cima do vídeo.
         let tools = container(
             row![
                 tipped(full.into(), "Tela cheia"),
-                mute_button(&key, silenced)
+                mute_button(&key, silenced),
+                stop
             ]
-            .spacing(2),
+            .spacing(2)
+            .align_y(Alignment::Center),
         )
+        .id("ferramentas-assistindo")
+        .padding(Padding {
+            right: 4.0,
+            ..Padding::ZERO
+        })
         .style(theme::pill);
         body = body.push(
-            container(row![tools, stop].spacing(8).align_y(Alignment::Center))
+            container(tools)
                 .align_right(Length::Fill)
                 .align_top(Length::Fill)
                 .padding(10),
