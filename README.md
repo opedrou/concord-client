@@ -4,30 +4,34 @@ Cliente desktop nativo do [Concord](https://github.com/opedrou/concord), em Rust
 Linux. Entra nas mesmas salas do site e aponta para qualquer servidor Concord: o endereço é
 escolhido na primeira abertura.
 
-**Versão atual: v0.1.18.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
+**Versão atual: v0.1.19.** Baixe na [última release](https://github.com/opedrou/concord-client/releases/latest).
 
 ## O que já faz
 
 - **Voz:** microfone com cancelamento de eco, limitador de voz automático ou manual,
   sensibilidade e ganho de entrada. Volume e botão de silenciar por pessoa, troca de dispositivo no meio da call, e
   o fone que cai volta sozinho quando reconecta. Avisa quem não está te ouvindo, call sendo
-  gravada e conexão instável.
+  gravada e conexão instável. Em Configurações › Voz dá pra testar a saída e ouvir a própria
+  voz sem entrar numa call. Atalhos: Ctrl+Shift+M liga e desliga o mic, Ctrl+Shift+D o fone.
 - **Transmitir a tela:** tela inteira ou janela, com o som do que está tocando, em estéreo. Dá
   pra trocar a tela e ligar ou desligar o áudio sem parar a transmissão, com prévia do que está
-  saindo.
+  saindo. A última tela fica lembrada e pode ser transmitida de novo sem o seletor.
 - **Assistir** a transmissão dos outros, com o som, também de quem transmite pelo site, vendo
-  quem mais está assistindo.
+  quem mais está assistindo. Duplo clique ou `F` alterna a tela cheia.
 - **Câmera dos outros** no tile de voz, no lugar da foto.
-- **Chat de texto** nos canais de texto, em tempo real, com anexos. O `@` tem autocompletar
+- **Chat de texto** nos canais de texto, em tempo real, com anexos pelo clipe, arrastando o
+  arquivo ou colando imagem com Ctrl+V. Links abrem no navegador. O `@` tem autocompletar
   (setas e Tab) e a menção aparece destacada em roxo.
 - **Lista de membros** à direita, com quem está online e quem está em cada canal de voz.
-  Minimiza no botão de duas pessoas.
+  Clicar na pessoa chama pra call, menciona no chat ou entra no canal de voz dela. Minimiza no
+  botão de duas pessoas.
 - **Notificações:** aviso do sistema com som quando alguém te chama pra call (botão "Chamar
   pessoas", no app ou no site) ou te marca com `@`. Clicar no aviso abre a call ou o chat.
 - **Fica na bandeja:** o X fecha a janela e o Concord segue recebendo avisos. Ele também pode
   abrir junto com o computador, em segundo plano. As duas opções ficam em Configurações ›
-  Notificações.
-- **Sons** de entrar, sair e começar a transmitir.
+  Notificações. O menu da bandeja liga e desliga o mic, sai da call e silencia os avisos por
+  1 h.
+- **Sons** de entrar, sair, começar a transmitir e ligar ou desligar o mic e o fone.
 - **Atualiza sozinho:** confere versão nova a cada 15 min, e a seta verde reinicia na nova. O
   arquivo baixado é conferido pelo SHA-256 da release, e se a versão nova não abrir o app volta
   pra anterior. Em Configurações › Sobre dá pra procurar atualização na hora.
@@ -77,17 +81,50 @@ o seletor de tela do sistema (xdg-desktop-portal).
   chamado.
 - No Linux, a bandeja precisa da extensão AppIndicator, que já vem no Ubuntu. Sem ela, o X
   fecha o app.
+- No Linux com Wayland, arrastar arquivo pra janela não anexa. O clipe funciona.
 
-## Novidades da v0.1.18
+## Novidades da v0.1.19
 
 ### Novo
-- **Silenciar alguém com um clique:** na call, o quadro de cada pessoa tem um botão de
-  alto-falante no canto. Ele aparece com o mouse em cima e fica vermelho enquanto ela está
-  silenciada. Clicar de novo volta no volume de antes. O painel de volume (clique direito)
-  ganhou o mesmo botão.
+- **Transmitir de novo a mesma tela:** o painel de transmitir lembra a última tela ou janela e
+  oferece "Transmitir de novo", sem passar pelo seletor. "Escolher outra" abre o seletor. No
+  Linux, se a permissão do sistema venceu, ele pergunta de novo.
+- **Tela inicial com quem está em voz:** os canais de voz com gente aparecem com os rostos e
+  um Entrar, e há um atalho pra voltar ao último canal.
+- **Atalhos:** Ctrl+Shift+M liga e desliga o mic, Ctrl+Shift+D o fone, e `F` alterna a tela
+  cheia da transmissão assistida. Os atalhos não disparam enquanto você digita.
+- **Na call:** a barra de controles fica sempre visível na grade. Clicar na pessoa abre o
+  volume, agora com a porcentagem. Duplo clique na transmissão liga e desliga a tela cheia, e
+  o quadro dela ganhou os botões de tela cheia e de mudo.
+- **Barra lateral:** bloco "Em call" com o tempo de call e o botão de sair, pra sair com o chat
+  aberto. Mudo por pessoa na lista da call e contador roxo de menções em cada canal de texto.
+- **Membros:** clicar na pessoa abre um menu com "Chamar pra call", "Mencionar" e entrar no
+  canal de voz em que ela está.
+- **Chat:** links viram botões que abrem no navegador. Arrastar arquivo pra janela e colar
+  imagem com Ctrl+V anexam. Botão "Novas mensagens" com a lista rolada pra cima, datas com
+  Hoje e Ontem e ícones no anexar e no apagar.
+- **Bandeja e avisos:** o menu da bandeja liga e desliga o mic, sai da call e tem "Não
+  incomodar por 1 h". Menção com a janela fora de foco põe um ponto vermelho no ícone. O aviso
+  de chamado tem os botões Entrar e Agora não.
+- **Voz:** som curto ao ligar e desligar o mic e o fone, que toca mesmo com o fone desligado.
+  Em Configurações › Voz: botão Testar na saída, "Ouvir minha voz" com a redução de ruído e o
+  ganho aplicados, volume geral em porcentagem e botão Padrão nos controles.
+- **Login e conexão:** botão pra mostrar a senha, contagem regressiva no bloqueio por
+  tentativas demais e na tela Offline, e Cancelar quando a conexão demora.
 
 ### Corrigido
-- **Som de abertura mais baixo:** toca com metade do volume.
+- **Sair e Trocar servidor perguntam antes** e avisam quando a call vai cair junto. Um clique
+  perdido apagava o login.
+- **Tentar de novo** onde antes era preciso sair e entrar: chat que não carregou, transmissão
+  que não abriu e call que não reconectou.
+
+### Interno
+- Dependência nova `arboard`, só pra ler imagem da área de transferência.
+- A cópia do `webrtc-sys` pede ao portal do Linux uma permissão que vale entre execuções, pra
+  transmitir de novo sem o seletor.
+
+### Limites conhecidos
+- No Linux com Wayland, arrastar arquivo pra janela não anexa. O clipe funciona.
 
 ## Compilar
 
